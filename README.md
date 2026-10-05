@@ -349,15 +349,21 @@ python bump.py 1.1        # 改版本：module.prop 与 update.json 一起更新
 # 补 CHANGELOG.md
 python build_zip.py
 git add -A && git commit -m 'v1.1' && git push github main && git push gitee main
-# 建 v1.1 的 Release，把 ctn_patch.zip 传为附件
+git tag -a v1.1 -m 'v1.1' && git push gitee v1.1 && git push github v1.1
+GITEE_TOKEN=xxx python make_release.py   # 两边建 Release + 传 zip 附件
 ```
 
-`python bump.py --show` 可随时检查两个文件是否一致。
+`python bump.py --show` 可随时检查两个文件是否一致。`make_release.py` 从
+git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN` 环境变量读 Gitee token，
+两边都已存在 Release 时会跳过而不是报错，可以反复跑。
 
-**两个注意点**：① 仓库必须公开（管理器是未登录状态拉 `update.json` 的，
+**三个注意点**：① 仓库必须公开（管理器是未登录状态拉 `update.json` 的，
 私有仓库返回 403）—— **绝不能**把 token 写进 `update.json` 或 `module.prop`
 来绕过，那等于把仓库写权限发给每个装模块的人。② `versionCode` 必须单调递增，
-`bump.py` 已强制校验。
+`bump.py` 已强制校验。③ Gitee 上把私有仓库改成公开需要账号安全评级达标：
+评级不足时 Gitee 会直接拒绝（`您的帐号安全评级较低，发布公开内容前请在
+「个人设置」完成2FA设置, 或绑定可靠第三方帐号`）。这一步只能账号本人在
+Gitee 网页上做，API 绕不过去。
 
 ## 十一、排查
 
