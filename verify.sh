@@ -192,12 +192,20 @@ LOG=$(dmesg | sed -n "/$KLOG_MARK START/,\$p")
 say "  --- ctn_patch 相关 ---"
 echo "$LOG" | grep -i ctn_patch | tail -n 10 | sed 's/^/    /'
 say "  --- 异常扫描（期望为空）---"
-BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" 	| grep -vE "CTN_VERIFY_" | tail -n 10)
-if [ -z "$BAD" ]; then
-	ok "本次测试期间 dmesg 无 BUG/WARNING/oops/CFI failure"
+# 标记必须出现在 dmesg 里，否则说明 /dev/kmsg 写不进去（或日志被清了）。
+# 这种情况下**绝不能报 PASS** —— 那等于「什么都没查却说没问题」，
+# 比不查更糟：用户会以为自检通过了。宁可报一条 FAIL 让人看见。
+if [ -z "$LOG" ]; then
+	ng "取不到本次测试的日志段（标记 $KLOG_MARK 不在 dmesg 里），异常扫描未执行"
+	echo "     /dev/kmsg 写不进去？手动确认：dmesg | grep CTN_VERIFY_" | sed 's/^/  /'
 else
-	ng "dmesg 有异常"
-	echo "$BAD" | sed 's/^/    /'
+	BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" 	| grep -vE "CTN_VERIFY_" | tail -n 10)
+	if [ -z "$BAD" ]; then
+		ok "本次测试期间 dmesg 无 BUG/WARNING/oops/CFI failure"
+	else
+		ng "dmesg 有异常"
+		echo "$BAD" | sed 's/^/    /'
+	fi
 fi
 echo "$KLOG_MARK END" > /dev/kmsg 2>/dev/null
 
