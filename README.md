@@ -181,6 +181,37 @@ com.tencent.tmgp.pubgmhd = GameThread RenderThread
 放在 `/data/adb/ctn_patch/`（不是模块目录里）是有意的：模块目录升级时会被替换，
 用户手写的名单不该跟着一起没。
 
+### 5.5 占用（真机实测，Ace 3 Pro）
+
+| 项目 | 实测值 | 说明 |
+|---|---|---|
+| 常驻内存 | **约 5.7 MB**（峰值 7.5 MB） | 单线程；`VmSize` 显示的 2.2 GB 是 bionic 预留的地址空间，不是真占用 |
+| 二进制 | 21 KB | 单文件，只依赖 `libc.so` / `libdl.so` |
+| 磁盘 | 616 KB | `/data/local/tmp/.ctnd` 里那份云控库拷贝（db 180K + wal 412K + SQLite 自建的 shm 32K） |
+| 空闲 CPU | **约 0.017%**（单核） | 每 800ms 读一次几十字节的 `/proc/game_opt/game_pid`，60 秒才耗 1 个 tick |
+| 一次注入的 CPU | **约 10 ms** | 拷库 + 开 SQLite + 查一行 + 解 JSON + 写节点，整条链一次 |
+
+同一个包第二次进游戏会走缓存（库没变就直接用），连那 10ms 里最贵的拷库都省了。
+
+量法见 `daemon/measure.sh`（推到设备上 root 跑）。
+
+### 5.6 手动跑 ctnd（排查用）
+
+开机时由 `service.sh` 自动拉起，平时不用管。想手动跑或改行为：
+
+```bash
+/data/adb/modules/ctn_patch/ctnd -h          # 看用法
+/data/adb/modules/ctn_patch/ctnd -e          # 连 ct_enable 一起按 ctb 代管
+/data/adb/modules/ctn_patch/ctnd -d /path/to/db   # 指定云控库（换机型/库不在候选里）
+/data/adb/modules/ctn_patch/ctnd -V          # 看版本
+```
+
+日志全走 stderr（开机时由 `service.sh` 重定向到
+`/data/adb/modules/ctn_patch/daemon.log`）。手动跑就自己重定向到文件。
+**同时只能跑一个实例**（`flock` 锁），重复启动会打印一行然后以退出码 3 退出，
+`service.sh` 见到 3 就不再重启它 —— 所以手动调试前先
+`touch /data/adb/modules/ctn_patch/.stop` 把守护循环停掉，调完删掉哨兵。
+
 ## 六、构建
 
 ### 6.1 内核模块
@@ -361,9 +392,20 @@ git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN` 环境变量读 Gitee t
 私有仓库返回 403）—— **绝不能**把 token 写进 `update.json` 或 `module.prop`
 来绕过，那等于把仓库写权限发给每个装模块的人。② `versionCode` 必须单调递增，
 `bump.py` 已强制校验。③ Gitee 上把私有仓库改成公开需要账号安全评级达标：
-评级不足时 Gitee 会直接拒绝（`您的帐号安全评级较低，发布公开内容前请在
+评级不足时 Gitee 直接拒绝（`您的帐号安全评级较低，发布公开内容前请在
 「个人设置」完成2FA设置, 或绑定可靠第三方帐号`）。这一步只能账号本人在
-Gitee 网页上做，API 绕不过去。
+Gitee 网页上做，API 绕不过去 —— 本仓库已绑第三方账号并通过 API 改成公开。
+
+**改完自己验一遍这三条**（都用未登录身份，就是管理器的视角）：
+
+```bash
+curl -sL .../raw/main/update.json     # 200，且 versionCode 比本地大
+curl -sL .../raw/main/CHANGELOG.md    # 200
+curl -sL .../releases/download/v1.1/ctn_patch.zip   # 200，且大小/哈希与本地一致
+```
+
+Gitee 的 `/raw/` 会 302 跳到 `raw.giteeusercontent.com`，这是正常的
+（管理器跟得上跳转）；但如果哪天发现管理器拉不到，先看这里是不是被挡了。
 
 ## 十一、排查
 
