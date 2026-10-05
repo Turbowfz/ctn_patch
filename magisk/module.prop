@@ -1,0 +1,6 @@
+id=ctn_patch
+name=CTN Patch
+version=v1.0
+versionCode=10
+author=Turbo
+description=给 6.1 内核补上 critical_task_name 节点，可自定义关键线程名单

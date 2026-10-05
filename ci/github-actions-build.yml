@@ -1,0 +1,74 @@
+# 这是 GitHub Actions 工作流，放在 ci/ 下是为了绕开「token 需要 workflow scope」的限制。
+# 想启用云端构建，二选一：
+#   A. 在网页上把本文件内容粘贴到 .github/workflows/build.yml（网页操作不受 token scope 限制）
+#   B. 用带 workflow scope 的 token 执行：
+#        mkdir -p .github/workflows && git mv ci/github-actions-build.yml .github/workflows/build.yml
+#        git commit -m "启用 Actions" && git push
+name: build-ctn-patch
+
+# 在 GitHub 的机器上编 ctn_patch.ko —— 自己电脑不用装 Linux 环境。
+# 用法：把这个目录推到自己的仓库 → Actions 页 → 选 build-ctn-patch → Run workflow
+#       跑完在本次运行的 Artifacts 里下载 ctn_patch-ko（里面有 .ko 和 zip）。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ctn_patch.c'
+      - 'Kbuild'
+      - 'device_kernel.config'
+      - 'Module.symvers.device'
+      - 'build.sh'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    # 内核源码 + 构建产物大概 5~6GB，标准 runner 够用
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: 取本仓库
+        uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-17 lld-17 llvm-17 build-essential bc bison flex \
+            libssl-dev libelf-dev python3 git
+          echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
+          clang --version | head -1
+
+      - name: 看还剩多少磁盘（内核源码很大，先确认）
+        run: df -h /
+
+      - name: 构建（克隆内核 + 编模块）
+        run: |
+          bash build.sh --work "$RUNNER_TEMP/ctnwork"
+
+      - name: 打 root 模块 zip
+        run: |
+          python3 build_zip.py
+          ls -la ctn_patch.ko ctn_patch.zip
+
+      - name: 汇总产物信息
+        run: |
+          {
+            echo "## ctn_patch 构建结果"
+            echo
+            echo '```'
+            echo "vermagic : $(grep -aom1 'vermagic=[ -~]*' ctn_patch.ko | cut -d= -f2)"
+            echo "size     : $(stat -c%s ctn_patch.ko) 字节"
+            echo "sha256   : $(sha256sum ctn_patch.ko | cut -d' ' -f1)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctn_patch-ko
+          path: |
+            ctn_patch.ko
+            ctn_patch.zip
+          if-no-files-found: error

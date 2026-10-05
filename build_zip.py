@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""把 magisk/ 目录打包成可刷入的 root 模块 zip（Magisk / KernelSU 通用）。
+
+用法（在 05_补丁模块/ctn_patch/ 下）:
+    python build_zip.py                     # 自动找当前目录的 ctn_patch.ko
+    python build_zip.py /path/to/ctn_patch.ko
+    python build_zip.py --out 自定义名字.zip
+
+要点:
+  - Magisk 要求 module.prop 在 zip 根目录（不能多套一层文件夹），这里直接平铺。
+  - 所有文本文件强制转成 LF —— Windows 下编辑的 sh 脚本带 CRLF 到手机上
+    会报 "no such file or directory" 之类的怪错，这里在打包时归一掉。
+  - 没找到 ctn_patch.ko 也能打包（会警告），装的时候 customize.sh 会拦住
+    并提示先编译，防止误刷空模块。
+"""
+
+import sys
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MAGISK = HERE / "magisk"
+
+# 文件名 -> (来源目录候选, 是否可执行位, 是否必须存在)
+# verify.sh 在工程根目录（和 ctn_patch.c 同级），打包时一起带上，
+# 这样装进模块后 action.sh 才能直接调它。
+FILES = {
+    "module.prop": (MAGISK, False, True),
+    "customize.sh": (MAGISK, True, True),
+    "service.sh": (MAGISK, True, True),
+    "uninstall.sh": (MAGISK, True, True),
+    "action.sh": (MAGISK, True, True),
+    "verify.sh": (HERE, True, True),
+    "README.md": (MAGISK, False, False),
+    "LICENSE": (HERE, False, True),   # GPL 要求：分发二进制须随附许可
+    "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
+}
+
+TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt"}
+
+
+def find_ko() -> Path | None:
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
+        p = Path(sys.argv[1])
+        if not p.is_file():
+            sys.exit(f"指定的 .ko 不存在: {p}")
+        return p
+    for cand in (HERE / "ctn_patch.ko", MAGISK / "ctn_patch.ko"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def main() -> None:
+    out_name = "ctn_patch.zip"
+    if "--out" in sys.argv:
+        out_name = sys.argv[sys.argv.index("--out") + 1]
+    out = HERE / out_name
+
+    ko = find_ko()
+
+    missing = [n for n, (_, _, must) in FILES.items()
+               if must and n != "ctn_patch.ko"
+               and not all((d / n).is_file() for d in {FILES[n][0]} | {MAGISK})
+               ]
+    missing = [n for n in missing
+               if not (MAGISK / n).is_file() and not (HERE / n).is_file()]
+    if missing:
+        sys.exit(f"缺文件: {missing}")
+
+    if ko is None:
+        print("[警告] 没找到 ctn_patch.ko —— 照样打包，但刷入时 customize.sh "
+              "会拒绝安装。请先按 README 编译 .ko 再重新打包。")
+
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, (srcdir, executable, _) in FILES.items():
+            if name == "ctn_patch.ko":
+                src = ko
+                if src is None:
+                    continue
+            else:
+                src = srcdir / name
+                if not src.is_file():
+                    src = MAGISK / name
+                    if not src.is_file():
+                        src = HERE / name
+            mode = 0o755 if executable else 0o644
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (mode << 16) | 0o100000  # 常规文件
+            data = src.read_bytes()
+            if src.suffix in TEXT_SUFFIXES:
+                # 归一 LF：去掉 \r，统一 \n 结尾
+                text = data.decode("utf-8")
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                data = text.encode("utf-8")
+            z.writestr(info, data)
+            print(f"  + {name}  ({len(data)} 字节, {'0755' if executable else '0644'})")
+
+    # 把「构建时对照的设备厂商模块」的 sha256 一并写进 zip，供 customize.sh 刷入时核对：
+    # 设备上的 oplus_bsp_game_opt.ko 一旦换了，我们这版 .ko 的 struct module 布局
+    # 就可能不匹配（会硬崩），必须重编。
+    devko = Path(r"C:/Users/User/Desktop/风驰/6.1_一加ace3pro/01_手机提取/modules/oplus_bsp_game_opt.ko")
+    if devko.is_file():
+        import hashlib
+        h = hashlib.sha256(devko.read_bytes()).hexdigest()
+        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
+            info = zipfile.ZipInfo("expected_vendor.txt")
+            info.external_attr = (0o644 << 16) | 0o100000
+            z.writestr(info, "vendor_ko_sha256=%s\n" % h)
+        print("  + expected_vendor.txt  (构建时对照的厂商模块 sha256=%s...)" % h[:16])
+
+    print(f"\n完成: {out}")
+    print("刷入: Magisk/KSU App -> 模块 -> 从存储安装 -> 选这个 zip -> 重启")
+
+
+if __name__ == "__main__":
+    main()

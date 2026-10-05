@@ -1,0 +1,24 @@
+# 构建产物：不要提交（可由源码 + device_kernel.config + Module.symvers.device 重建）
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.cmd
+Module.symvers
+ctn_patch.zip
+ctn_patch_magisk.zip
+build_work/
+
+# 设备抽取物（体积大、可自行从设备再抽；如需可复现构建则手动加进来）
+vmlinux.btf
+probe*.bin
+last_kmsg.txt
+*.btf
+
+# 调试/临时
+_usb.ps1
+ck.sh
+dv.sh
+__pycache__/
+*.pyc

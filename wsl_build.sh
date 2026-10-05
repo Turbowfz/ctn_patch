@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# =============================================================================
+# Arch(WSL) 一键全流程：依赖 → NDK → 内核源码 → Kconfig 补链 → 编 ko → 校验
+# （所有子步骤脚本都可单独重跑，本脚本按顺序串一遍；已做过的步骤会自动跳过）
+#
+# 由 Windows 侧调起：
+#   MSYS_NO_PATHCONV=1 wsl.exe -d archlinux -u root -- /bin/bash /mnt/c/.../wsl_build.sh
+# =============================================================================
+set -uo pipefail
+
+HERE="/mnt/c/Users/User/Desktop/风驰/6.1_一加ace3pro/05_补丁模块/ctn_patch"
+NDK="/opt/ndkroot/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64"
+# 必须把 NDK 的 bin 加进 PATH：内核用 LLVM=1 时会把 NM/AR/OBJCOPY 等设成
+# llvm-nm / llvm-ar / llvm-objcopy，这些是从 PATH 找的（Arch 没装系统 llvm，
+# 只有 NDK 里有）。少了它 scripts/check-local-export 会报 "llvm-nm failed"。
+# CC 是显式传全路径的，所以只有 PATH 缺了时症状很隐蔽。
+export PATH="$NDK/bin:$PATH"
+KERNEL=/root/ctn_build/kernel
+OUT=/root/ctn_build/work/out
+SRC=/root/ctn_build/src
+WIN_DIR="$HERE"
+
+step() { echo; echo "=================================================="; echo " $*"; echo "=================================================="; }
+
+# ---------- 1. 依赖 ----------
+if ! command -v make >/dev/null || ! command -v gcc >/dev/null; then
+	step "1/8 装依赖"
+	bash "$HERE/arch_setup.sh" || exit 1
+else
+	step "1/8 依赖已装（跳过）"
+fi
+
+# ---------- 2. NDK clang 17.0.2 ----------
+if [ ! -x "$NDK/bin/clang" ]; then
+	step "2/8 下载 NDK r26b（clang 17.0.2）"
+	bash "$HERE/arch_get_ndk.sh" || exit 1
+else
+	step "2/8 NDK 已就绪（跳过）"
+	"$NDK/bin/clang" --version | head -1 | sed 's/^/    /'
+fi
+
+# ---------- 3. 内核源码 ----------
+step "3/8 内核源码"
+if [ ! -f "$KERNEL/Makefile" ]; then
+	git clone --depth 1 -b oneplus/sm8650_b_16.0.0_ace_3_pro \
+		https://gh-proxy.com/https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650 \
+		"$KERNEL" 2>&1 | tail -3 || exit 1
+else
+	echo "    已存在：$KERNEL"
+fi
+V=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) = ' "$KERNEL/Makefile" | head -3 | awk '{print $3}' | paste -sd.)
+echo "    源码版本 = $V（需 6.1.141）"
+[ "$V" = "6.1.141" ] || { echo "    !! 版本不对"; exit 1; }
+
+# ---------- 4. 设备配置 ----------
+step "4/8 铺设备真实配置"
+mkdir -p "$OUT"
+cp "$HERE/device_kernel.config" "$OUT/.config"
+python3 - "$OUT/.config" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+txt = open(path, encoding="utf-8").read()
+
+def setval(txt, key, val):
+    pe = re.compile(r'^%s=.*$' % re.escape(key), re.M)
+    pn = re.compile(r'^# %s is not set$' % re.escape(key), re.M)
+    if pe.search(txt): return pe.sub('%s=%s' % (key, val), txt, count=1)
+    if pn.search(txt): return pn.sub('%s=%s' % (key, val), txt, count=1)
+    return txt + '\n%s=%s\n' % (key, val)
+
+def unset(txt, key):
+    return re.sub(r'^%s=.*$' % re.escape(key), '# %s is not set' % key, txt, count=1, flags=re.M)
+
+# vermagic 钉死成设备模块那一串
+txt = setval(txt, 'CONFIG_LOCALVERSION', '"-android14-11-o-gdc1b6a03413f"')
+txt = unset(txt, 'CONFIG_LOCALVERSION_AUTO')
+# 构建机上不存在的白名单路径
+txt = setval(txt, 'CONFIG_UNUSED_KSYMS_WHITELIST', '""')
+# 省 pahole 依赖 / 防 -Werror 咬人（都不影响 vermagic 和结构体布局）
+txt = unset(txt, 'CONFIG_DEBUG_INFO_BTF')
+txt = unset(txt, 'CONFIG_DEBUG_INFO_BTF_MODULES')
+txt = unset(txt, 'CONFIG_WERROR')
+open(path, 'w', encoding='utf-8', newline='\n').write(txt)
+print("    已钉 LOCALVERSION，关 BTF/WERROR")
+PYEOF
+
+# ---------- 5. 断链重指 + Kconfig 修补 + olddefconfig ----------
+step "5/8 断链重指 + Kconfig 修补 + olddefconfig"
+bash "$HERE/arch_relink.sh" || exit 1
+
+# ---------- 6. modules_prepare ----------
+step "6/8 modules_prepare"
+if [ ! -f "$OUT/Module.symvers" ] && [ ! -d "$OUT/scripts" ]; then
+	bash "$HERE/arch_prepare.sh" || exit 1
+else
+	bash "$HERE/arch_prepare.sh" || exit 1
+fi
+
+# ---------- 7. 编模块（含 symvers 重排 + .scmversion 去 + 号）----------
+step "7/8 编模块"
+
+# 先把 Windows 侧源码同步到 Linux 侧（/mnt/c 是 9p 慢盘，编译在本地盘做），
+# 顺便归一 CRLF —— Windows 编辑过的文件若带回车符，内核 Makefile 会报错。
+rm -rf "$SRC"
+mkdir -p "$SRC"
+cp -a "$HERE/." "$SRC/"
+cd "$SRC"
+find . -maxdepth 1 -type f -print0 | xargs -0 -r sed -i 's/\r$//'
+echo "    源码已同步到 $SRC"
+echo "    ctn_patch.c sha256 = $(sha256sum ctn_patch.c | cut -c1-16)"
+
+# 清掉从 Windows 侧一起拷过来的旧编译产物。留着会让 make 走增量链接，
+# 实测产出过坏 ELF（ko 少 3 字节、modinfo 报 Invalid argument），干净重编最稳。
+rm -f ctn_patch.ko ctn_patch.mod ctn_patch.mod.c ctn_patch.mod.o ctn_patch.o \
+      Module.symvers modules.order
+
+touch "$KERNEL/.scmversion"
+rm -f "$OUT/include/config/kernel.release"
+make -C "$KERNEL" O="$OUT" ARCH=arm64 LLVM=1 CC="$NDK/bin/clang" \
+	HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld -j"$(nproc)" prepare >/dev/null 2>&1
+python3 - "$SRC/Module.symvers.device" "$OUT/Module.symvers" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+out = []
+for line in open(src, encoding="utf-8"):
+    s = line.rstrip("\n")
+    if not s: continue
+    p = s.split("\t")
+    crc, sym = p[0], p[1]
+    export = p[2] if len(p) > 2 else "EXPORT_SYMBOL"
+    ns = p[4] if len(p) > 4 else ""
+    out.append("\t".join([crc, sym, "kernel", export, ns]) + "\n")
+open(dst, "w", newline="\n").write("".join(out))
+print(f"    symvers {len(out)} 条")
+PYEOF
+make -C "$KERNEL" O="$OUT" M="$SRC" ARCH=arm64 LLVM=1 CC="$NDK/bin/clang" \
+	HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld -j"$(nproc)" modules 2>&1 | tail -8
+[ -f "$SRC/ctn_patch.ko" ] || { echo "    !! 编译失败"; exit 1; }
+echo "    $(ls -la "$SRC/ctn_patch.ko")"
+
+# ---------- 8. 校验 + 拷回 ----------
+step "8/8 校验"
+VM=$(grep -aom1 'vermagic=[ -~]*' "$SRC/ctn_patch.ko" | cut -d= -f2)
+EXPECT="6.1.141-android14-11-o-gdc1b6a03413f SMP preempt mod_unload modversions aarch64"
+echo "    vermagic: $VM"
+[ "$VM" = "$EXPECT" ] && echo "    [OK] vermagic 一致" || echo "    [!!] vermagic 不一致"
+echo "    undefined 符号: $("$NDK/bin/llvm-nm" -u "$SRC/ctn_patch.ko" | grep -c ' U ' || true)"
+CTN_DEV_MODDIR="/mnt/c/Users/User/Desktop/风驰/6.1_一加ace3pro/01_手机提取/modules" \
+	python3 "$HERE/verify_kcfi.py" "$SRC/ctn_patch.ko" 2>&1 | tail -12 || true
+
+cp -f "$SRC/ctn_patch.ko" "$WIN_DIR/ctn_patch.ko"
+echo
+echo "    已拷回 Windows 侧：$WIN_DIR/ctn_patch.ko"
+echo "    下一步打包: python build_zip.py"
