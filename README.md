@@ -535,3 +535,66 @@ version 2 only*。GPLv2 与 GPLv3 是**互相不兼容**的两个许可（自由
 接口格式（写入 `"%99s %99s"`、读取 `"%s:%d,%s:%d"`）参照一加 6.6 官方源码
 （OnePlusOSS 开源仓，GPL-2.0）实现，以便上层工具通用。项目中**不包含**
 任何一加的专有代码或二进制。
+
+## 十一、云更新（Gitee）
+
+模块支持管理器内置的在线更新。`module.prop` 里有：
+
+```
+updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
+```
+
+管理器（Magisk / KernelSU）会定期拉这个 JSON，把里面的 `versionCode` 和本机
+已装的比较，**远端更大就在模块列表里显示「更新」按钮**，点一下自动下载安装。
+
+`update.json`：
+
+```json
+{
+  "version": "v1.0",
+  "versionCode": 10,
+  "zipUrl": "https://gitee.com/turbowfz/ctn_patch/releases/download/v1.0/ctn_patch.zip",
+  "changelog": "https://gitee.com/turbowfz/ctn_patch/raw/main/CHANGELOG.md"
+}
+```
+
+### 11.1 发新版本的正确顺序
+
+顺序很重要：**先定 tag 名，再改版本号，再发 Release**——因为 `zipUrl` 里带 tag，
+顺序错了管理器下载会 404。
+
+```bash
+python bump.py 1.1        # 1. 改版本：module.prop 与 update.json 一起更新
+                          #    （versionCode 自动 +1，必须递增）
+# 2. 在 CHANGELOG.md 顶部补一段 v1.1 的说明
+python build_zip.py       # 3. 重打 zip
+git add -A && git commit -m 'v1.1' && git push github main && git push gitee main
+# 4. 在 Gitee 建 v1.1 的 Release，把 ctn_patch.zip 传为附件
+```
+
+`bump.py` 会打印上面这套步骤并带上正确的 URL，照着做即可。
+`python bump.py --show` 可以随时检查两个文件是否一致。
+
+### 11.2 两个必须注意的点
+
+**① 仓库必须公开。** 管理器是在**没有登录**的情况下拉 `update.json` 的，
+所以：
+
+- 私有仓库 → raw 地址返回 403，**云更新不可用**（实测：即使带 token 也是 403）
+- 仓库公开 → `https://gitee.com/turbowfz/ctn_patch/raw/main/update.json` 可直接读
+
+**绝对不能**把 access_token 写进 `update.json` 或 `module.prop` 来"绕过"这一点——
+那等于把你的仓库写权限发给每一个装模块的人。
+
+**② versionCode 必须单调递增。** 管理器只比这个整数，不比版本号字符串。
+`bump.py` 已经强制校验，不允许填一个更小的值。
+
+### 11.3 手动检查更新
+
+不想等管理器的话，手机上直接看远端版本：
+
+```bash
+curl -s https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
+```
+
+对比本机 `/data/adb/modules/ctn_patch/module.prop` 里的 `versionCode`。
