@@ -1,5 +1,6 @@
 # 构建产物：不要提交（可由源码 + device_kernel.config + Module.symvers.device 重建）
 *.ko
+daemon/ctnd
 *.o
 *.mod
 *.mod.c
@@ -22,3 +23,8 @@ ck.sh
 dv.sh
 __pycache__/
 *.pyc
+
+# 从设备拉下来的 COSA 云控数据库（含你手机的应用/游戏数据，绝不能进公开仓库）
+db_game_database*
+dbtest/
+db.tar

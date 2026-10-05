@@ -169,6 +169,42 @@ else
 	pass "节点不存在，安装后由本模块提供"
 fi
 
+# ================= 5.5 ctnd 与它依赖的 SQLite =================
+say "--- 5.5 ctnd（自动写入节点必需）"
+if [ -f "$MODPATH/ctnd" ]; then
+	pass "ctnd 存在（$(stat -c%s "$MODPATH/ctnd" 2>/dev/null) 字节）"
+	# 架构对不上会在启动时才炸，这里先看一眼
+	if grep -qa "ELF" "$MODPATH/ctnd" 2>/dev/null; then
+		pass "ctnd 是 ELF 可执行文件"
+	else
+		bad "ctnd 不是有效的 ELF（zip 坏了？）"
+	fi
+else
+	bad "zip 里没有 ctnd —— 没有它节点永远停在默认值，装了也白装"
+fi
+
+# ctnd 靠 dlopen 读 COSA 的 SQLite 库拿云控配置，库不在就没法自动填名字
+SQLITE=""
+for p in /system/lib64/libsqlite.so /system/lib64/libsqlite3.so          /apex/com.android.runtime/lib64/libsqlite3.so          /apex/com.android.art/lib64/libsqlite3.so; do
+	[ -f "$p" ] && { SQLITE="$p"; break; }
+done
+if [ -n "$SQLITE" ]; then
+	pass "找到 SQLite 库：$SQLITE"
+else
+	warn "找不到 SQLite 库，ctnd 读不了云控配置（节点会停在默认值）"
+fi
+
+# 云控库（COSA 的 SQLite）——没有它 ctnd 拿不到 ctn
+COSADB=""
+for p in /data/user/0/com.oplus.cosa/databases/db_game_database          /data/data/com.oplus.cosa/databases/db_game_database; do
+	[ -f "$p" ] && { COSADB="$p"; break; }
+done
+if [ -n "$COSADB" ]; then
+	pass "找到云控库：$COSADB"
+else
+	warn "找不到 COSA 的 db_game_database（游戏没启动过？ctnd 会重试）"
+fi
+
 # ================= 6. 配置项检查 =================
 say "--- 6. 内核配置"
 if [ "$HAVE_CONFIG" != "1" ]; then

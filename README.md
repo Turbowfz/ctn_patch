@@ -598,3 +598,112 @@ curl -s https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
 ```
 
 对比本机 `/data/adb/modules/ctn_patch/module.prop` 里的 `versionCode`。
+
+## 十二、ctnd —— 自动写入节点（必需，不是可选）
+
+### 12.1 为什么光有节点没用
+
+`ctn_patch` 只是把 `/proc/game_opt/task_boost/critical_task_name` 这个节点补出来。
+**但没有任何进程会去写它。** 一加 6.1 的 gameopt HAL 走的是 sched_assist 那条路
+（`GameoptIoctl` 的 ioctl + `pipeline_pids_cpus`），从来没碰过内核的
+`critical_task[]`；实测 HAL 二进制里 `critical_task_name` 出现 **0** 次。
+
+所以不装 daemon 的话，节点永远停在默认的 `UnityMain` / `UnityGfxDevice` ——
+这对 Unity 游戏刚好合适，但对**虚幻引擎游戏**（`GameThread` / `RenderThread`）
+完全没用。
+
+### 12.2 它怎么判断
+
+**游戏启动信号**：HAL 在游戏起来时把 pid 写进 `/proc/game_opt/game_pid`
+（退出写 `-1`）。实测：
+
+```
+game_pid=10217 child_num=38     ← 游戏在跑
+game_pid=-1 child_num=0         ← 没游戏
+```
+
+**配置来源**：OPLUS 云服务的 SQLite 库
+
+```
+/data/user/0/com.oplus.cosa/databases/db_game_database
+  └ 表 PackageConfigBean，列 game_config（JSON 字符串）
+```
+
+`game_config` 里的 **`ctn`** 就是官方给的关键线程名，格式与我们的节点完全一致：
+
+| 包 | `game_config.ctn` | 引擎 |
+|---|---|---|
+| `com.tencent.tmgp.pubgmhd` | `RenderThread Thread-` | 虚幻 |
+| `com.hottagames.yh.laohu` | `GameThread RenderThread` | 虚幻 |
+| `com.tencent.tmgp.dfm` | `GameThread RenderThread` | 虚幻 |
+| `com.kurogame.mingchao` | `GameThread RenderThread` | 虚幻 |
+| `com.tencent.tmgp.codev` | `GameThread RenderThread` | 虚幻 |
+| `com.miHoYo.Nap` 等 | **无 `ctn`** | Unity → 用内核默认值 |
+
+> Unity 游戏没有 `ctn`，是因为内核默认的 `UnityMain` / `UnityGfxDevice`
+> 正好就是它们的线程名 —— 这也反过来证明 `ctn` 就是为「非 Unity 游戏」准备的。
+
+**判断流程**：
+
+```
+轮询 /proc/game_opt/game_pid (500ms)
+  └ pid 由 -1 变正数（游戏启动）
+      ├ 读 /proc/<pid>/cmdline 取包名
+      ├ 拷 db/-wal/-shm 到临时目录，用 SQLite 查该包的 game_config
+      ├ 有 ctn        → 写进去
+      ├ 有配置无 ctn  → Unity 游戏 → 写回 UnityMain UnityGfxDevice
+      ├ 库里没这个包  → OPLUS 不认识 → 写回默认值
+      └ 读库失败      → 保持现状不动（宁可不动，也别写错名字）
+  └ pid 连续 8 次为 -1（游戏退出，防抖 4 秒）→ 恢复默认名字
+```
+
+### 12.3 实现要点
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| 读 SQLite | `dlopen("/system/lib64/libsqlite.so")` | 平台私有库，NDK 没有 stub；不同机型路径不同，dlopen 好做回退 |
+| 库是 WAL 模式 | 把 db/-wal/-shm 三个文件拷到 `/data/local/tmp/.ctnd/` 再读 | 直接开原库会动它的 -shm；拷贝零干扰，且只在游戏启动那一刻做一次 |
+| JSON 解析 | 手写极简取值器，不用 JSON 库 | `game_config` 是扁平 JSON，只需要取一个键；省掉一个依赖 |
+| **`ctn` 是字符串，`ctb` 是数字** | 两个取值器分开 | 一开始只写了字符串取值器，结果 `ctb` 永远取不到（实测踩过） |
+| 退出防抖 | 连续 8 次（4 秒）读到 -1 才算退出 | 实测加载期 `game_pid` 会在正数和 -1 之间反复抖好几秒 |
+| `ct_enable` | **默认不管** | 归 HAL 管（它按 `game_config.ctb` + 游戏场景判定开关）；两边同时写会互相打架。要强制代管加 `-e` |
+
+### 12.4 关于 `ct_enable`（重要）
+
+名字设对了，**boost 本身还另有一道门**：`ct_enable`。它归 HAL 管，判据是配置里的
+`ctb` 加**游戏场景激活**：
+
+```c
+// HAL 里的逻辑（反编译）
+v9  = config.ctb;                 // 配置里 ctb=1 表示这个游戏要 CTB
+v10 = v9 != 0;
+if (v9 && !game_scene)            // 游戏场景没激活就不开
+    v10 = other_state != 0;
+if (cached != v10) write("/proc/game_opt/task_boost/ct_enable", v10 ? "1" : "0");
+```
+
+实测某游戏（配置 `ctb=1`）运行期间 `/proc/uag/is_game_scene` 始终为 0，
+`ct_enable` 也就一直是 0 —— 这是 OPLUS 自己的场景判定，不在本模块能控制的范围。
+想绕过它就让 daemon 加 `-e` 强制按配置的 `ctb` 写 `ct_enable`，
+但那样就绕过了 HAL 的场景门控（可能影响功耗/温控），自己权衡。
+
+### 12.5 日志与排查
+
+```bash
+# daemon 日志（service.sh 自动重定向）
+cat /data/adb/modules/ctn_patch/daemon.log
+# 正常应该长这样：
+#   ctnd 启动（节点 /proc/game_opt/task_boost/critical_task_name）
+#   游戏启动: pid=10217 包名=com.hottagames.yh.laohu
+#   sqlite: 加载 /system/lib64/libsqlite.so 成功
+#   配置 ctn = "GameThread RenderThread"（ctb=1）
+#   已写入 [GameThread RenderThread]
+```
+
+| 现象 | 原因 |
+|---|---|
+| 日志里没有「游戏启动」 | `game_pid` 没变 → 这个游戏不在 OPLUS 名单里，HAL 不认 |
+| `sqlite: 所有候选路径都加载失败` | 该机型库名/路径不同，改 `SQLITE_CANDIDATES` |
+| `库: 包 xxx 不在 PackageConfigBean 里` | OPLUS 不认识这个游戏 → 用默认名 |
+| 节点是 `UnityMain` 但游戏是虚幻的 | 读库失败（看日志），或该包配置里确实没有 `ctn` |
+| 名字对了但没效果 | `ct_enable=0` → 见 12.4 |

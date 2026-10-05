@@ -35,6 +35,8 @@ FILES = {
     "README.md": (MAGISK, False, False),
     "LICENSE": (HERE, False, True),   # GPL 要求：分发二进制须随附许可
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
+    # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）
+    "ctnd": (HERE / "daemon", True, True),
 }
 
 TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt"}
@@ -60,12 +62,14 @@ def main() -> None:
 
     ko = find_ko()
 
-    missing = [n for n, (_, _, must) in FILES.items()
-               if must and n != "ctn_patch.ko"
-               and not all((d / n).is_file() for d in {FILES[n][0]} | {MAGISK})
-               ]
-    missing = [n for n in missing
-               if not (MAGISK / n).is_file() and not (HERE / n).is_file()]
+    missing = []
+    for n, (src_dir, _, must) in FILES.items():
+        if not must or n == "ctn_patch.ko":
+            continue
+        cands = [Path(src_dir) / n if isinstance(src_dir, str) else src_dir / n,
+                 MAGISK / n, HERE / n]
+        if not any(c.is_file() for c in cands):
+            missing.append(n)
     if missing:
         sys.exit(f"缺文件: {missing}")
 
@@ -80,7 +84,10 @@ def main() -> None:
                 if src is None:
                     continue
             else:
-                src = srcdir / name
+                if isinstance(srcdir, str):
+                    src = Path(srcdir) / name
+                else:
+                    src = srcdir / name
                 if not src.is_file():
                     src = MAGISK / name
                     if not src.is_file():
