@@ -52,10 +52,3 @@
   `GameThread RenderThread`、Unity 游戏与库外包 → 默认值）
 - 真实游戏端到端：启动和平精英 → HAL 写 `game_pid` → ctnd 注入
   `RenderThread Thread-`（与游戏内实际线程名一致）→ 退出后 6 拍防抖恢复默认
-
-**校验值**
-```
-ctn_patch.ko  sha256 be9a686a1901931a7cd82f76df00e1f268820ed459427f86e8ee90aef2cd37f1
-ctnd          sha256 7a47dc6844cc37d5933b7fbff023b1ed608a4682af7c6ba2a5d19971dd94e0f1
-zip           sha256 ce1113f96659fa4e797d9b39504dcbdd5c563a732f349f5d9e9127f8b9b6a125
-```

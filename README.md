@@ -390,6 +390,14 @@ updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
 > 文件名不能叫 `changelog.md` —— 仓库在 Windows 上，它和 `CHANGELOG.md`
 > 是**同一个文件**（大小写不敏感），会互相覆盖。
 
+生成时会**去掉「校验值」那一段**（`sha256` 代码块 + 它上面的小标题）：
+
+- 更新弹窗是给「这次更新改了什么」看的，而管理器**不校验** `sha256`，
+  用户也不会拿着 64 位哈希去比对，摆在弹窗里纯属噪音；
+- 但 `CHANGELOG.md` 里留着有价值 —— 那是仓库里**唯一**记着「每一版发出去的
+  到底是哪个二进制」的地方（`expected_vendor.txt` 记的是厂商模块，不是我们的
+  产物）。核对下载到的东西对不对，就靠它。
+
 `update-changelog.md` 是生成物，**别手改**。改内容请改 `CHANGELOG.md`，然后重跑
 `python gen_changelog.py`。
 

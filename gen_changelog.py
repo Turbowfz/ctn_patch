@@ -54,6 +54,45 @@ def extract_section(text: str, version: str) -> str:
     return text[start:(nxt.start() if nxt else len(text))].rstrip() + "\n"
 
 
+def strip_checksums(section: str) -> str:
+    """去掉「校验值」那一段（含 ``` 代码块和它上面的小标题）。
+
+    为什么只在这里去、CHANGELOG.md 里留着：
+      - 更新弹窗是给「这次更新改了什么」看的。管理器**不校验** sha256，
+        用户也不会拿着 64 位哈希去比对，摆在弹窗里就是噪音。
+      - 但 CHANGELOG.md 里留着有价值：那是仓库里唯一记着「每一版发出去的
+        到底是哪个二进制」的地方（`expected_vendor.txt` 记的是厂商模块，
+        不是我们的产物）。要核对下载到的东西对不对，就靠它。
+    """
+    lines = section.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.strip().startswith("```"):
+            j = i + 1
+            body = []
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                body.append(lines[j])
+                j += 1
+            if "sha256" in "\n".join(body):
+                # 把紧邻上面的「**校验值**」小标题和空行一起去掉
+                while out and out[-1].strip() == "":
+                    out.pop()
+                if out and "校验" in out[-1] and len(out[-1]) < 20:
+                    out.pop()
+                while out and out[-1].strip() == "":
+                    out.pop()
+                i = j + 1
+                continue
+            out.extend(lines[i:j + 1])
+            i = j + 1
+            continue
+        out.append(ln)
+        i += 1
+    return "\n".join(out).rstrip() + "\n"
+
+
 def main() -> None:
     version = sys.argv[1] if len(sys.argv) > 1 else current_version()
     if not version.startswith("v"):
@@ -65,10 +104,14 @@ def main() -> None:
         sys.exit("!! CHANGELOG.md 里找不到 %s 那一节 —— 先在 CHANGELOG.md 顶部"
                  "把它写上，再跑本脚本" % version)
 
-    OUT.write_text(HEADER + section, encoding="utf-8", newline="\n")
-    n = len(section.splitlines())
-    print("  已生成 %s（%s，%d 行）" % (OUT.name, version, n))
-    print("  更新器看到的就是这一节；CHANGELOG.md 保持完整历史不变")
+    stripped = strip_checksums(section)
+    dropped = len(section.splitlines()) - len(stripped.splitlines())
+
+    OUT.write_text(HEADER + stripped, encoding="utf-8", newline="\n")
+    print("  已生成 %s（%s，%d 行%s）"
+          % (OUT.name, version, len(stripped.splitlines()),
+             "，去掉了 %d 行校验值" % dropped if dropped else ""))
+    print("  更新器看到的就是这一节；CHANGELOG.md 保持完整历史（含校验值）不变")
 
 
 if __name__ == "__main__":
