@@ -119,7 +119,11 @@ say "--- 3. oplus_bsp_game_opt"
 if grep -q '^oplus_bsp_game_opt ' /proc/modules 2>/dev/null; then
 	pass "oplus_bsp_game_opt 已加载（是模块，可解析符号）"
 	REF="$(sed -n 's/^oplus_bsp_game_opt [0-9]* \([0-9]*\).*/\1/p' /proc/modules)"
-	info "当前 refcount=$REF（装上后会 +1，这是有意钉住防野指针）"
+	if grep -q '^ctn_patch ' /proc/modules 2>/dev/null; then
+		info "当前 refcount=$REF（其中 1 是本模块旧版在引用，装完重启后由新版接管）"
+	else
+		info "当前 refcount=$REF（装上后会 +1，这是有意钉住防野指针）"
+	fi
 else
 	if grep -q '^oplus_bsp_game_opt$' /proc/modules 2>/dev/null; then
 		pass "oplus_bsp_game_opt 已加载"
@@ -161,10 +165,24 @@ else
 fi
 
 # ================= 5. 是否已经有了这个节点（6.6 内核 / 重复安装）=================
+# 节点存在有两种**完全不同**的情况，必须分开处理（早先没分，导致升级被误拒）：
+#   a) ctn_patch 正加载着 → 节点是**我们自己**建的 → 这是「升级」，允许装。
+#      KernelSU 装新版是装到 modules_update，旧版的 ko 还在内存里跑着、
+#      节点还在 —— 这时候要是拒绝，就等于每升一次版卡一次。
+#      装完重启，新版的 ko 接管，节点内容由新版重建。
+#   b) ctn_patch 没加载却有节点 → 内核自带（6.6 那种）或别的补丁建的 → 拒绝。
+# 为什么 (a) 能断定节点是我们的：如果内核本来就有这个节点，我们 insmod 时
+# proc_create_data 会返回 NULL，init 直接 -EEXIST 退出，ctn_patch 就不会
+# 出现在 /proc/modules 里。所以「ctn_patch 在跑」和「节点是我们建的」等价。
 say "--- 5. 是否已存在 critical_task_name"
 if [ -e /proc/game_opt/task_boost/critical_task_name ]; then
-	bad "该节点已存在 —— 内核自带（6.6 那种）或已装过同类补丁，重复安装无意义"
-	info "当前值：$(cat /proc/game_opt/task_boost/critical_task_name 2>/dev/null)"
+	if grep -q '^ctn_patch ' /proc/modules 2>/dev/null; then
+		pass "节点存在，但 ctn_patch 正在运行 —— 这是升级，重启后由新版接管"
+		info "当前值：$(cat /proc/game_opt/task_boost/critical_task_name 2>/dev/null)"
+	else
+		bad "该节点已存在，而 ctn_patch 没在运行 —— 内核自带（6.6 那种）或别的补丁建的，重复安装无意义"
+		info "当前值：$(cat /proc/game_opt/task_boost/critical_task_name 2>/dev/null)"
+	fi
 else
 	pass "节点不存在，安装后由本模块提供"
 fi
