@@ -33,13 +33,14 @@ FILES = {
     "action.sh": (MAGISK, True, True),
     "verify.sh": (HERE, True, True),
     "README.md": (MAGISK, False, False),
+    "ctn.conf.example": (MAGISK, False, True),  # service.sh 首次启动铺到 /data/adb/ctn_patch/
     "LICENSE": (HERE, False, True),   # GPL 要求：分发二进制须随附许可
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
     # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）
     "ctnd": (HERE / "daemon", True, True),
 }
 
-TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt"}
+TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt", ".example"}
 
 
 def find_ko() -> Path | None:
@@ -94,6 +95,12 @@ def main() -> None:
                         src = HERE / name
             mode = 0o755 if executable else 0o644
             info = zipfile.ZipInfo(name)
+            # create_system=3 表示「这个 zip 是 Unix 上打的」。少了它，条目会被
+            # 当成 DOS 文件，解包器（KernelSU 用的 Info-ZIP unzip）就只看 DOS
+            # 属性、无视下面那个 Unix 权限位 —— 可执行位会整条丢掉，ctnd 解出来
+            # 是 0644，daemon 根本起不来（真机上踩过）。带 #! 的脚本侥幸没事，
+            # 是因为管理器会给有 shebang 的文件补 0755；裸二进制没有这层照顾。
+            info.create_system = 3
             info.external_attr = (mode << 16) | 0o100000  # 常规文件
             data = src.read_bytes()
             if src.suffix in TEXT_SUFFIXES:
@@ -113,9 +120,27 @@ def main() -> None:
         h = hashlib.sha256(devko.read_bytes()).hexdigest()
         with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
             info = zipfile.ZipInfo("expected_vendor.txt")
+            info.create_system = 3
             info.external_attr = (0o644 << 16) | 0o100000
             z.writestr(info, "vendor_ko_sha256=%s\n" % h)
         print("  + expected_vendor.txt  (构建时对照的厂商模块 sha256=%s...)" % h[:16])
+
+    # 回读校验：确认写进去的权限位真的能读出来，而且 create_system=3。
+    # 这一步是为了挡住上面那个坑 —— 权限位写错了 zip 照样打得出来，
+    # 只有装到手机上才会以「daemon 起不来」的形式暴露，太晚。
+    bad = []
+    with zipfile.ZipFile(out) as z:
+        for name, (_, executable, _) in FILES.items():
+            try:
+                info = z.getinfo(name)
+            except KeyError:
+                continue
+            want = 0o755 if executable else 0o644
+            got = (info.external_attr >> 16) & 0o7777
+            if info.create_system != 3 or got != want:
+                bad.append(f"{name}: create_system={info.create_system} mode={got:o}（要 3/{want:o}）")
+    if bad:
+        sys.exit("!! 权限位写错了（解包器会丢掉可执行位）:\n  " + "\n  ".join(bad))
 
     print(f"\n完成: {out}")
     print("刷入: Magisk/KSU App -> 模块 -> 从存储安装 -> 选这个 zip -> 重启")

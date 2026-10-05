@@ -1,0 +1,39 @@
+# ================= ctn_patch 本地覆盖文件（示例） =================
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# 这个文件是 ctnd 的「手写兜底」名单。它存在的唯一理由：
+# 云控库（COSA 的 db_game_database）里没覆盖到的游戏、或者那条配置是
+# 加密内容、ctnd 解不出来时，你在这里写一行，照样能把关键线程名注入进去。
+#
+# 生效位置（服务启动时会自动把本示例拷过去，已存在就不覆盖）：
+#     /data/adb/ctn_patch/ctn.conf
+# 也就是说：想改就编辑上面那个路径的文件，改完不用重启，
+# ctnd 每次游戏启动都会重新读一遍。
+#
+# 格式：一行一条，等号左边是包名，右边是 1~2 个线程名，空格分开。
+#       以 # 开头的行是注释。行首行尾的空白会被忽略。
+#
+#     包名 = 线程名1 线程名2
+#
+# 优先级：本文件 > 云控库。本文件里写了，就不再去看云控那条。
+#
+# 线程名怎么写（重要）：
+#   1) 线程名必须和游戏里真实线程名一模一样，大小写敏感。
+#   2) 最长 15 个字符。内核里 task->comm 只有 16 字节（含结尾的 0），
+#      超过 15 字符的名字永远匹配不到任何线程，写了等于没写（ctnd 会告警）。
+#   3) 怎么查游戏线程名：
+#        游戏跑起来后，在 root shell 里执行
+#            ps -T -p $(cat /proc/game_opt/game_pid) | head -50
+#        右边 NAME 那一列就是线程名，挑负责渲染/主逻辑的那一两个填进来。
+#   4) 只写一个名字也行，ctnd 会把它写两遍（内核要两个槽，填同一个线程等价）。
+#
+# 下面是几个填写示例（前面带 # 的都没生效，要用就把 # 去掉）：
+#
+# 和平精英（主线程通常叫 GameThread，渲染线程叫 RenderThread）
+#com.tencent.tmgp.pubgmhd = GameThread RenderThread
+#
+# 原神
+#com.miHoYo.Yuanshen = UnityMain UnityGfxDevice
+#
+# 王者荣耀
+#com.tencent.tmgp.sgame = GameThread RenderThread

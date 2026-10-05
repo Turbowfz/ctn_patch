@@ -69,6 +69,15 @@ fi
 	# ---------- 阶段二：守护 ctnd（此时节点已经在了）----------
 	[ -x "$MODDIR/ctnd" ] || { echo "警告：找不到 $MODDIR/ctnd，节点不会被自动写入" >> "$LOG"; exit 0; }
 
+	# 本地覆盖文件：不存在就把带注释的示例铺一份，方便用户照格式手写。
+	# 放在 /data/adb/ctn_patch/（不是模块目录里）——模块目录会在升级时被替换，
+	# 用户手写的名单不该跟着一起没。
+	mkdir -p /data/adb/ctn_patch
+	if [ ! -f /data/adb/ctn_patch/ctn.conf ] && [ -f "$MODDIR/ctn.conf.example" ]; then
+		cp "$MODDIR/ctn.conf.example" /data/adb/ctn_patch/ctn.conf
+		echo "==== $(date) 已铺开本地覆盖文件 /data/adb/ctn_patch/ctn.conf ====" >> "$DLOG"
+	fi
+
 	while true; do
 		# 两个退出条件缺一不可：哨兵出现、或模块目录没了。
 		# 少了它们，卸载时 pkill 只杀得掉 ctnd 本体，杀不掉这个循环，

@@ -30,7 +30,8 @@
 |---|---|
 | `ctn_patch.ko` | 外部 LKM，补出可写节点 |
 | `ctnd` | 用户态 daemon，按云控配置自动写节点 |
-| `ctn_patch.zip` | Magisk / KernelSU 刷入包（含上面两个） |
+| `ctn.conf` | 本地覆盖名单（手写兜底，优先级高于云控），首次开机自动铺到 `/data/adb/ctn_patch/` |
+| `ctn_patch.zip` | Magisk / KernelSU 刷入包（含上面全部） |
 
 ## 三、安装
 
@@ -45,6 +46,9 @@ cat /data/adb/modules/ctn_patch/boot.log     # 模块加载 + daemon 启动
 cat /data/adb/modules/ctn_patch/daemon.log   # daemon 干活记录
 cat /proc/game_opt/task_boost/critical_task_name
 ```
+
+想手动指定某个游戏的关键线程名，编辑 `/data/adb/ctn_patch/ctn.conf`
+（首次开机自动铺好带注释的模板），见 5.4 节。
 
 ## 四、用法
 
@@ -63,7 +67,8 @@ cat /proc/game_opt/task_boost/critical_task_name
 | `A B` / `A    B` / `A<TAB>B` | 接受 |
 | `onlyone`（只填一个） | 拒绝 `-EINVAL`，节点不变 |
 | `A B C`（三个） | 拒绝 `-EINVAL` |
-| 空 | 拒绝 `-E2BIG` |
+| 全是空白（如一个空格） | 拒绝 `-EINVAL` |
+| `write(fd, buf, 0)` | 拒绝 `-E2BIG`（注意 `: > 节点` 这类 shell 写法压根不产生 write 调用，是空操作，不是被接受） |
 | 99 字符 | 接受（接口上限，与官方 `%99s` 一致） |
 
 **写入是整体替换**，不保留原值。想留着 Unity 默认名就自己带上：
@@ -100,17 +105,21 @@ cat /proc/game_opt/task_boost/critical_task_name
 ### 5.2 daemon
 
 ```
-轮询 /proc/game_opt/game_pid (500ms)
+轮询 /proc/game_opt/game_pid (800ms)
   │  HAL 在游戏启动时写 pid、退出写 -1
   └ pid 由 -1 变正数
       ├ 读 /proc/<pid>/cmdline 取包名
-      ├ 拷 db/-wal/-shm 到临时目录，用 SQLite 查该包的 game_config
-      │   库: /data/user/0/com.oplus.cosa/databases/db_game_database
-      ├ 有 ctn       → 写进去
+      ├ ① 本地覆盖文件 /data/adb/ctn_patch/ctn.conf 命中 → 用它（优先级最高）
+      ├ ② 否则查云控库：
+      │     命中缓存且库指纹没变 → 直接用（不碰库）
+      │     否则拷 db + -wal 到临时目录，SQLite 查该包的 game_config
+      │       库: /data/user/0/com.oplus.cosa/databases/db_game_database
+      ├ 有 ctn（明文 JSON 或 base64 编码的 JSON）→ 写进去
       ├ 有配置无 ctn → Unity 游戏 → 写回 UnityMain UnityGfxDevice
       ├ 库里没这个包 → OPLUS 不认识 → 写回默认值
+      ├ 配置是加密/未知形态 → 明确告警 + 提示怎么写本地覆盖 → 写回默认值
       └ 读库失败     → 保持现状不动（宁可不动，也别写错名字）
-  └ pid 连续 8 次（4 秒）为 -1 → 恢复默认名字
+  └ pid 连续 6 次（约 5 秒）为 -1 → 恢复默认名字
 ```
 
 `game_config` 里的 **`ctn`** 就是官方给的关键线程名，格式与节点完全一致：
@@ -129,11 +138,48 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 | 点 | 做法 | 原因 |
 |---|---|---|
 | 读 SQLite | `dlopen("/system/lib64/libsqlite.so")` | 平台私有库，NDK 没 stub；各机型路径不同，dlopen 好回退 |
-| 库是 WAL 模式 | 拷 db/-wal/-shm 再读 | 直接开原库会动它的 -shm，拷贝零干扰 |
+| 库是 WAL 模式 | 拷 db + -wal 再读（**不拷 -shm**） | 直接开原库会动它的 -shm；-shm 是 COSA 正在 mmap 的共享内存，拷它既没必要（SQLite 会重建）也可能拷到撕裂内容 |
+| 配置缓存 | 按包名缓存 64 条，比对库指纹 | 同一个包反复启停只解析一次，省掉重复拷贝 600KB 库 |
+| 库指纹 | db/-wal 的 `mtime+size+inode` 哈希 | 库没变就整段跳过拷贝和解析 |
 | JSON 解析 | 手写取值器 | `game_config` 是扁平 JSON，省一个依赖 |
 | `ctn` 字符串 / `ctb` 数字 | 两个取值器 | 混用会取不到 `ctb` |
-| 退出防抖 | 连续 8 次 -1 才算退出 | 加载期 `game_pid` 会反复抖好几秒 |
+| base64 编码 | 自带解码器（含无填充残余处理） | 云控可能下发编码过的 JSON，省掉 libcrypto 依赖 |
+| 退出防抖 | 连续 6 次 -1 才算退出 | 加载期 `game_pid` 会反复抖好几秒 |
 | 单实例 | `flock` 锁文件 | 防止被两条路径重复拉起 |
+| 库路径 | 内置多候选 + `--db <路径>` 覆盖 | 换机型/换 OPLUS 版本时库不在候选列表里，留个出口 |
+
+### 5.3 云控配置的三种形态，daemon 怎么处理
+
+云控库 `game_config` 这一列的内容**不一定是明文 JSON**。daemon 按下面顺序判定：
+
+| 形态 | 判别 | 处理 |
+|---|---|---|
+| 明文 JSON | 串里有 `{` | 直接取 `ctn` / `ctb` |
+| base64 编码的 JSON | 不含 `{`，但能完整 base64 解码 | 先解码，再在解码结果里取 |
+| 加密 / 未知 | 上面两条都不成立 | **不硬猜**：日志明确告警 + 告诉你怎么写本地覆盖，本次先写回默认值 |
+
+> 判定用「有没有 `{`」是因为 base64 字符集里不含 `{`，这个判别很稳，不需要猜。
+> 实测本机 84 条官方配置**全部是明文 JSON**，加密形态目前没出现过 —— 留这条
+> 分支是为了「不管云控怎么下发，注入这条路都走得通」。
+
+### 5.4 本地覆盖文件（手写兜底）
+
+`/data/adb/ctn_patch/ctn.conf`，**优先级高于云控库**。刷入后首次启动
+`service.sh` 会从模块目录把带注释的 `ctn.conf.example` 铺一份过去，照着改即可：
+
+```
+# 一行一条，等号左边包名，右边 1~2 个线程名
+com.tencent.tmgp.pubgmhd = GameThread RenderThread
+```
+
+改完不用重启，ctnd 每次游戏启动都重读一遍。什么时候用得上：
+
+- 云控没覆盖的游戏
+- 云控那条是加密内容、daemon 读不出来（日志里会明确提示）
+- 你就是想手动指定，不想被云控改
+
+放在 `/data/adb/ctn_patch/`（不是模块目录里）是有意的：模块目录升级时会被替换，
+用户手写的名单不该跟着一起没。
 
 ## 六、构建
 
@@ -166,17 +212,34 @@ bash wsl_build.sh        # 一键全流程（详见脚本内注释）
 ### 6.2 daemon
 
 ```bash
-bash daemon/build.sh     # NDK aarch64 clang，产出约 18KB 单文件
+bash daemon/build.sh     # NDK aarch64 clang，产出约 21KB 单文件
 bash daemon/lint.sh      # 严格警告检查（应零输出）
+bash daemon/test.sh      # PC 上跑解析逻辑单元测试（不需要设备）
 ```
 
-只依赖 `libc.so` / `libdl.so`，无其他运行时依赖。
+只依赖 `libc.so` / `libdl.so`，无其他运行时依赖。`test.sh` 覆盖 base64
+解码（含无填充残余）、明文/base64 JSON 取值、加密形态识别、名字归一化、
+`game_pid` 解析、本地覆盖文件解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
+
+真机上还有一套端到端用例（`daemon/device_e2e.sh` + `daemon/fakepkg.c`）：
+
+```bash
+# 需要 root shell。用 --db 指向一份合成的云控库，把 8 种配置形态都走一遍，
+# fakepkg 负责伪造「进程名 = 包名」的进程来驱动判断链。
+# 不改动设备上真正的 COSA 库与模块目录。
+adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh /data/local/tmp/
+bash daemon/build.sh && adb push ctn_patch.ko /data/local/tmp/
+adb shell su -c 'chmod 755 /data/local/tmp/{ctnd,fakepkg,device_e2e.sh}; /data/local/tmp/device_e2e.sh'
+```
 
 ### 6.3 打包
 
 ```bash
 python build_zip.py      # 产出 ctn_patch.zip
 ```
+
+打包时会回读 zip 校验每个条目的 `create_system` 与权限位（见第十二节第 10 条），
+不对就直接报错退出。
 
 ## 七、兼容性
 
@@ -217,7 +280,8 @@ python build_zip.py      # 产出 ctn_patch.zip
 4. **本设备 6.1 的 HAL 不读这个节点**（走
    `/proc/sys/oplus_sched_ext/pid_unitymain`），所以补节点是补齐 6.6 标准接口 +
    让内核侧匹配名单可改。
-5. **daemon 依赖 COSA 的云控库**。库里没有的游戏（OPLUS 不认识）只能用默认名。
+5. **daemon 依赖 COSA 的云控库**。库里没有的游戏（OPLUS 不认识）、或库里那条
+   是加密内容时，用默认名 —— 这种情况可以在本地覆盖文件里手写一行解决（见 5.4）。
 6. 模块不持久化；刷 zip 则由 `service.sh` 开机自动加载。
 
 ## 九、许可
@@ -305,9 +369,12 @@ git add -A && git commit -m 'v1.1' && git push github main && git push gitee mai
 | 刷入时被 `[不满足]` 拒绝 | 闸门拦住了，消息里写明是哪一条 |
 | `daemon.log` 里没有「游戏启动」 | `game_pid` 没变 → 这游戏不在 OPLUS 名单里，HAL 不认 |
 | `sqlite: 所有候选路径都加载失败` | 该机型库名/路径不同，改 `ctnd.c` 的 `SQLITE_CANDIDATES` |
-| `库: 包 xxx 不在 PackageConfigBean 里` | OPLUS 不认识这个游戏 → 用默认名 |
+| `云控库里没有这个游戏` | OPLUS 不认识这个包 → 用默认名，或在 `ctn.conf` 里手写一行 |
+| `既不是 JSON 也不是 base64-JSON` | 该包配置是加密/未知形态 → 在 `ctn.conf` 里手写一行 |
 | 节点是 `UnityMain` 但游戏是虚幻的 | 读库失败（看日志），或该包配置里确实没有 `ctn` |
 | 名字对了但没效果 | `ct_enable=0` → 见第八节第 1 条 |
+| `daemon.log` 里只有「启动」没有「游戏启动」 | `game_pid` 没变过 → HAL 没把这游戏当游戏（不在 OPLUS 名单里），或在用 `--db` 指了别的库 |
+| 模块装上了但 `daemon.log` 不生成 | `ctnd` 解包后丢了可执行位（见第十二节第 10 条），手动 `chmod 755` 或重装 |
 | `daemon.log` 一直刷「已有另一个 ctnd 在跑」 | 有重复的守护循环，正常会自己退出；若持续刷说明守护脚本是旧版 |
 
 ## 十二、开发中踩过的坑（改代码前请读）
@@ -327,3 +394,18 @@ git add -A && git commit -m 'v1.1' && git push github main && git push gitee mai
    `btf_struct_dump.py` 可以直接 dump 任意 struct 的成员偏移，比猜配置快得多。
 6. **`game_pid` 在游戏加载期会在正数和 -1 之间反复抖好几秒**，退出判定必须防抖。
 7. **`game_config` 里 `ctn` 是字符串、`ctb` 是数字**，JSON 取值器要分开。
+8. **无填充的 base64 尾部必须单独处理**。只按 4 字符一组解码的话，
+   `aGVsbG8`（`hello`）这种会丢掉最后几个字符，解出来的 JSON 被截断。
+   `daemon/test.sh` 里有用例覆盖这条。
+9. **`ctn` 和 `ctb` 必须从同一个源串取**。base64 形态下只在原始串上找 `ctb`
+   永远找不到 —— 解出来的 JSON 才是真源。这条也是单元测试抓出来的。
+10. **打 zip 必须设 `ZipInfo.create_system = 3`**。Python 默认写 0（=DOS），
+    解包器（KernelSU 用的 Info-ZIP unzip）就只看 DOS 属性、无视 `external_attr`
+    里的 Unix 权限位，`ctnd` 解出来变成 0644 —— 表现是「模块装上了，但
+    `daemon.log` 不生成、节点没人写」。带 `#!` 的脚本侥幸没事，因为管理器会给
+    有 shebang 的文件补 0755；**裸二进制没有这层照顾**。`build_zip.py` 现在
+    打完包会回读校验，`customize.sh` 里也补了 `set_perm` 兜底。
+11. **`game_pid` 节点只认裸 pid**。内核里是 `sscanf(page, "%d", &pid)`
+    （`task_util.c:56`），而且要求这个 pid 是**线程组组长**（`pid == tgid`）。
+    写成 `game_pid=123 child_num=0` 会被 `-EINVAL` 拒掉 —— 那个格式是**读**出来的，
+    不是写进去的。调试时别照着读的格式写。

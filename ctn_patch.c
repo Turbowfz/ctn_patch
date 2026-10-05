@@ -529,5 +529,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

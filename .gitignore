@@ -1,6 +1,8 @@
 # 构建产物：不要提交（可由源码 + device_kernel.config + Module.symvers.device 重建）
 *.ko
 daemon/ctnd
+daemon/fakepkg
+daemon/synth.db
 *.o
 *.mod
 *.mod.c

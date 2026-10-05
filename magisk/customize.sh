@@ -306,11 +306,17 @@ fi
 ui_print "=============================="
 
 # ---------- 权限 ----------
-set_perm "$MODPATH/ctn_patch.ko" 0 0 0644
-set_perm "$MODPATH/service.sh"   0 0 0755
-set_perm "$MODPATH/uninstall.sh" 0 0 0755
-set_perm "$MODPATH/action.sh"    0 0 0755
-set_perm "$MODPATH/verify.sh"    0 0 0755
+# ctnd 必须显式 chmod：解包器不一定认 zip 里存的 Unix 权限位
+# （实测 KernelSU 用 Info-ZIP unzip 解包，遇到 create_system=0 的条目会
+#   按 DOS 属性处理，可执行位直接丢掉，解出来是 0644 —— daemon 起不来）。
+# 带 #! 的脚本会被解包器/管理器补上 0755，但没有 shebang 的二进制不会。
+set_perm "$MODPATH/ctn_patch.ko"     0 0 0644
+set_perm "$MODPATH/ctnd"             0 0 0755
+set_perm "$MODPATH/service.sh"       0 0 0755
+set_perm "$MODPATH/uninstall.sh"     0 0 0755
+set_perm "$MODPATH/action.sh"        0 0 0755
+set_perm "$MODPATH/verify.sh"        0 0 0755
+set_perm "$MODPATH/ctn.conf.example" 0 0 0644
 
 say "- 安装完成，重启后自动加载"
 say "- 开机日志：/data/adb/modules/ctn_patch/boot.log"
