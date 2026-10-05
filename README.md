@@ -512,3 +512,16 @@ KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在
     比对大小/哈希。另外 Gitee 的 release 详情里**没有** `attach_files` 字段
     （只有 `assets`，且不含附件 id），判重必须单独查
     `/releases/{id}/attach_files`。
+13. **「节点已存在」这个检查必须区分「我们自己在跑」和「别人建的」**（v1.2 修掉
+    的 bug，害得所有升级都被拒）。KernelSU 装新版是装到 `modules_update`，
+    **旧版的 ko 还在内存里跑着、节点还在** —— 检查 5 要是不区分，就会把每一次
+    正常升级都当成「重复安装」拒掉。判据：`ctn_patch` 出现在 `/proc/modules` 里
+    → 节点是我们自己建的（内核本来就有该节点的话，我们 `insmod` 时
+    `proc_create_data` 会返回 NULL、`init` 直接 `-EEXIST` 退出，`ctn_patch`
+    根本不会出现在 `/proc/modules` 里）。**写「安装时检查」这类逻辑时，先想清楚
+    升级路径下设备处于什么状态** —— 升级时新旧两版是同时在的。
+14. **发布出去的东西不原地改**。v1.1 的刷入包有上面那个 bug，但没去替换 v1.1 的
+    附件，而是发了 v1.2（`bump.py` 也强制 versionCode 递增）。理由：已经发布的
+    artifact 和它的哈希是记录，改了以后「谁装的是哪个」就说不清了。顺带一个
+    好处：`customize.sh` 是**被安装的那个 zip 里**的脚本，所以从有 bug 的 v1.1
+    升到修好的 v1.2 不会踩这个坑（用的是新版的脚本）。
