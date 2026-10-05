@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -66,6 +67,10 @@ static const char *SQLITE_CANDIDATES[] = {
 	NULL,
 };
 
+/* 退出码：3 = 已有另一个实例在跑。service.sh 的守护循环见到 3 就不再重启，
+ * 否则重复的守护循环会每 5 秒起一次、每次都被锁挡回来，白刷日志。 */
+#define EXIT_ALREADY_RUNNING 3
+
 #define NAME_MAX_LEN 100          /* 与内核接口一致（官方 6.6 用 %99s） */
 #define TMP_DIR      "/data/local/tmp/.ctnd"
 #define POLL_MS      500
@@ -73,36 +78,32 @@ static const char *SQLITE_CANDIDATES[] = {
 #define GONE_POLLS   8            /* 8 × 500ms = 4 秒 */
 
 /* ------------------------------ 日志 ------------------------------ */
-
-static FILE *g_log;
-static bool g_verbose;
-
+/*
+ * 只写 stderr：service.sh 用 >> daemon.log 2>&1 重定向，日志就落到模块目录。
+ * 不做文件日志是刻意的 —— 少一处 fd、少一处出错可能（原来那套 g_log 其实
+ * 永远是 NULL，等于白留一个开关）。
+ */
+/*
+ * format(printf,1,2) 让编译器去查每个调用点的格式串对不对
+ * （顺带消掉 -Wformat-nonliteral 那条必然出现的告警）。
+ */
+__attribute__((format(printf, 1, 2)))
 static void logmsg(const char *fmt, ...)
 {
 	char ts[32];
 	time_t now = time(NULL);
 	struct tm tm;
+	va_list ap;
 
 	localtime_r(&now, &tm);
 	strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tm);
 
-	va_list ap;
+	fprintf(stderr, "[%s] ", ts);
 	va_start(ap, fmt);
-	if (g_log) {
-		fprintf(g_log, "[%s] ", ts);
-		vfprintf(g_log, fmt, ap);
-		fputc('\n', g_log);
-		fflush(g_log);
-	}
-	if (!g_log || g_verbose) {
-		fprintf(stderr, "[%s] ", ts);
-		va_list ap2;
-		va_start(ap2, fmt);
-		vfprintf(stderr, fmt, ap2);
-		va_end(ap2);
-		fputc('\n', stderr);
-	}
+	vfprintf(stderr, fmt, ap);
 	va_end(ap);
+	fputc('\n', stderr);
+	fflush(stderr);		/* 掉电/被杀时也别丢最后几行 */
 }
 
 /* --------------------------- SQLite 动态加载 --------------------------- */
@@ -167,6 +168,43 @@ static bool load_sqlite(void)
 	BIND(sqlite3_errmsg);
 #undef BIND
 
+	return true;
+}
+
+/* --------------------------- 单实例锁 --------------------------- */
+/*
+ * 同一个模块可能被两条路径拉起来（service.sh 的守护循环、action.sh 的
+ * 「操作」按钮，或用户手动敲一次），重复跑会两个进程抢着写同一个节点。
+ * 用 flock 排他锁挡掉：锁文件放在可执行文件旁边（模块目录）。
+ */
+static int g_lock_fd = -1;
+
+static bool acquire_single_instance(const char *exe)
+{
+	char path[PATH_MAX];
+	char *slash;
+	int fd;
+
+	snprintf(path, sizeof(path), "%s", exe);
+	slash = strrchr(path, '/');
+	if (slash)
+		slash[1] = 0;
+	else
+		snprintf(path, sizeof(path), "./");
+	strncat(path, ".ctnd.lock", sizeof(path) - strlen(path) - 1);
+
+	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		/* 锁文件建不了不算致命，照常跑，只是失去防重复能力 */
+		logmsg("锁: 打不开 %s: %s（继续跑）", path, strerror(errno));
+		return true;
+	}
+	if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+		close(fd);
+		logmsg("锁: 已有另一个 ctnd 在跑，本进程退出（%s）", path);
+		return false;
+	}
+	g_lock_fd = fd;
 	return true;
 }
 
@@ -435,6 +473,9 @@ static int lookup_ctn(const char *pkg, char *out, size_t outlen, int *ctb)
 		ret = 1;
 		goto out;
 	}
+	if (strlen((const char *)txt) >= sizeof(cfg))
+		logmsg("库: 警告 %s 的 game_config 有 %zu 字节，超过本地缓冲 %zu，"
+		       "可能取不到 ctn", pkg, strlen((const char *)txt), sizeof(cfg));
 	snprintf(cfg, sizeof(cfg), "%s", (const char *)txt);
 
 	{
@@ -466,6 +507,7 @@ static bool normalize_and_write(const char *names)
 	int n = 0;
 	char *p;
 	char out[256];
+	int i;
 
 	snprintf(buf, sizeof(buf), "%s", names ? names : "");
 	for (p = strtok(buf, " \t\r\n"); p && n < 8; p = strtok(NULL, " \t\r\n"))
@@ -483,9 +525,15 @@ static bool normalize_and_write(const char *names)
 			logmsg("名字: 配置里有 %d 个，只取前两个", n);
 	}
 
-	if (strlen(tok[0]) >= 16)
-		logmsg("名字: 警告 [%s] 超过 15 字符，内核匹配不到（task->comm 只有 16 字节）",
-		       tok[0]);
+	/*
+	 * 长度提醒：内核比对是 strncmp(task->comm, name, strlen(name))，
+	 * 而 task->comm 只有 16 字节（含 NUL），所以超过 15 字符的名字永远匹配不到。
+	 * 注意要在 n==0 判断之后再做 —— 空串时 tok[0] 还是未初始化的野指针。
+	 */
+	for (i = 0; i < (n < 2 ? n : 2); i++)
+		if (strlen(tok[i]) >= 16)
+			logmsg("名字: 警告 [%s] 超过 15 字符，内核匹配不到（task->comm 只有 16 字节）",
+			       tok[i]);
 
 	if (!write_file(NODE_PATH, out)) {
 		logmsg("写入失败 %s: %s（模块加载了吗？）", NODE_PATH, strerror(errno));
@@ -566,17 +614,14 @@ int main(int argc, char **argv)
 	int i;
 
 	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose"))
-			g_verbose = true;
-		else if (!strcmp(argv[i], "-e") || !strcmp(argv[i], "--enable-ctb"))
+		if (!strcmp(argv[i], "-e") || !strcmp(argv[i], "--enable-ctb"))
 			g_manage_cten = true;
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			printf("ctnd —— 按云控配置自动写 critical_task_name\n"
-			       "用法: ctnd [-v] [-e]\n"
-			       "  -v, --verbose      日志同时打到 stderr\n"
+			       "用法: ctnd [-e]\n"
 			       "  -e, --enable-ctb   连 ct_enable 一起按配置的 ctb 开关\n"
 			       "                     （默认不管：HAL 自己会写，同时管可能互相打架）\n"
-			       "  日志走 stderr，由 service.sh 重定向到 daemon.log\n");
+			       "日志走 stderr，由 service.sh 重定向到 daemon.log\n");
 			return 0;
 		}
 	}
@@ -586,8 +631,20 @@ int main(int argc, char **argv)
 	/* 父进程（service.sh）退出时不要把我们带走 */
 	signal(SIGHUP, SIG_IGN);
 
+	/* 只允许一个实例；重复启动直接退出，避免两个进程抢写同一个节点 */
+	if (!acquire_single_instance(argv[0]))
+		return EXIT_ALREADY_RUNNING;
+
 	logmsg("ctnd 启动（节点 %s%s）", NODE_PATH,
 	       g_manage_cten ? "，代管 ct_enable" : "");
+
+	/*
+	 * 先确认节点在。模块没加载/加载失败时节点不存在，这时没必要每来一个
+	 * 游戏就报一次写入失败；提一次就好，后面该写还是会试着写。
+	 */
+	if (access(NODE_PATH, W_OK) != 0)
+		logmsg("注意: 现在写不了 %s（%s）—— ctn_patch 模块没加载？"
+		       " 节点出现后本进程会照常工作", NODE_PATH, strerror(errno));
 
 	/* 启动时先对齐一次当前状态（比如 daemon 是被重启的，游戏已经在跑） */
 	if (read_file(GAMEPID_PATH, buf, sizeof(buf))) {
@@ -625,7 +682,7 @@ int main(int argc, char **argv)
 		 * GONE_POLLS 次 -1 才当真的退出，免得把刚写好的名字冲回默认值。
 		 */
 		if (last > 0 && ++gone >= GONE_POLLS) {
-			logmsg("游戏退出（pid 连续两次为 -1），恢复默认名字");
+			logmsg("游戏退出（pid 连续 %d 次为 -1），恢复默认名字", GONE_POLLS);
 			last = -1;
 			gone = 0;
 			normalize_and_write(DEFAULT_NAMES);
@@ -633,7 +690,7 @@ int main(int argc, char **argv)
 	}
 
 	logmsg("ctnd 退出");
-	if (g_log)
-		fclose(g_log);
+	if (g_lock_fd >= 0)
+		close(g_lock_fd);
 	return 0;
 }

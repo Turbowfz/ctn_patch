@@ -25,6 +25,12 @@ say() { echo "$@"; }
 ok()  { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 ng()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 
+# 打一个内核日志标记：后面只截取标记之后的日志来判异常。
+# 不这么做的话，会把 msm_vidc / binder_debug 这类跟本模块无关的
+# WARNING 也算成失败（实测踩过，白报一个 FAIL）。
+KLOG_MARK="CTN_VERIFY_$$_$(date +%s)"
+echo "$KLOG_MARK START" > /dev/kmsg 2>/dev/null
+
 say "=== 0. 前置检查 ==="
 if [ "$(id -u)" != "0" ]; then
 	echo "  必须以 root 运行"; exit 1
@@ -181,16 +187,19 @@ fi
 
 say ""
 say "=== 10. 内核日志 ==="
+# 只取本次测试期间（标记之后）的日志，避免被无关模块的 WARNING 误伤
+LOG=$(dmesg | sed -n "/$KLOG_MARK START/,\$p")
 say "  --- ctn_patch 相关 ---"
-dmesg | grep -i ctn_patch | tail -n 10 | sed 's/^/    /'
+echo "$LOG" | grep -i ctn_patch | tail -n 10 | sed 's/^/    /'
 say "  --- 异常扫描（期望为空）---"
-BAD=$(dmesg | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace" | tail -n 10)
+BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" 	| grep -vE "CTN_VERIFY_" | tail -n 10)
 if [ -z "$BAD" ]; then
-	ok "dmesg 无 BUG/WARNING/oops"
+	ok "本次测试期间 dmesg 无 BUG/WARNING/oops/CFI failure"
 else
 	ng "dmesg 有异常"
 	echo "$BAD" | sed 's/^/    /'
 fi
+echo "$KLOG_MARK END" > /dev/kmsg 2>/dev/null
 
 say ""
 say "=== 11. 卸载 ==="

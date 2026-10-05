@@ -77,12 +77,18 @@ txt = setval(txt, 'CONFIG_LOCALVERSION', '"-android14-11-o-gdc1b6a03413f"')
 txt = unset(txt, 'CONFIG_LOCALVERSION_AUTO')
 # 构建机上不存在的白名单路径
 txt = setval(txt, 'CONFIG_UNUSED_KSYMS_WHITELIST', '""')
-# 省 pahole 依赖 / 防 -Werror 咬人（都不影响 vermagic 和结构体布局）
-txt = unset(txt, 'CONFIG_DEBUG_INFO_BTF')
-txt = unset(txt, 'CONFIG_DEBUG_INFO_BTF_MODULES')
-txt = unset(txt, 'CONFIG_WERROR')
+    # WERROR 也保留设备值（clang 17.0.2 编不会有新警告问题）
+    # ★ 千万不要关 CONFIG_DEBUG_INFO_BTF / _BTF_MODULES ★
+    #   它们给 struct module 加字段，一关掉 sizeof(struct module) 就从 1088
+    #   掉到 1024，装载器按自己的布局越界写坏指针 → insmod 时 panic。
+    # ★ 千万不要关 CONFIG_DEBUG_INFO_BTF / _BTF_MODULES ★
+    #   它们给 struct module 加字段，一关掉 sizeof(struct module) 就从 1088
+    #   掉到 1024，装载器按自己的布局越界写坏指针 → insmod 时 panic。
+    # ★ 千万不要关 CONFIG_DEBUG_INFO_BTF / _BTF_MODULES ★
+    #   它们给 struct module 加字段，一关掉 sizeof(struct module) 就从 1088
+    #   掉到 1024，装载器按自己的布局越界写坏指针 → insmod 时 panic。
 open(path, 'w', encoding='utf-8', newline='\n').write(txt)
-print("    已钉 LOCALVERSION，关 BTF/WERROR")
+print("    已钉 LOCALVERSION，其余配置沿用设备值")
 PYEOF
 
 # ---------- 5. 断链重指 + Kconfig 修补 + olddefconfig ----------
@@ -90,12 +96,12 @@ step "5/8 断链重指 + Kconfig 修补 + olddefconfig"
 bash "$HERE/arch_relink.sh" || exit 1
 
 # ---------- 6. modules_prepare ----------
+# 生成内核头文件 / host 工具 / kernel.release。
+# 注意：改过 .config 后必须重跑这一步，否则 autoconf.h 还是旧的
+# （实测踩过：以为关了 BTF 不影响 struct module，其实是 prepare 没重跑）。
 step "6/8 modules_prepare"
-if [ ! -f "$OUT/Module.symvers" ] && [ ! -d "$OUT/scripts" ]; then
-	bash "$HERE/arch_prepare.sh" || exit 1
-else
-	bash "$HERE/arch_prepare.sh" || exit 1
-fi
+make -C "$KERNEL" O="$OUT" ARCH=arm64 LLVM=1 CC="$NDK/bin/clang" 	HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld -j"$(nproc)" modules_prepare 2>&1 | tail -5
+echo "    kernel.release = $(cat "$OUT/include/config/kernel.release" 2>/dev/null)"
 
 # ---------- 7. 编模块（含 symvers 重排 + .scmversion 去 + 号）----------
 step "7/8 编模块"
@@ -130,7 +136,7 @@ for line in open(src, encoding="utf-8"):
     crc, sym = p[0], p[1]
     export = p[2] if len(p) > 2 else "EXPORT_SYMBOL"
     ns = p[4] if len(p) > 4 else ""
-    out.append("\t".join([crc, sym, "kernel", export, ns]) + "\n")
+    out.append("\t".join([crc, sym, "vmlinux", export, ns]) + "\n")
 open(dst, "w", newline="\n").write("".join(out))
 print(f"    symvers {len(out)} 条")
 PYEOF

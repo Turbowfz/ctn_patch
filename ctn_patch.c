@@ -522,6 +522,10 @@ static void __exit ctn_patch_exit(void)
 module_init(ctn_patch_init);
 module_exit(ctn_patch_exit);
 
+/* 本模块以 GPL-2.0-only 发布（见 SPDX 头与 LICENSE）。
+ * 内核的 license_is_gpl_compatible() 把 "GPL" 认作 GPL-2.0，这是内核模块的
+ * 通用写法；同时这样才拿得到 register_kprobe / synchronize_rcu 这些
+ * EXPORT_SYMBOL_GPL 符号。 */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
