@@ -93,13 +93,27 @@ def gh_release():
         rel = json.loads(raw)
         print("  GitHub: 已建 Release %s (id=%s)" % (TAG, rel["id"]))
 
-    names = {a["name"] for a in rel.get("assets", [])}
+    names = {a["name"]: a["id"] for a in rel.get("assets", [])}
     if "ctn_patch.zip" in names:
-        print("  GitHub: 附件已存在，跳过上传")
-        return
-    data, ctype = multipart("file", "ctn_patch.zip", ZIP.read_bytes())
+        # 已存在也要查一遍：早期版本这里用 multipart 上传，GitHub 会把整个
+        # multipart 包体原样存下来（它要的是裸字节，不是表单），传上去的
+        # 「zip」外面裹了一层 --BOUNDARY 头和尾，多出 149 字节。发现是坏的
+        # 就删掉重传，而不是跳过。
+        aurl = api + "/releases/assets/%d" % names["ctn_patch.zip"]
+        st, raw = req(aurl, headers=h)
+        got = json.loads(raw).get("size") if st == 200 else None
+        if got == ZIP.stat().st_size:
+            print("  GitHub: 附件已存在且大小正确，跳过上传")
+            return
+        print("  GitHub: 附件大小不对（%s != %d），删掉重传"
+              % (got, ZIP.stat().st_size))
+        req(aurl, headers=h, method="DELETE")
+
+    # 注意：GitHub 的 release asset 上传接口收的是**裸字节**，不是 multipart。
+    # 用 multipart 传的话它会原样存下来，得到的是「包了一层边界的 zip」。
     st, raw = req(rel["upload_url"].split("{")[0] + "?name=ctn_patch.zip",
-                  data=data, headers=dict(h, **{"Content-Type": ctype}))
+                  data=ZIP.read_bytes(),
+                  headers=dict(h, **{"Content-Type": "application/zip"}))
     if st not in (200, 201):
         sys.exit("!! GitHub 传附件失败 %s: %s" % (st, raw[:400]))
     print("  GitHub: 附件已上传 ->", json.loads(raw)["browser_download_url"])
@@ -127,9 +141,27 @@ def gitee_release(tok: str):
             sys.exit("!! Gitee 建 Release 返回空: %s" % raw[:400])
         print("  Gitee : 已建 Release %s (id=%s)" % (TAG, rel["id"]))
 
-    if rel.get("attach_files"):
-        print("  Gitee : 附件已存在，跳过上传")
+    # 附件列表要单独查这个端点：release 详情里的 assets 只有名字和 URL，
+    # 没有附件 id，也没有大小（判不了「传上去的到底对不对」）。
+    st, raw = req("%s/%s/attach_files?access_token=%s" % (api, rel["id"], tok))
+    files = json.loads(raw) if st == 200 and raw.strip() not in (b"null", b"") else []
+    good = [f for f in files if f["name"] == "ctn_patch.zip"
+            and f.get("size") == ZIP.stat().st_size]
+    if good:
+        # 有多份就删到只剩一份：重复上传过一次（早期版本判重用了 assets，
+        # 那个字段在 Gitee 的响应里不存在，导致每次都重传）。
+        for f in files:
+            if f["id"] != good[0]["id"]:
+                req("%s/%s/attach_files/%s?access_token=%s"
+                    % (api, rel["id"], f["id"], tok), method="DELETE")
+                print("  Gitee : 删掉重复附件 id=%s" % f["id"])
+        print("  Gitee : 附件已存在且大小正确（id=%s），跳过上传" % good[0]["id"])
         return
+    for f in files:
+        req("%s/%s/attach_files/%s?access_token=%s" % (api, rel["id"], f["id"], tok),
+            method="DELETE")
+        print("  Gitee : 删掉旧的/大小不对的附件 id=%s（%s 字节）" % (f["id"], f.get("size")))
+
     data, ctype = multipart("file", "ctn_patch.zip", ZIP.read_bytes())
     st, raw = req("%s/%s/attach_files?access_token=%s" % (api, rel["id"], tok),
                   data=data, headers={"Content-Type": ctype})
@@ -153,6 +185,7 @@ def main():
     gitee_release(tok)
     print("\n完成。update.json 的 zipUrl 指向：")
     print("  https://gitee.com/turbowfz/ctn_patch/releases/download/%s/ctn_patch.zip" % TAG)
+    print("\n别忘了回读核对：附件必须是**裸 zip**（前两字节 PK），大小与本地一致。")
 
 
 if __name__ == "__main__":

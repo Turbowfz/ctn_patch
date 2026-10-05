@@ -415,3 +415,11 @@ Gitee 网页上做，API 绕不过去。
     （`task_util.c:56`），而且要求这个 pid 是**线程组组长**（`pid == tgid`）。
     写成 `game_pid=123 child_num=0` 会被 `-EINVAL` 拒掉 —— 那个格式是**读**出来的，
     不是写进去的。调试时别照着读的格式写。
+12. **两个平台的 Release 附件上传方式不一样**。GitHub 的 asset 接口收的是
+    **裸字节**（`Content-Type: application/zip` + 文件内容），用 multipart 传
+    它会把整个表单包体原样存下来 —— 得到的是「外面裹了一层 `--BOUNDARY` 的
+    zip」，多出 149 字节，`unzip` 未必认得。Gitee 的 `attach_files` 反过来，
+    就要求 multipart。所以 `make_release.py` 里两边走不同分支，传完都要回读
+    比对大小/哈希。另外 Gitee 的 release 详情里**没有** `attach_files` 字段
+    （只有 `assets`，且不含附件 id），判重必须单独查
+    `/releases/{id}/attach_files`。
