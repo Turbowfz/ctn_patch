@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""在 Gitee 与 GitHub 上建 v1.1 Release，并把 ctn_patch.zip 作为附件传上去。
+"""在 Gitee 与 GitHub 上建 Release，并把 ctn_patch.zip 作为附件传上去。
 
-update.json 里的 zipUrl 是
-    https://gitee.com/turbowfz/ctn_patch/releases/download/v1.1/ctn_patch.zip
-所以必须先有 tag v1.1、再把 zip 传成「附件」，否则管理器下载会 404。
+版本号从 magisk/module.prop 读，不写死。update.json 里的 zipUrl 形如
+    https://gitee.com/turbowfz/ctn_patch/releases/download/<版本>/ctn_patch.zip
+所以必须先有同名 tag、再把 zip 传成「附件」，否则管理器下载会 404。
 
 凭据来源：
   - GitHub：从 git credential（凭据管理器里已缓存的 Turbowfz 凭据）读，不落盘
@@ -18,30 +18,52 @@ import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ZIP = HERE / "ctn_patch.zip"
-TAG = "v1.1"
-NAME = "v1.1"
-CHANGELOG = HERE / "CHANGELOG.md"
+PROP = HERE / "magisk" / "module.prop"
+UPD_CHANGELOG = HERE / "update-changelog.md"
+
+
+def prop_version() -> str:
+    for line in PROP.read_text(encoding="utf-8").splitlines():
+        if line.startswith("version="):
+            return line.split("=", 1)[1].strip()
+    sys.exit("!! module.prop 里找不到 version=")
+
+
+TAG = NAME = prop_version()
+
+
+def check_update_changelog() -> None:
+    """确认 update-changelog.md 就是当前这一版的，别把上一版的内容发出去。
+
+    update.json 的 changelog 指向这个文件，更新弹窗显示的就是它。
+    如果它还是旧版本（忘了跑 gen_changelog.py），用户会看到错的更新日志，
+    而且这种错很隐蔽 —— 弹窗有内容，只是内容不对。
+    """
+    if not UPD_CHANGELOG.is_file():
+        sys.exit("!! 缺 update-changelog.md，先跑 python gen_changelog.py")
+    head = ""
+    for line in UPD_CHANGELOG.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            head = line
+            break
+    if TAG not in head:
+        sys.exit("!! update-changelog.md 里是 [%s]，不是 %s 那一版。\n"
+                 "   先跑 python gen_changelog.py 再发版。" % (head or "空", TAG))
+    print("  update-changelog.md 是 %s 那一版，OK" % TAG)
 
 
 def body_from_changelog() -> str:
-    """取 CHANGELOG 里 v1.1 那一节当 Release 说明。"""
-    txt = CHANGELOG.read_text(encoding="utf-8")
-    lines = txt.splitlines()
-    out, grab = [], False
-    for ln in lines:
-        if ln.startswith("## "):
-            if grab:
-                break
-            grab = TAG in ln
-            continue
-        if grab:
-            out.append(ln)
-    return "\n".join(out).strip() or f"{NAME} 发布"
+    """Release 说明 = CHANGELOG 里当前版本那一节。"""
+    sys.path.insert(0, str(HERE))
+    from gen_changelog import extract_section
+    txt = (HERE / "CHANGELOG.md").read_text(encoding="utf-8")
+    return extract_section(txt, TAG).strip() or "%s 发布" % NAME
 
 
 def github_token() -> str:
@@ -172,13 +194,14 @@ def gitee_release(tok: str):
 
 
 def main():
-    import urllib.parse  # noqa: F401  （gitee_release 里用到）
     if not ZIP.is_file():
         sys.exit("!! 找不到 %s，先跑 python build_zip.py" % ZIP)
     tok = os.environ.get("GITEE_TOKEN")
     if not tok:
         sys.exit("!! 需要 GITEE_TOKEN 环境变量")
 
+    print("=== 前置检查（版本 %s）===" % TAG)
+    check_update_changelog()
     print("=== GitHub ===")
     gh_release()
     print("=== Gitee ===")

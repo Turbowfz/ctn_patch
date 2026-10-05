@@ -373,20 +373,53 @@ updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
 
 管理器会拉这个 JSON，比对 `versionCode`，远端更大就显示「更新」按钮。
 
-**发新版本的顺序**（`zipUrl` 里带 tag，顺序错了下载会 404）：
+### 10.1 更新弹窗里的「更新日志」是哪个文件
+
+`update.json` 的 `changelog` 指向 **`update-changelog.md`**，不是 `CHANGELOG.md`：
+
+| 文件 | 给谁看 | 内容 |
+|---|---|---|
+| `CHANGELOG.md` | 人 / 仓库 | **完整历史**，从 v1.0 到现在，一版都不删 |
+| `update-changelog.md` | 更新弹窗 | **只有当前这一版**，由 `gen_changelog.py` 从上面那个抽出来 |
+
+为什么拆开：KernelSU 会把 `changelog` 地址的内容**整段**当 markdown 渲染进更新
+弹窗（源码 `ModuleViewModel.kt:437-486`，没有任何截断）。直接喂 `CHANGELOG.md`
+的话，发到 v1.5 时弹窗里就是「v1.0 到 v1.5」的一大段墙；更新弹窗本来就该只讲
+「这次更新改了什么」。
+
+> 文件名不能叫 `changelog.md` —— 仓库在 Windows 上，它和 `CHANGELOG.md`
+> 是**同一个文件**（大小写不敏感），会互相覆盖。
+
+`update-changelog.md` 是生成物，**别手改**。改内容请改 `CHANGELOG.md`，然后重跑
+`python gen_changelog.py`。
+
+### 10.2 发新版本的顺序
+
+顺序有讲究（`zipUrl` 里带 tag，`changelog` 拉的是 `main` 分支，弄反了会 404
+或发错内容）：
 
 ```bash
-python bump.py 1.1        # 改版本：module.prop 与 update.json 一起更新
-# 补 CHANGELOG.md
-python build_zip.py
-git add -A && git commit -m 'v1.1' && git push github main && git push gitee main
+python bump.py 1.1        # 1. 改版本：module.prop 与 update.json 一起更新
+#                          2. 在 CHANGELOG.md 顶部补一段 v1.1 的说明
+python gen_changelog.py   # 3. 抽出这一版 → update-changelog.md
+python build_zip.py       # 4. 打包
+git add -A && git commit -m 'v1.1'
+git push gitee main && git push github main      # 5. 先推代码（更新器拉 main）
 git tag -a v1.1 -m 'v1.1' && git push gitee v1.1 && git push github v1.1
-GITEE_TOKEN=xxx python make_release.py   # 两边建 Release + 传 zip 附件
+GITEE_TOKEN=xxx python make_release.py           # 6. 两边建 Release + 传 zip 附件
 ```
 
-`python bump.py --show` 可随时检查两个文件是否一致。`make_release.py` 从
-git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN` 环境变量读 Gitee token，
-两边都已存在 Release 时会跳过而不是报错，可以反复跑。
+几个工具的分工：
+
+- `bump.py --show` 检查 `module.prop` 与 `update.json` 是否一致；
+  `bump.py --sync` 按 `module.prop` 现有版本重写 `update.json`（不改版本号，
+  换地址之类的小改动用它，不用硬升版本）。
+- `gen_changelog.py` 从 `CHANGELOG.md` 抽当前版本那一节。版本号匹配带
+  「后面不能紧跟数字/点」的约束，所以取 `v1.1` 不会误命中 `v1.10`。
+- `make_release.py` 会先**校验** `update-changelog.md` 就是当前这一版的，
+  不对就拒绝发版 —— 忘了跑第 3 步是很容易犯的错，而且很隐蔽：弹窗里有内容，
+  只是内容不对。它还从 git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN`
+  读 Gitee token，两边都已存在 Release 时跳过而不是报错，可以反复跑。
 
 **三个注意点**：① 仓库必须公开（管理器是未登录状态拉 `update.json` 的，
 私有仓库返回 403）—— **绝不能**把 token 写进 `update.json` 或 `module.prop`
@@ -396,16 +429,22 @@ git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN` 环境变量读 Gitee t
 「个人设置」完成2FA设置, 或绑定可靠第三方帐号`）。这一步只能账号本人在
 Gitee 网页上做，API 绕不过去 —— 本仓库已绑第三方账号并通过 API 改成公开。
 
-**改完自己验一遍这三条**（都用未登录身份，就是管理器的视角）：
+### 10.3 改完自己验一遍
+
+都用未登录身份（就是管理器的视角）：
 
 ```bash
-curl -sL .../raw/main/update.json     # 200，且 versionCode 比本地大
-curl -sL .../raw/main/CHANGELOG.md    # 200
-curl -sL .../releases/download/v1.1/ctn_patch.zip   # 200，且大小/哈希与本地一致
+curl -sL .../raw/main/update.json          # 200，versionCode 比本地大
+curl -sL .../raw/main/update-changelog.md  # 200，且**只有**当前这一版
+curl -sL .../releases/download/v1.1/ctn_patch.zip   # 200，大小/哈希与本地一致
 ```
 
 Gitee 的 `/raw/` 会 302 跳到 `raw.giteeusercontent.com`，这是正常的
 （管理器跟得上跳转）；但如果哪天发现管理器拉不到，先看这里是不是被挡了。
+
+**更新弹窗不显示日志**（只有「开始下载 xxx」）说明 `changelog` 那个地址没取到 ——
+KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在那儿），
+所以最终是空的。这时按上面三条 curl 挨个查。
 
 ## 十一、排查
 
