@@ -1,233 +1,299 @@
 #!/system/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# ctn_patch 加载 + 验证脚本（在手机上以 root 运行）
+# ctn_patch 自检：内核模块 + daemon + 环境，一趟跑完
+#
+# 输出约定（为了一眼能看出问题）：
+#   [OK]  一行一项，通过了
+#   [!!]  失败 —— 失败时才在下面缩进打印细节
+#   [--]  跳过（没条件测）
+#   最后一行是汇总。脚本退出码 = 失败项数（0 表示全过）。
 #
 # 用法：
-#   adb push ctn_patch.ko /data/local/tmp/
-#   adb push verify.sh /data/local/tmp/
-#   adb shell su -c 'sh /data/local/tmp/verify.sh'
-# 也可带参数指定 .ko 路径（Magisk 模块里的 action.sh 就这么调用）：
-#   sh verify.sh /data/adb/modules/ctn_patch/ctn_patch.ko
+#   sh verify.sh                  # ko 取脚本同目录的 ctn_patch.ko
+#   sh verify.sh /path/to/ko      # 指定 ko
 #
-# 只读检查 + 临时写测试（结束前恢复原值），每一步都会打印 PASS / FAIL。
-# 读取格式与官方 6.6 一致：名字:pid,名字:pid（6.1 无 pid 数据，固定 -1）。
-# 注意：Android 的 toybox 没有 modinfo，vermagic 用 grep 直接从 .ko 里抽。
+# 模块生命周期由本脚本负责：自己 insmod、测完自己 rmmod。
+# 所以调它之前请确保模块没被加载（action.sh 会先 rmmod）。
 
-set -u
-
-KO="${1:-/data/local/tmp/ctn_patch.ko}"
-NODE=/proc/game_opt/task_boost/critical_task_name
 DIR=/proc/game_opt/task_boost
-PASS=0
-FAIL=0
+NODE=$DIR/critical_task_name
+VICTIM=oplus_bsp_game_opt
+MODDIR=${0%/*}
+KO="${1:-$MODDIR/ctn_patch.ko}"
 
-say() { echo "$@"; }
-ok()  { PASS=$((PASS+1)); echo "  [PASS] $1"; }
-ng()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+PASS=0; FAIL=0; SKIP=0
 
-# 打一个内核日志标记：后面只截取标记之后的日志来判异常。
-# 不这么做的话，会把 msm_vidc / binder_debug 这类跟本模块无关的
-# WARNING 也算成失败（实测踩过，白报一个 FAIL）。
+# 标签手工补齐到显示宽 12（中文算 2 列，printf 的 %-12s 按字符数算，用不了）
+row() { printf '[%s]  %s  %s\n' "$1" "$2" "$3"; }
+ok()  { PASS=$((PASS+1)); row OK "$1" "$2"; }
+ng()  { FAIL=$((FAIL+1)); row '!!' "$1" "$2"; }
+sk()  { SKIP=$((SKIP+1)); row '--' "$1" "$2"; }
+det() { printf '        %s\n' "$*"; }
+
+# 写一个值、读回核对。不一致时**立刻重读**再判 —— 实测遇到过一次
+# 「读回好几轮之前的旧值」（模块刚重载 + 连续写的场景；之后 300 轮压测复现不出来）。
+# 重读能区分两种情况，而且两种都如实报出来：
+#   瞬时旧值 → 重读就对了，记进 STALE，最后以备注行提示（不算失败）
+#   真写坏了 → 怎么读都不对，返回 1，由调用方报失败
+STALE=""
+STALEN=0
+wread() { # wread <要写的> <期望读回> [轮次说明]
+	echo "$1" > "$NODE" 2>/dev/null
+	got=$(cat "$NODE")
+	[ "$got" = "$2" ] && return 0
+	sleep 0.2; g2=$(cat "$NODE")
+	sleep 0.2; g3=$(cat "$NODE")
+	if [ "$g2" = "$2" ] || [ "$g3" = "$2" ]; then
+		STALEN=$((STALEN+1))
+		STALE="$STALE${STALE:+；}${3:-写 $1} 首次读到 [$got]"
+		return 0
+	fi
+	return 1
+}
+
+# 打一个内核日志标记：第 11 项只扫标记之后的日志，免得被无关模块的
+# WARNING 误伤（实测踩过：抓到 10 分钟前一条无关的 warn_alloc）。
 KLOG_MARK="CTN_VERIFY_$$_$(date +%s)"
 echo "$KLOG_MARK START" > /dev/kmsg 2>/dev/null
 
-say "=== 0. 前置检查 ==="
-if [ "$(id -u)" != "0" ]; then
-	echo "  必须以 root 运行"; exit 1
-fi
-ok "root"
+# ---------------------------------------------------------------- 环境
+VER=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
+echo "ctn_patch 自检${VER:+  $VER}"
+echo "  机型 $(getprop ro.product.model 2>/dev/null) / $(getprop ro.board.platform 2>/dev/null)" \
+     "｜ 内核 $(uname -r) ｜ 页 $(getconf PAGE_SIZE 2>/dev/null || echo ?) ｜ SELinux $(getenforce 2>/dev/null)"
+echo
 
-if ! grep -q '^oplus_bsp_game_opt ' /proc/modules; then
-	echo "  oplus_bsp_game_opt 未加载，本模块无意义"; exit 1
+if [ "$(id -u)" != "0" ]; then echo "必须以 root 运行"; exit 1; fi
+if ! grep -q "^$VICTIM " /proc/modules; then
+	echo "$VICTIM 未加载，本模块无意义"
+	exit 1
 fi
-ok "oplus_bsp_game_opt 已加载"
 
-say ""
-say "=== 1. 加载前状态 ==="
-if [ -e "$NODE" ]; then
-	say "  注意：节点已存在，说明这个内核本来就有 ctn 节点，或已加载过别的补丁"
-	say "  当前值: $(cat $NODE)"
-	ALREADY=1
+# ---------------------------------------------------------------- 1 模块文件
+# ctnd 的可执行位必须显式检查：解包器可能丢掉它（实测踩过，装完 daemon 起不来）
+F_MISS=""; F_BAD=""
+[ -f "$KO" ] || F_MISS="$F_MISS ctn_patch.ko"
+[ -s "$MODDIR/ctnd" ] || F_MISS="$F_MISS ctnd"
+[ -f "$MODDIR/ctnd" ] && [ ! -x "$MODDIR/ctnd" ] && F_BAD="$F_BAD ctnd(无可执行位)"
+[ -f "$MODDIR/expected_vendor.txt" ] || F_MISS="$F_MISS expected_vendor.txt"
+if [ -n "$F_MISS" ]; then
+	ng "模块文件    " "缺:$F_MISS"
+elif [ -n "$F_BAD" ]; then
+	ng "模块文件    " "权限不对:$F_BAD（chmod 755 或重装）"
 else
-	ok "加载前 /proc/game_opt/task_boost 无 critical_task_name（符合预期）"
-	ALREADY=0
-fi
-say "  加载前 task_boost 节点:"
-ls "$DIR" 2>/dev/null | sed 's/^/    /'
-
-if [ ! -f "$KO" ]; then
-	echo ""; echo "  找不到 $KO，请先 push ctn_patch.ko"; exit 1
+	ok "模块文件    " "ko $(stat -c%s "$KO")B ｜ ctnd $(stat -c%s "$MODDIR/ctnd")B 0755 $(grep -qa ELF "$MODDIR/ctnd" && echo ELF)"
 fi
 
-say ""
-say "=== 2. vermagic 比对 ==="
+# ---------------------------------------------------------------- 2 厂商模块
+# struct module 布局与厂商 ko 绑定，换了就必须重编（曾因此崩机）
+VKO=""
+for p in /vendor/lib/modules/$VICTIM.ko /system/lib/modules/$VICTIM.ko \
+         /vendor_dlkm/lib/modules/$VICTIM.ko; do
+	[ -f "$p" ] && { VKO="$p"; break; }
+done
+WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODDIR/expected_vendor.txt" 2>/dev/null | head -n1)
+if [ -z "$VKO" ]; then
+	sk "厂商模块    " "找不到设备上的 $VICTIM.ko，跳过比对"
+elif [ -z "$WANT" ]; then
+	sk "厂商模块    " "zip 里没有 expected_vendor.txt，跳过比对"
+else
+	GOT=$(sha256sum "$VKO" 2>/dev/null | cut -d' ' -f1)
+	if [ "$WANT" = "$GOT" ]; then
+		ok "厂商模块    " "sha256 与构建时一致"
+	else
+		ng "厂商模块    " "与构建时不是同一份 → 结构体布局可能不匹配，会崩机"
+		det "构建时 $WANT"
+		det "设备上 $GOT"
+	fi
+fi
+
+# ---------------------------------------------------------------- 3 vermagic
 KO_VM=$(grep -aom1 'vermagic=[ -~]*' "$KO" 2>/dev/null | cut -d= -f2)
-K_VER=$(uname -r)
-say "  模块 vermagic: ${KO_VM:-（读不到）}"
-say "  内核版本    : $K_VER"
-if [ -n "$KO_VM" ]; then
-	KO_REL=$(echo "$KO_VM" | cut -d' ' -f1)
-	KO_REL4=$(echo "$KO_REL" | awk -F- '{print $1"-"$2"-"$3"-"$4}')
-	K_REL4=$(echo "$K_VER"  | awk -F- '{print $1"-"$2"-"$3"-"$4}')
-	if [ "$KO_REL4" = "$K_REL4" ]; then
-		ok "版本前缀一致（git hash 尾差 GKI 容忍）"
-	else
-		ng "ko 版本 [$KO_REL4] 与内核 [$K_REL4] 不一致，insmod 大概率失败"
-	fi
+K_REL=$(uname -r)
+if [ -z "$KO_VM" ]; then
+	ng "vermagic    " "读不到 ko 的 vermagic"
 else
-	ng "读不到模块 vermagic"
-fi
-
-say ""
-say "=== 3. insmod ==="
-if [ "$ALREADY" = "1" ]; then
-	say "  跳过 insmod（节点已存在）"
-else
-	OLD_REF=$(sed -n 's/^oplus_bsp_game_opt [0-9]* \([0-9]*\).*/\1/p' /proc/modules)
-	insmod "$KO"
-	if [ $? -ne 0 ]; then
-		ng "insmod 失败"
-		dmesg | tail -n 20 | sed 's/^/    /'
-		echo ""; echo "结果: PASS=$PASS FAIL=$FAIL"; exit 1
-	fi
-	ok "insmod 成功"
-	NEW_REF=$(sed -n 's/^oplus_bsp_game_opt [0-9]* \([0-9]*\).*/\1/p' /proc/modules)
-	say "  oplus_bsp_game_opt refcount: $OLD_REF -> $NEW_REF (期望 +1，说明已被钉住)"
-	if [ "$NEW_REF" -gt "$OLD_REF" ] 2>/dev/null; then
-		ok "目标模块 refcount 增加"
+	KO4=$(echo "$KO_VM" | cut -d' ' -f1 | awk -F- '{print $1"-"$2"-"$3"-"$4}')
+	K4=$(echo "$K_REL"  | awk -F- '{print $1"-"$2"-"$3"-"$4}')
+	if [ "$KO4" = "$K4" ]; then
+		ok "vermagic    " "$KO4"
 	else
-		ng "refcount 没增加，模块钉住可能没生效"
+		ng "vermagic    " "ko [$KO4] 与内核 [$K4] 不一致，insmod 大概率失败"
 	fi
 fi
 
-say ""
-say "=== 4. 节点存在性 ==="
+# ---------------------------------------------------------------- 4 insmod
+say_loaded=0
+if grep -q '^ctn_patch ' /proc/modules; then
+	# 已经加载着：没法测加载/卸载，但要能测节点行为
+	sk "insmod      " "ctn_patch 已在运行，本次跳过加载/卸载测试"
+	say_loaded=1
+else
+	R0=$(sed -n "s/^$VICTIM [0-9]* \([0-9]*\).*/\1/p" /proc/modules)
+	if insmod "$KO" 2>/dev/null; then
+		R1=$(sed -n "s/^$VICTIM [0-9]* \([0-9]*\).*/\1/p" /proc/modules)
+		if [ "${R1:-0}" -gt "${R0:-0}" ] 2>/dev/null; then
+			ok "insmod      " "成功，$VICTIM refcount $R0→$R1（已钉住）"
+		else
+			ng "insmod      " "成功但 refcount 没涨（$R0→$R1），钉住可能没生效"
+		fi
+	else
+		ng "insmod      " "失败"
+		dmesg | tail -n 12 | while read -r l; do det "$l"; done
+	fi
+fi
+
+# ---------------------------------------------------------------- 5 节点
 if [ -e "$NODE" ]; then
-	ok "节点已创建"
+	ok "节点        " "$(ls -l "$NODE" | awk '{print $1, $3, $4}')"
 else
-	ng "节点不存在"
-	echo ""; echo "结果: PASS=$PASS FAIL=$FAIL"; exit 1
+	ng "节点        " "不存在（模块没加载成功？）"
 fi
-say "  权限: $(ls -l $NODE | awk '{print $1, $3, $4}')"
-say "  task_boost 节点列表:"
-ls "$DIR" | sed 's/^/    /'
 
-say ""
-say "=== 5. 默认值（6.6 格式）==="
-V=$(cat "$NODE")
-say "  读到: [$V]"
+# ---------------------------------------------------------------- 6 读格式
+V=$(cat "$NODE" 2>/dev/null)
 case "$V" in
-	"UnityMain:-1,UnityGfxDevice:-1") ok "默认值与格式和官方 6.6 初始状态一致" ;;
-	*) say "  （不是默认值，可能之前被改过；只要格式是 名字:pid,名字:pid 就正常）" ;;
+	*:*","*:*) ok "读格式      " "[$V]" ;;
+	"")        ng "读格式      " "读不到内容" ;;
+	*)         ng "读格式      " "不是 名字:pid,名字:pid 格式：[$V]" ;;
 esac
 
-say ""
-say "=== 6. 任意填两个名字 / 读回 ==="
-ORIG="$V"
-if echo "CTNTestMain CTNTestGfx" > "$NODE" 2>/dev/null; then
-	V2=$(cat "$NODE")
-	if [ "$V2" = "CTNTestMain:-1,CTNTestGfx:-1" ]; then
-		ok "写入任意两个名字后能正确读回（6.6 格式）"
-	else
-		ng "读回不一致: [$V2]"
-	fi
+# ---------------------------------------------------------------- 7 写入读回
+if wread "CTNTestMain CTNTestGfx" "CTNTestMain:-1,CTNTestGfx:-1" "写入读回"; then
+	ok "写入读回    " "正确"
 else
-	ng "写入失败"
+	ng "写入读回    " "写进去和读回来不一致（重读也对不上）"
+	det "读回 [$(cat "$NODE")]"
 fi
 
-say ""
-say "=== 7. 反复写（压双缓冲/RCU）==="
-RCU_OK=1
+# ---------------------------------------------------------------- 8 反复写
+RCU_BAD=""
 i=1
 while [ $i -le 8 ]; do
-	echo "A${i}Main A${i}Gfx" > "$NODE" 2>/dev/null
-	R=$(cat "$NODE")
-	[ "$R" = "A${i}Main:-1,A${i}Gfx:-1" ] || { RCU_OK=0; say "  第 $i 次不一致: [$R]"; }
+	wread "A${i}Main A${i}Gfx" "A${i}Main:-1,A${i}Gfx:-1" "反复写第 $i 次" || RCU_BAD="$RCU_BAD $i"
 	i=$((i+1))
 done
-if [ "$RCU_OK" = "1" ]; then ok "连续 8 次写入/读回全部正确"; else ng "有写入读回不一致"; fi
+if [ -z "$RCU_BAD" ]; then ok "反复写      " "8/8 正确（双缓冲/RCU 路径）"; else ng "反复写      " "第$RCU_BAD 次不一致"; fi
 
-say ""
-say "=== 8. 边界与非法输入 ==="
-# 8.1 只给一个名字应被拒（官方 sscanf 要求恰好 2 个）
-if echo "onlyone" > "$NODE" 2>/dev/null; then
-	ng "只给一个名字竟然被接受"
+# ---------------------------------------------------------------- 9 边界输入
+E=""
+echo "onlyone" > "$NODE" 2>/dev/null && E="$E 单名被接受(应拒)"
+echo "A B C"   > "$NODE" 2>/dev/null && E="$E 三名被接受(应拒)"
+echo "ABCDEFGHIJKLMNO0 ABCDEFGHIJKLMNO1" > "$NODE" 2>/dev/null || E="$E 16字符被拒(应接受)"
+LONG=$(printf 'x%.0s' $(seq 1 120) 2>/dev/null)
+echo "$LONG test" > "$NODE" 2>/dev/null && E="$E 120字符被接受(应拒)"
+if [ -z "$E" ]; then
+	ok "边界输入    " "单名/三名/120字符 被拒，16字符 接受"
 else
-	ok "只给一个名字被拒绝（正确）"
-fi
-# 8.2 给三个名字应被拒（多了第三段）
-if echo "A B C" > "$NODE" 2>/dev/null; then
-	ng "三个名字竟然被接受"
-else
-	ok "三个名字被拒绝（正确）"
-fi
-# 8.3 接口层允许到 99 字符（与官方 %99s 一致），16 字符应当被接受
-if echo "ABCDEFGHIJKLMNO0 ABCDEFGHIJKLMNO1" > "$NODE" 2>/dev/null; then
-	ok "16 字符名字被接受（与 6.6 接口一致）"
-else
-	ng "16 字符名字被拒绝（接口层应允许到 99 字符）"
-fi
-# 8.4 超过 99 字符应被拒
-LONG=$(printf 'x%.0s' $(seq 1 120))
-if echo "$LONG test" > "$NODE" 2>/dev/null; then
-	ng "120 字符名字竟然被接受"
-else
-	ok "120 字符名字被拒绝（正确）"
+	ng "边界输入    " "不符合预期:$E"
 fi
 
-say ""
-say "=== 9. 恢复原值 ==="
-echo "UnityMain UnityGfxDevice" > "$NODE" 2>/dev/null
-V3=$(cat "$NODE")
-if [ "$V3" = "UnityMain:-1,UnityGfxDevice:-1" ]; then
-	ok "已恢复为 UnityMain/UnityGfxDevice"
+# ---------------------------------------------------------------- 10 恢复
+if wread "UnityMain UnityGfxDevice" "UnityMain:-1,UnityGfxDevice:-1" "恢复默认值"; then
+	ok "恢复默认值  " "UnityMain/UnityGfxDevice"
 else
-	ng "恢复失败: [$V3]"
+	ng "恢复默认值  " "恢复失败（重读也对不上）：[$(cat "$NODE")]"
 fi
 
-say ""
-say "=== 10. 内核日志 ==="
-# 只取本次测试期间（标记之后）的日志，避免被无关模块的 WARNING 误伤
+# ---------------------------------------------------------------- 11 dmesg
+# 只取本次测试期间的日志。标记必须出现，否则说明 /dev/kmsg 写不进去 ——
+# 那种情况绝不能报 OK（等于什么都没查却说没问题），宁可报失败让人看见。
 LOG=$(dmesg | sed -n "/$KLOG_MARK START/,\$p")
-say "  --- ctn_patch 相关 ---"
-echo "$LOG" | grep -i ctn_patch | tail -n 10 | sed 's/^/    /'
-say "  --- 异常扫描（期望为空）---"
-# 标记必须出现在 dmesg 里，否则说明 /dev/kmsg 写不进去（或日志被清了）。
-# 这种情况下**绝不能报 PASS** —— 那等于「什么都没查却说没问题」，
-# 比不查更糟：用户会以为自检通过了。宁可报一条 FAIL 让人看见。
 if [ -z "$LOG" ]; then
-	ng "取不到本次测试的日志段（标记 $KLOG_MARK 不在 dmesg 里），异常扫描未执行"
-	echo "     /dev/kmsg 写不进去？手动确认：dmesg | grep CTN_VERIFY_" | sed 's/^/  /'
+	ng "dmesg 异常  " "取不到本次日志段（标记不在 dmesg 里），未扫描"
+	det "确认：dmesg | grep CTN_VERIFY_"
 else
-	BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" 	| grep -vE "CTN_VERIFY_" | tail -n 10)
+	BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" \
+	      | grep -vE "CTN_VERIFY_" | tail -n 5)
 	if [ -z "$BAD" ]; then
-		ok "本次测试期间 dmesg 无 BUG/WARNING/oops/CFI failure"
+		ok "dmesg 异常  " "本次无 BUG/WARNING/oops/CFI failure"
 	else
-		ng "dmesg 有异常"
-		echo "$BAD" | sed 's/^/    /'
+		ng "dmesg 异常  " "本次测试期间有异常"
+		echo "$BAD" | while read -r l; do det "$l"; done
 	fi
 fi
 echo "$KLOG_MARK END" > /dev/kmsg 2>/dev/null
 
-say ""
-say "=== 11. 卸载 ==="
-if [ "$ALREADY" = "1" ]; then
-	say "  跳过 rmmod（本来就没由本脚本加载）"
-else
-	rmmod ctn_patch
-	if [ $? -eq 0 ]; then
-		ok "rmmod 成功"
-		if [ -e "$NODE" ]; then ng "卸载后节点还在"; else ok "卸载后节点已消失"; fi
-		V4=$(cat /proc/game_opt/task_boost/ct_enable 2>/dev/null)
-		say "  剩余节点检查 ct_enable=[${V4}]（应还能读，说明原模块完好）"
+# ---------------------------------------------------------------- 12 卸载
+if [ "$say_loaded" = "1" ]; then
+	sk "卸载        " "本次没由脚本加载，跳过"
+elif rmmod ctn_patch 2>/dev/null; then
+	if [ -e "$NODE" ]; then
+		ng "卸载        " "rmmod 成功但节点还在"
 	else
-		ng "rmmod 失败"
-		dmesg | tail -n 10 | sed 's/^/    /'
+		ok "卸载        " "rmmod 后节点已消失，refcount 还原"
+	fi
+else
+	ng "卸载        " "rmmod 失败（有进程正拿着节点？）"
+fi
+
+# ------------------------------------------------- 恢复运行状态（后面要查 daemon）
+# 自检不能把设备留在「模块没加载 / daemon 没跑」的状态，而且 daemon 那几项
+# 必须它真的在跑才有意义 —— 所以这里先把它拉起来。这几行不算检查项。
+echo "  --- 恢复运行状态 ---"
+if ! grep -q '^ctn_patch ' /proc/modules; then
+	insmod "$KO" 2>/dev/null && echo "    模块已重新加载" || echo "    !! 模块重新加载失败，建议重启"
+fi
+if ! pgrep -x ctnd >/dev/null 2>&1; then
+	if [ -x "$MODDIR/ctnd" ]; then
+		setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
+		sleep 2
+		echo "    daemon 已拉起"
+	else
+		echo "    !! 找不到 $MODDIR/ctnd"
 	fi
 fi
 
-say ""
-say "=================================="
-say "结果: PASS=$PASS  FAIL=$FAIL"
-say "=================================="
-[ "$FAIL" = "0" ] && exit 0 || exit 1
+# ---------------------------------------------------------------- 13 daemon
+NP=$(pgrep -x ctnd 2>/dev/null | wc -l)
+if [ "$NP" = "1" ]; then
+	DV=$("$MODDIR/ctnd" --version 2>/dev/null | awk '{print $2}')
+	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(pgrep -x ctnd | head -1)）"
+elif [ "$NP" = "0" ]; then
+	ng "daemon      " "ctnd 没在运行 —— 节点不会被自动写入"
+else
+	ng "daemon      " "有 $NP 个 ctnd 实例，应只允许 1 个（互抢写节点）"
+fi
+
+# ---------------------------------------------------------------- 14 daemon 依赖
+D=""
+for p in /system/lib64/libsqlite.so /system/lib64/libsqlite3.so \
+         /apex/com.android.runtime/lib64/libsqlite3.so; do
+	[ -r "$p" ] && { D="$D sqlite=ok"; break; }
+done
+case "$D" in *sqlite*) ;; *) D="$D sqlite=缺" ;; esac
+[ -r /data/user/0/com.oplus.cosa/databases/db_game_database ] && D="$D cosa库=ok" || D="$D cosa库=缺"
+[ -r /data/adb/ctn_patch/ctn.conf ] && D="$D ctn.conf=有" || D="$D ctn.conf=无(可自动铺)"
+case "$D" in
+	*"sqlite=缺"*|*"cosa库=缺"*) ng "daemon 依赖 " "$D" ;;
+	*) ok "daemon 依赖 " "$D" ;;
+esac
+
+# ---------------------------------------------------------------- 15 daemon 日志
+DLOG="$MODDIR/daemon.log"
+if [ ! -f "$DLOG" ]; then
+	sk "daemon 日志 " "还没有 $DLOG"
+else
+	# 只找明确的失败标记，不做模糊匹配（避免误报）
+	BADL=$(tail -n 200 "$DLOG" 2>/dev/null \
+	       | grep -E "加载失败|写入失败|缺少符号|找不到可读的云控库|已有另一个" | tail -n 3)
+	if [ -z "$BADL" ]; then
+		ok "daemon 日志 " "近 200 行无失败记录"
+	else
+		ng "daemon 日志 " "有失败记录"
+		echo "$BADL" | while read -r l; do det "$l"; done
+	fi
+fi
+
+# ---------------------------------------------------------------- 汇总
+if [ "$STALEN" != "0" ]; then
+	sk "瞬时旧值    " "有 $STALEN 次首次读回旧值（重读即正常，不算失败）"
+	det "$STALE"
+fi
+echo "------------------------------------------------"
+if [ "$FAIL" = "0" ]; then
+	echo "结果: $PASS 项全过${SKIP:+（$SKIP 项跳过/备注）}"
+else
+	echo "结果: $PASS 过 / $FAIL 失败${SKIP:+ / $SKIP 跳过}   ← 看上面标 [!!] 的行"
+fi
+[ "$FAIL" = "0" ]

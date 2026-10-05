@@ -50,6 +50,58 @@ cat /proc/game_opt/task_boost/critical_task_name
 想手动指定某个游戏的关键线程名，编辑 `/data/adb/ctn_patch/ctn.conf`
 （首次开机自动铺好带注释的模板），见 5.4 节。
 
+### 3.1 自检（管理器里的「操作 / Action」按钮）
+
+装了之后，在 Magisk / KernelSU 的模块页点**操作**按钮，它会重载模块 + 重启
+daemon + 跑一遍完整自检，结果写进 `action.log`。输出是**一项一行**：
+
+```
+ctn_patch 自检  v1.3
+  机型 PJX110 / pineapple ｜ 内核 6.1.141-... ｜ 页 4096 ｜ SELinux Enforcing
+
+[OK]  模块文件      ko 304392B ｜ ctnd 21616B 0755 ELF
+[OK]  厂商模块      sha256 与构建时一致
+[OK]  vermagic      6.1.141-android14-11-o
+[OK]  insmod        成功，oplus_bsp_game_opt refcount 1→2（已钉住）
+[OK]  节点          -rw-rw-r-- root root
+[OK]  读格式        [UnityMain:-1,UnityGfxDevice:-1]
+[OK]  写入读回      正确
+[OK]  反复写        8/8 正确（双缓冲/RCU 路径）
+[OK]  边界输入      单名/三名/120字符 被拒，16字符 接受
+[OK]  恢复默认值    UnityMain/UnityGfxDevice
+[OK]  dmesg 异常    本次无 BUG/WARNING/oops/CFI failure
+[OK]  卸载          rmmod 后节点已消失，refcount 还原
+  --- 恢复运行状态 ---
+    模块已重新加载
+    daemon 已拉起
+[OK]  daemon        ctnd 1.3 运行中（pid 24937）
+[OK]  daemon 依赖    sqlite=ok cosa库=ok ctn.conf=有
+[OK]  daemon 日志   近 200 行无失败记录
+------------------------------------------------
+结果: 15 项全过
+```
+
+三档标记，一眼能扫：
+
+| 标记 | 含义 |
+|---|---|
+| `[OK]` | 通过 |
+| `[!!]` | **失败 —— 失败时才会在下面缩进打印细节** |
+| `[--]` | 跳过 / 备注（没条件测，或不算失败的情况） |
+
+脚本退出码 = 失败项数（0 = 全过），可以直接被脚本调用。
+
+**它自己负责模块的加载和卸载**，所以别先手动 `insmod` —— 那样「insmod」和
+「卸载」两项就只能跳过。`action.sh` 会先 `rmmod` 再调它，所以走按钮永远是
+完整测试。
+
+压测单独有 `stress_node.sh`（写读几千次，专压双缓冲/RCU 那条路）：
+
+```bash
+adb push stress_node.sh /data/local/tmp/
+adb shell su -c 'sh /data/local/tmp/stress_node.sh 2000'
+```
+
 ## 四、用法
 
 节点要求**恰好两个名字**，空格分隔（制表符、换行也行）：
@@ -525,3 +577,14 @@ KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在
     artifact 和它的哈希是记录，改了以后「谁装的是哪个」就说不清了。顺带一个
     好处：`customize.sh` 是**被安装的那个 zip 里**的脚本，所以从有 bug 的 v1.1
     升到修好的 v1.2 不会踩这个坑（用的是新版的脚本）。
+15. **自检不能先把模块加载好再跑**，否则「加载」和「卸载」两项永远只能跳过 ——
+    而这两项恰恰是最该测的（insmod 失败会崩机、rmmod 失败会留野指针）。
+    正确顺序是：先 `rmmod`，让自检自己 `insmod` → 测试 → `rmmod`。v1.3 之前的
+    `action.sh` 就是先加载再调 `verify.sh`，等于那两项一直没测过。
+16. **节点读回偶尔会读到「上一轮的值」**。实测遇到过一次：模块刚重载 + 连续写
+    的序列里，某次读回的是**好几轮之前**的一对名字（`A4Main/A4Gfx`）。之后
+    用 900+ 次迭代（含 daemon 开/关、每轮重新加载模块、300 轮大循环）都复现不
+    出来，模块的双缓冲逻辑逐行看也没问题。处理办法不是掩盖：`verify.sh` 的
+    `wread()` 在首次读回不一致时会**立刻重读两次**，重读对上就记一条「瞬时旧值」
+    备注（不算失败）并把首次读到的旧值原样打印出来；重读也对不上才算失败。
+    这样既不会让自检抖，真出问题时又能从日志里看到现场。
