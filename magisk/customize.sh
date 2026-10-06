@@ -163,35 +163,65 @@ else
 fi
 grp_end
 
-# ================= 4. 厂商模块版本（对应上次崩机的根因）=================
-grp_start "厂商模块版本"
+# ================= 4. 厂商模块 / struct module 布局 =================
+# 为什么不再拿 sha256 卡死：一加12、Ace3Pro、Ace5、GT6 这些 8Gen3 机型在**同一
+# 内核版本**（如 6.1.118 / 6.1.141）下，官方风驰（game_opt）代码是**同源**的，
+# 跨机型可以直接用；但不同机型/不同构建批次编出来的 ko 二进制哈希天然不同，
+# 拿哈希当闸门会把兼容的机型全拒掉。
+#
+# 真正会**崩机**（而不是干净加载失败）的只有一件事：sizeof(struct module) 不一致。
+# 设备上那份 oplus_bsp_game_opt.ko 是给那个内核编的，它的
+# .gnu.linkonce.this_module 段大小 == 那个内核的 sizeof(struct module)，
+# 跟我们 .ko 的比一比就知道布局对不对（elf_sec_size.sh，只用 od+awk）。
+#
+# 另外：本 .ko 的符号 CRC 取自设备模块表，与它自己的实际布局是一致的
+# （build.sh 第 8 步硬校验 this_module 段大小）。所以在别的内核上若 CRC 对不上，
+# 内核会**干净地拒绝加载**（disagrees about version of symbol），不会崩机。
+grp_start "厂商模块与布局"
 VKO=""
 for p in /vendor/lib/modules/oplus_bsp_game_opt.ko \
          /system/lib/modules/oplus_bsp_game_opt.ko \
          /vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko; do
 	[ -f "$p" ] && { VKO="$p"; break; }
 done
-if [ -n "$VKO" ] && [ -f "$MODPATH/expected_vendor.txt" ]; then
+if [ -z "$VKO" ]; then
+	warn "找不到设备上的 oplus_bsp_game_opt.ko 文件，跳过比对"
+elif [ ! -f "$MODPATH/expected_vendor.txt" ]; then
+	warn "zip 里没有 expected_vendor.txt，跳过比对"
+else
 	WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODPATH/expected_vendor.txt" | head -n1)
 	GOT=$(sha256sum "$VKO" 2>/dev/null | cut -d' ' -f1)
 	if [ -n "$WANT" ] && [ "$WANT" = "$GOT" ]; then
 		ok "oplus_bsp_game_opt.ko 与构建时对照的一致（$VKO）"
 	else
-		bad "厂商模块与构建时对照的不是同一份！"
-		info "比对对象: $VKO"
-		info "构建时: ${WANT:-未知}"
-		info "设备上: ${GOT:-读不到}"
-		# 把这台设备厂商模块自己的 vermagic 也打出来 —— 一眼看出它是
-		# 哪个内核构建（git hash 尾巴不同 = 另一份内核构建，本 .ko 的
-		# vermagic/CRC 都对不上，必须按它重编）
-		VKO_VM="$(grep -aom1 'vermagic=[ -~]*' "$VKO" 2>/dev/null | cut -d= -f2)"
-		info "设备厂商模块 vermagic: ${VKO_VM:-读不到}"
-		info "这会导致 struct module 布局/符号 CRC 对不上 → insmod 失败甚至崩机（实测崩过）。请按那台设备重编（README 6.1）"
+		# 二进制不同 → 可能是别的机型/别的构建批次。量 struct module 布局。
+		elfsec="$MODPATH/elf_sec_size.sh"
+		OUR_TS=""; DEV_TS=""
+		if [ -f "$elfsec" ]; then
+			OUR_TS=$(sh "$elfsec" "$MODPATH/ctn_patch.ko" .gnu.linkonce.this_module 2>/dev/null)
+			DEV_TS=$(sh "$elfsec" "$VKO" .gnu.linkonce.this_module 2>/dev/null)
+		fi
+		if [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ] && [ "$OUR_TS" = "$DEV_TS" ]; then
+			ok "厂商模块是另一份构建，但 struct module 布局一致（${DEV_TS} 字节）→ 可用"
+			info "比对对象: $VKO"
+			info "构建时: $WANT"
+			info "设备上: $GOT"
+			info "（同内核版本下这几款 8Gen3 机型的 game_opt 源码同源，布局一致即可通用）"
+		elif [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ]; then
+			bad "struct module 布局不一致：本 .ko ${OUR_TS} 字节 / 设备 ${DEV_TS} 字节"
+			info "比对对象: $VKO"
+			info "这会在 insmod 时崩机（实测崩过，pc: mod_sysfs_setup）。必须按该设备的内核重编（README 6.1）"
+		else
+			warn "厂商模块与构建时不是同一份，且量不出 struct module 布局"
+			info "比对对象: $VKO"
+			info "构建时: $WANT"
+			info "设备上: $GOT"
+			VKO_VM="$(grep -aom1 'vermagic=[ -~]*' "$VKO" 2>/dev/null | cut -d= -f2)"
+			info "设备厂商模块 vermagic: ${VKO_VM:-读不到}"
+			info "同内核版本下这几款 8Gen3 机型源码同源，通常可用；装完重启看 boot.log ——"
+			info "若 insmod 报 disagrees about version of symbol，说明符号 CRC 不匹配，需按本机重编（只会加载失败，不会崩机）"
+		fi
 	fi
-elif [ -z "$VKO" ]; then
-	warn "找不到设备上的 oplus_bsp_game_opt.ko 文件，跳过版本比对"
-else
-	warn "zip 里没有 expected_vendor.txt，跳过版本比对"
 fi
 grp_end
 
@@ -380,6 +410,7 @@ set_perm "$MODPATH/service.sh"       0 0 0755
 set_perm "$MODPATH/uninstall.sh"     0 0 0755
 set_perm "$MODPATH/action.sh"        0 0 0755
 set_perm "$MODPATH/verify.sh"        0 0 0755
+set_perm "$MODPATH/elf_sec_size.sh"  0 0 0755
 set_perm "$MODPATH/ctn.conf.example" 0 0 0644
 
 ui_print "- 重启后自动加载；日志 /data/adb/modules/ctn_patch/boot.log"

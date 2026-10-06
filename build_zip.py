@@ -38,6 +38,9 @@ FILES = {
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
     # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）
     "ctnd": (HERE / "daemon", True, True),
+    # customize.sh 用它读设备厂商 ko 的 .gnu.linkonce.this_module 段大小，
+    # 判断 struct module 布局是否一致（跨机型通用性的依据）
+    "elf_sec_size.sh": (HERE, True, True),
 }
 
 TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt", ".example"}
