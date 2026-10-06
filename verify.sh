@@ -270,20 +270,49 @@ case "$D" in
 esac
 
 # ---------------------------------------------------------------- 15 daemon 日志
-DLOG="$MODDIR/daemon.log"
-if [ ! -f "$DLOG" ]; then
-	sk "daemon 日志 " "还没有 $DLOG"
-else
-	# 只找明确的失败标记，不做模糊匹配（避免误报）
-	BADL=$(tail -n 200 "$DLOG" 2>/dev/null \
-	       | grep -E "加载失败|写入失败|缺少符号|找不到可读的云控库|已有另一个" | tail -n 3)
-	if [ -z "$BADL" ]; then
-		ok "daemon 日志 " "近 200 行无失败记录"
+# 只看**本次自检之后新增**的记录：日志里留着升级/重载过渡期的旧记录（比如停
+# daemon 时守护循环抢跑撞了一次锁，它自己退干净了，无后果），拿历史噪音判失败
+# 只会吓人。所以用「行数水位」：上次检查到的行数存进 .verify_logmark，
+# 这次只看新增的行（水位跟日志同目录；日志被轮转/清空时水位自动归零重来）。
+# 另外「已有另一个实例」单独归为自愈噪音：它意味着撞锁的进程自己退出了，
+# daemon 实际只有一个 —— 打出来让人看见，但不判失败。
+	DLOG="$MODDIR/daemon.log"
+	if [ ! -f "$DLOG" ]; then
+		sk "daemon 日志 " "还没有 $DLOG"
 	else
-		ng "daemon 日志 " "有失败记录"
-		echo "$BADL" | while read -r l; do det "$l"; done
+		WMARK="$MODDIR/.verify_logmark"
+		PREV=$(cat "$WMARK" 2>/dev/null)
+		[ -n "$PREV" ] || PREV=0
+		CUR=$(wc -l < "$DLOG" 2>/dev/null)
+		[ -n "$CUR" ] || CUR=0
+		# 日志变短了 = 被轮转/清空，水位归零从头看
+		[ "$CUR" -ge "$PREV" ] 2>/dev/null || PREV=0
+
+		NEWL=$(tail -n +$((PREV + 1)) "$DLOG" 2>/dev/null)
+		echo "$CUR" > "$WMARK" 2>/dev/null
+
+		# 第一次建水位：没有「上次看到哪」的基准，历史记录全是旧的、
+		# 没法区分是不是本次产生的 —— 只立水位不评价，下次开始才算数。
+		if [ "$PREV" = "0" ] && [ "$CUR" != "0" ]; then
+			sk "daemon 日志 " "首次检查，只记水位（$CUR 行），历史记录不评价"
+		else
+		# 自愈噪音：撞锁后自己退出（无后果）
+			NOISE_N=$(printf '%s\n' "$NEWL" | grep -cE "已有另一个 ctnd 在跑")
+			# 真失败：需要人为处理的
+			BADF=$(printf '%s\n' "$NEWL" \
+			       | grep -E "加载失败|写入失败|缺少符号|找不到可读的云控库" | tail -n 3)
+
+			if [ -n "$BADF" ]; then
+				ng "daemon 日志 " "本次期间有失败记录"
+				echo "$BADF" | while read -r l; do det "$l"; done
+			elif [ "$NOISE_N" -gt 0 ] 2>/dev/null; then
+				sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（重载过渡期守护循环抢跑，无后果）"
+				printf '%s\n' "$NEWL" | grep -E "已有另一个 ctnd 在跑" | tail -n 3 | while read -r l; do det "$l"; done
+			else
+				ok "daemon 日志 " "本次期间无失败记录"
+			fi
+		fi
 	fi
-fi
 
 # ---------------------------------------------------------------- 汇总
 if [ "$STALEN" != "0" ]; then

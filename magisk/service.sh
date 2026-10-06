@@ -81,25 +81,37 @@ fi
 	while true; do
 		# 两个退出条件缺一不可：哨兵出现、或模块目录没了。
 		# 少了它们，卸载时 pkill 只杀得掉 ctnd 本体，杀不掉这个循环，
-		# 5 秒后它又会把 ctnd 拉起来。
+		# 一会儿它又会把 ctnd 拉起来。
 		[ -e "$STOP" ] && { echo "==== $(date) 收到 .stop，守护退出 ====" >> "$DLOG"; exit 0; }
 		[ -d "$MODDIR" ] || exit 0
 
-		echo "==== $(date) 启动 ctnd ====" >> "$DLOG"
-		"$MODDIR/ctnd" >> "$DLOG" 2>&1
-		RC=$?
+		# 哨兵在「拉起前」再查一遍：action.sh 是 touch .stop 后才 pkill，
+		# 而本循环可能刚睡到一半，醒来时正好卡在停与卸载之间 —— 这时
+		# 再拉一个 ctnd 就会去撞锁，白刷一行「已有另一个实例」。
+		[ -e "$STOP" ] && { echo "==== $(date) 收到 .stop，守护退出 ====" >> "$DLOG"; exit 0; }
+
+		# ctnd 正在跑就不拉新的（不然 pkill 没杀干净时，这里会叠一个）
+		if ! pgrep -x ctnd >/dev/null 2>&1; then
+			echo "==== $(date) 启动 ctnd ====" >> "$DLOG"
+			"$MODDIR/ctnd" >> "$DLOG" 2>&1
+			RC=$?
+		else
+			RC=0
+			sleep 2
+			continue
+		fi
 
 		[ -e "$STOP" ] && { echo "==== $(date) 收到 .stop，守护退出 ====" >> "$DLOG"; exit 0; }
 
 		# 退出码 3 = 已有别的 ctnd 实例在跑（说明有另一个守护循环）。
-		# 这种情况要退出，不然会每 5 秒起一次、每次都被锁挡回来，白刷日志。
+		# 这种情况要退出，不然会每几秒起一次、每次都被锁挡回来，白刷日志。
 		if [ "$RC" = "3" ]; then
 			echo "==== $(date) 已有其它 ctnd 实例，本守护退出 ====" >> "$DLOG"
 			exit 0
 		fi
 
-		echo "==== $(date) ctnd 退出 rc=$RC，5 秒后重启 ====" >> "$DLOG"
-		sleep 5
+		echo "==== $(date) ctnd 退出 rc=$RC，2 秒后重启 ====" >> "$DLOG"
+		sleep 2
 	done
 ) &
 
