@@ -1,36 +1,29 @@
 <!-- 由 gen_changelog.py 自动生成，请勿手改。要改内容请改 CHANGELOG.md 后重跑本脚本。 -->
-## v1.6（versionCode 16）
+## v1.7（versionCode 17）
 
-**修掉自检里两个误报/自相矛盾的地方。** 内核模块和 daemon 都没动。
+**修掉一个环境相关的假故障：daemon 明明活着，自检却报「0 个 / 起不来」。**
+内核模块和 daemon 本体都没动。
 
-**问题一：自检的厂商模块检查还是旧的「比哈希」逻辑。** v1.5 只改了安装器
-（`customize.sh`），漏改了自检脚本（`verify.sh`）。结果在另一台设备
-（PKG110 / Ace5）上：**`insmod` 明明成功了**（模块在那台机器上能正常加载），
-自检却报 `[!!] 厂商模块 与构建时不是同一份 → 结构体布局可能不匹配，会崩机`。
-现在 `verify.sh` 用与 `customize.sh` **同一套判据**：哈希一致 → OK；哈希不同但
-`.gnu.linkonce.this_module` 段大小相同 → OK（另一份构建、布局一致）；段大小
-不同 → 失败；量不出 → 备注（以下面 `insmod` 的结果为准，能加载成功就是最硬的证据）。
+**现象**（用户真机 log）：自检的「恢复运行状态」里 `ctnd` 启动成功（日志有
+「ctnd 1.1 启动」），随后 3 次重试全部撞锁 —— **说明那个 ctnd 一直活着、锁一直
+被它握着**；可自检和 `action.sh` 里的 `pgrep -x ctnd` 全都返回 0，`pkill -x ctnd`
+也杀不掉它。最后报「daemon 0 个」，但它实际干了一下午活（后续的游戏写入记录都在）。
 
-**问题二：自检说「daemon 已拉起」，下一项又报「ctnd 没在运行」。** 两句自相矛盾，
-因为「已拉起」是无条件打印的，根本没确认。现在：
+**根因**：`pgrep`/`pkill` 的 `-x` 语义**因实现而异**。系统 toybox 的 `-x` 按
+**进程名（comm）**精确匹配（能匹配上）；而 KernelSU 的 action 环境里 PATH 可能
+排到别的实现（这台设备上发现了 `/data/adb/turbo/backup/toolkit/pgrep`），那种
+实现的 `-x` 匹配的是**整条命令行** —— ctnd 的 cmdline 是完整路径
+`/data/adb/modules/ctn_patch/ctnd`，跟 `ctnd` 永远不相等 → **永远匹配不上**。
+于是「探测不到、也杀不掉」，重试自然全撞锁。
 
-- 起 daemon 会**确认**：最多试 3 次，每次等最多 5 秒；失败就清掉残兵重来；
-  真起来了才打 `daemon 已拉起（pid 12345）`；
-- 还是起不来 → 把**本次尝试期间新增的 daemon.log 行**当原因打出来
-  （实测能直接看到「锁: 已有另一个 ctnd 在跑」）；
-- **撞锁的措辞修正**：只有确实有 `ctnd` 活着才算「自愈、无后果」；没有 `ctnd`
-  在跑时，那几条撞锁正是它起不来的原因 → 判失败（原来一律写「无后果」，误导）。
+**改法**：探测/击杀不再依赖 `pgrep`/`pkill`，自己扫 `/proc/*/comm`
+（`ctnd_pids` / `ctnd_count` / `ctnd_kill` 三个小函数，与 pgrep 的实现无关）。
+四个脚本（verify.sh / action.sh / service.sh / uninstall.sh）里的
+`pgrep -x ctnd`、`pkill -x ctnd` 全部替换，共 19 处。
 
-**问题三（顺带）**：`action.sh` 收尾时如果 daemon 没起来，会**重跑 `service.sh`**
-把守护循环和 daemon 一起恢复（只起 daemon 不恢复守护循环的话，它挂了没人重启），
-并把最终状态如实报出（模块数 / daemon pid / 节点值，起不来就打 daemon.log 尾部）。
+**真机验证**（一加 Ace 3 Pro）：`/proc` 扫描与 toybox `pgrep -x` 结果一致；
+在 PATH 前置 ksu/bin 的模拟环境里两种写法都能工作（该环境恰好没有 pgrep
+applet，所以无法在本机直接复现 app 环境的失败，但新写法不依赖任何 pgrep 实现，
+从根上免疫）。
 
-**问题四（顺带）**：`verify.sh` 的 `MODDIR` 改用 `dirname "$0"`。原来用
-`${0%/*}`，在「裸文件名调用」（`sh verify.sh`）时会算成文件名本身，导致后面所有
-`$MODDIR/xxx` 路径全错。
-
-**真机验证**（一加 Ace 3 Pro）：正常流程 14 项全过、`daemon 已拉起（pid …）`；
-把 `ctnd` 换成必定失败的假程序后，正确打出「起不来（试了 3 次）」+ 三次撞锁的
-新增日志，且 daemon 与 daemon 日志两项都判失败。
-
-> `ctn_patch.ko` 和 `ctnd` 的哈希与 v1.2~v1.5 相同（没动），只有脚本和文档变了。
+> `ctn_patch.ko` 和 `ctnd` 的哈希与 v1.2~v1.6 相同（没动）。

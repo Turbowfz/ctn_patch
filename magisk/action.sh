@@ -13,7 +13,21 @@
 MODDIR=${0%/*}
 LOG="$MODDIR/action.log"
 DLOG="$MODDIR/daemon.log"
-STOP="$MODDIR/.stop"
+# ---- ctnd 进程探测/击杀：不依赖 pgrep/pkill ----
+# KernelSU 的 action 环境会把 PATH 指到 busybox，busybox 的 pgrep/pkill -x
+# 匹配的是**整条命令行**（cmdline 是完整路径），永远匹配不上 —— 表现就是
+# 「daemon 明明活着却报 0 个」「pkill 杀不掉导致重试全撞锁」（实测踩过）。
+# 所以自己扫 /proc/*/comm，与 pgrep 的实现无关。
+ctnd_pids() {
+	for d in /proc/[0-9]*; do
+		[ -r "$d/comm" ] || continue
+		read -r n < "$d/comm" 2>/dev/null
+		[ "$n" = "ctnd" ] && echo "${d#/proc/}"
+	done
+}
+ctnd_count() { ctnd_pids | wc -l; }
+ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# ---- STOP="$MODDIR/.stop"
 NODE=/proc/game_opt/task_boost/critical_task_name
 
 echo "执行中，日志：$LOG"
@@ -23,8 +37,8 @@ echo "执行中，日志：$LOG"
 
 	# --- 1. 停 daemon ---
 	touch "$STOP" 2>/dev/null
-	pkill -f "$MODDIR/ctnd" 2>/dev/null
-	pkill -x ctnd 2>/dev/null
+	ctnd_kill
+	ctnd_kill
 	sleep 1
 	echo "daemon 已停（残留 $(ps -A | grep -c '[c]tnd') 个）"
 
@@ -51,21 +65,21 @@ echo "执行中，日志：$LOG"
 	rm -f "$STOP"
 	grep -q '^ctn_patch ' /proc/modules || insmod "$MODDIR/ctn_patch.ko" 2>/dev/null
 
-	if ! pgrep -x ctnd >/dev/null 2>&1; then
+	if [ "$(ctnd_count)" = "0" ]; then
 		echo
 		echo "daemon 没在运行，重跑 service.sh 恢复（含守护循环）"
 		sh "$MODDIR/service.sh"
 		i=1
 		while [ $i -le 10 ]; do
-			pgrep -x ctnd >/dev/null 2>&1 && break
+			[ "$(ctnd_count)" != "0" ] && break
 			sleep 1
 			i=$((i+1))
 		done
 	fi
 
 	echo
-	if pgrep -x ctnd >/dev/null 2>&1; then
-		echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(pgrep -c -x ctnd) 个（pid $(pgrep -x ctnd | head -1)）｜ 节点 $(cat $NODE 2>/dev/null)"
+	if [ "$(ctnd_count)" != "0" ]; then
+		echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(ctnd_count) 个（pid $(ctnd_pids | head -1)）｜ 节点 $(cat $NODE 2>/dev/null)"
 	else
 		echo "!! 当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon 仍然没起来 ｜ 节点 $(cat $NODE 2>/dev/null)"
 		echo "   daemon.log 尾部："

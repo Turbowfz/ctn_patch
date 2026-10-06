@@ -14,7 +14,21 @@
 MODDIR=${0%/*}
 LOG="$MODDIR/boot.log"
 DLOG="$MODDIR/daemon.log"
-STOP="$MODDIR/.stop"
+# ---- ctnd 进程探测/击杀：不依赖 pgrep/pkill ----
+# KernelSU 的 action 环境会把 PATH 指到 busybox，busybox 的 pgrep/pkill -x
+# 匹配的是**整条命令行**（cmdline 是完整路径），永远匹配不上 —— 表现就是
+# 「daemon 明明活着却报 0 个」「pkill 杀不掉导致重试全撞锁」（实测踩过）。
+# 所以自己扫 /proc/*/comm，与 pgrep 的实现无关。
+ctnd_pids() {
+	for d in /proc/[0-9]*; do
+		[ -r "$d/comm" ] || continue
+		read -r n < "$d/comm" 2>/dev/null
+		[ "$n" = "ctnd" ] && echo "${d#/proc/}"
+	done
+}
+ctnd_count() { ctnd_pids | wc -l; }
+ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# ---- STOP="$MODDIR/.stop"
 
 # 重新加载前清掉上次卸载可能留下的哨兵
 rm -f "$STOP"
@@ -91,7 +105,7 @@ fi
 		[ -e "$STOP" ] && { echo "==== $(date) 收到 .stop，守护退出 ====" >> "$DLOG"; exit 0; }
 
 		# ctnd 正在跑就不拉新的（不然 pkill 没杀干净时，这里会叠一个）
-		if ! pgrep -x ctnd >/dev/null 2>&1; then
+		if [ "$(ctnd_count)" = "0" ]; then
 			echo "==== $(date) 启动 ctnd ====" >> "$DLOG"
 			"$MODDIR/ctnd" >> "$DLOG" 2>&1
 			RC=$?

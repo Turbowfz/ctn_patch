@@ -31,6 +31,21 @@ ok()  { PASS=$((PASS+1)); row OK "$1" "$2"; }
 ng()  { FAIL=$((FAIL+1)); row '!!' "$1" "$2"; }
 sk()  { SKIP=$((SKIP+1)); row '--' "$1" "$2"; }
 det() { printf '        %s\n' "$*"; }
+# ---- ctnd 进程探测/击杀：不依赖 pgrep/pkill ----
+# KernelSU 的 action 环境会把 PATH 指到 busybox，busybox 的 pgrep/pkill -x
+# 匹配的是**整条命令行**（cmdline 是完整路径），永远匹配不上 —— 表现就是
+# 「daemon 明明活着却报 0 个」「pkill 杀不掉导致重试全撞锁」（实测踩过）。
+# 所以自己扫 /proc/*/comm，与 pgrep 的实现无关。
+ctnd_pids() {
+	for d in /proc/[0-9]*; do
+		[ -r "$d/comm" ] || continue
+		read -r n < "$d/comm" 2>/dev/null
+		[ "$n" = "ctnd" ] && echo "${d#/proc/}"
+	done
+}
+ctnd_count() { ctnd_pids | wc -l; }
+ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# ----
 
 # 写一个值、读回核对。不一致时**立刻重读**再判 —— 实测遇到过一次
 # 「读回好几轮之前的旧值」（模块刚重载 + 连续写的场景；之后 300 轮压测复现不出来）。
@@ -252,7 +267,7 @@ echo "  --- 恢复运行状态 ---"
 if ! grep -q '^ctn_patch ' /proc/modules; then
 	insmod "$KO" 2>/dev/null && echo "    模块已重新加载" || echo "    !! 模块重新加载失败，建议重启"
 fi
-if ! pgrep -x ctnd >/dev/null 2>&1; then
+if [ "$(ctnd_count)" = "0" ]; then
 	if [ -x "$MODDIR/ctnd" ]; then
 		# 记下 daemon.log 现有行数：起不来时只打新增的那几行当"原因"
 		DL0=$(wc -l < "$MODDIR/daemon.log" 2>/dev/null)
@@ -262,20 +277,20 @@ if ! pgrep -x ctnd >/dev/null 2>&1; then
 			setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
 			j=1
 			while [ $j -le 5 ]; do
-				pgrep -x ctnd >/dev/null 2>&1 && break
+				[ "$(ctnd_count)" != "0" ] && break
 				sleep 1
 				j=$((j+1))
 			done
-			pgrep -x ctnd >/dev/null 2>&1 && break
+			[ "$(ctnd_count)" != "0" ] && break
 			# 没起来：清掉残兵再来（锁可能被一个正在退出的 ctnd 占着）
-			pkill -x ctnd 2>/dev/null
+			ctnd_kill
 			sleep 1
 			i=$((i+1))
 		done
 		# 必须**确认**起来了才敢说"已拉起" —— 早期版本无条件打印，
 		# 结果上面写"已拉起"、下一项又报"没在运行"，自相矛盾（实测踩过）。
-		if pgrep -x ctnd >/dev/null 2>&1; then
-			echo "    daemon 已拉起（pid $(pgrep -x ctnd | head -1)）"
+		if [ "$(ctnd_count)" != "0" ]; then
+			echo "    daemon 已拉起（pid $(ctnd_pids | head -1)）"
 		else
 			echo "    !! daemon 起不来（试了 3 次），本次尝试期间的新日志："
 			tail -n +$((DL0 + 1)) "$MODDIR/daemon.log" 2>/dev/null | tail -n 5 | while read -r l; do echo "       $l"; done
@@ -286,10 +301,10 @@ if ! pgrep -x ctnd >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------- 13 daemon
-NP=$(pgrep -x ctnd 2>/dev/null | wc -l)
+NP=$(ctnd_count)
 if [ "$NP" = "1" ]; then
 	DV=$("$MODDIR/ctnd" --version 2>/dev/null | awk '{print $2}')
-	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(pgrep -x ctnd | head -1)）"
+	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_pids | head -1)）"
 elif [ "$NP" = "0" ]; then
 	ng "daemon      " "ctnd 没在运行 —— 节点不会被自动写入"
 else
@@ -316,7 +331,7 @@ esac
 # 只会吓人。所以用「行数水位」：上次检查到的行数存进 .verify_logmark，
 # 这次只看新增的行（水位跟日志同目录；日志被轮转/清空时水位自动归零重来）。
 # 另外「已有另一个实例」要分两种情况看：确实有 ctnd 活着 → 是撞锁自愈（无后果）；
-# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 pgrep 区分）。
+# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 ctnd_pids 区分）。
 	DLOG="$MODDIR/daemon.log"
 	if [ ! -f "$DLOG" ]; then
 		sk "daemon 日志 " "还没有 $DLOG"
@@ -350,7 +365,7 @@ esac
 				# 撞锁**只有**在确实有 ctnd 活着时才算「自愈、无后果」。
 				# 没有 ctnd 在跑就说明它没自愈 —— 那几条撞锁正是起不来的原因，
 				# 这时候还写「无后果」是误导（实测踩过）。
-				if pgrep -x ctnd >/dev/null 2>&1; then
+				if [ "$(ctnd_count)" != "0" ]; then
 					sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（无后果）"
 				else
 					ng "daemon 日志 " "本次期间 $NOISE_N 次撞锁，且当前没有 ctnd 在运行 —— 这就是它起不来的原因"
