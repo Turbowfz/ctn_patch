@@ -175,12 +175,18 @@ if [ -n "$VKO" ] && [ -f "$MODPATH/expected_vendor.txt" ]; then
 	WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODPATH/expected_vendor.txt" | head -n1)
 	GOT=$(sha256sum "$VKO" 2>/dev/null | cut -d' ' -f1)
 	if [ -n "$WANT" ] && [ "$WANT" = "$GOT" ]; then
-		ok "oplus_bsp_game_opt.ko 与构建时对照的一致"
+		ok "oplus_bsp_game_opt.ko 与构建时对照的一致（$VKO）"
 	else
 		bad "厂商模块与构建时对照的不是同一份！"
+		info "比对对象: $VKO"
 		info "构建时: ${WANT:-未知}"
 		info "设备上: ${GOT:-读不到}"
-		info "这会导致 struct module 布局不匹配 → insmod 时崩机（实测崩过）。请按本机重编。"
+		# 把这台设备厂商模块自己的 vermagic 也打出来 —— 一眼看出它是
+		# 哪个内核构建（git hash 尾巴不同 = 另一份内核构建，本 .ko 的
+		# vermagic/CRC 都对不上，必须按它重编）
+		VKO_VM="$(grep -aom1 'vermagic=[ -~]*' "$VKO" 2>/dev/null | cut -d= -f2)"
+		info "设备厂商模块 vermagic: ${VKO_VM:-读不到}"
+		info "这会导致 struct module 布局/符号 CRC 对不上 → insmod 失败甚至崩机（实测崩过）。请按那台设备重编（README 6.1）"
 	fi
 elif [ -z "$VKO" ]; then
 	warn "找不到设备上的 oplus_bsp_game_opt.ko 文件，跳过版本比对"
