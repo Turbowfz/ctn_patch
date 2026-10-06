@@ -18,7 +18,9 @@
 DIR=/proc/game_opt/task_boost
 NODE=$DIR/critical_task_name
 VICTIM=oplus_bsp_game_opt
-MODDIR=${0%/*}
+# 用 dirname 而不是 ${0%/*}：后者在「裸文件名调用」（sh verify.sh）时会算成
+# 文件名本身（没有斜杠可切），导致 MODDIR=verify.sh，后面所有 $MODDIR/xxx 全错。
+MODDIR=$(dirname "$0")
 KO="${1:-$MODDIR/ctn_patch.ko}"
 
 PASS=0; FAIL=0; SKIP=0
@@ -84,14 +86,19 @@ else
 	ok "模块文件    " "ko $(stat -c%s "$KO")B ｜ ctnd $(stat -c%s "$MODDIR/ctnd")B 0755 $(grep -qa ELF "$MODDIR/ctnd" && echo ELF)"
 fi
 
-# ---------------------------------------------------------------- 2 厂商模块
-# struct module 布局与厂商 ko 绑定，换了就必须重编（曾因此崩机）
+# ---------------------------------------------------------------- 2 厂商模块与布局
+# 判**布局**不判哈希：一加12/Ace3Pro/Ace5/GT6 这些 8Gen3 机型在同一内核版本下
+# game_opt 源码同源、可以通用，但不同机型/批次编出来的 ko 二进制哈希天然不同。
+# 真正会崩机的是 sizeof(struct module) 不一致 —— 用设备那份厂商 ko 的
+# .gnu.linkonce.this_module 段大小跟我们的比（跟 customize.sh 同一套判据）。
+# 另外：本脚本下面会真的 insmod，能加载成功本身就是最硬的兼容性证据。
 VKO=""
 for p in /vendor/lib/modules/$VICTIM.ko /system/lib/modules/$VICTIM.ko \
          /vendor_dlkm/lib/modules/$VICTIM.ko; do
 	[ -f "$p" ] && { VKO="$p"; break; }
 done
 WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODDIR/expected_vendor.txt" 2>/dev/null | head -n1)
+elfsec="$MODDIR/elf_sec_size.sh"
 if [ -z "$VKO" ]; then
 	sk "厂商模块    " "找不到设备上的 $VICTIM.ko，跳过比对"
 elif [ -z "$WANT" ]; then
@@ -101,9 +108,20 @@ else
 	if [ "$WANT" = "$GOT" ]; then
 		ok "厂商模块    " "sha256 与构建时一致"
 	else
-		ng "厂商模块    " "与构建时不是同一份 → 结构体布局可能不匹配，会崩机"
-		det "构建时 $WANT"
-		det "设备上 $GOT"
+		OUR_TS=""; DEV_TS=""
+		if [ -f "$elfsec" ]; then
+			OUR_TS=$(sh "$elfsec" "$KO" .gnu.linkonce.this_module 2>/dev/null)
+			DEV_TS=$(sh "$elfsec" "$VKO" .gnu.linkonce.this_module 2>/dev/null)
+		fi
+		if [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ] && [ "$OUR_TS" = "$DEV_TS" ]; then
+			ok "厂商模块    " "另一份构建（非构建时那份），但 struct module 布局一致（${DEV_TS} 字节）→ 兼容"
+			det "构建时 ${WANT:0:16}… / 设备上 ${GOT:0:16}…"
+		elif [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ]; then
+			ng "厂商模块    " "struct module 布局不一致（本 ${OUR_TS} / 设备 ${DEV_TS}）→ insmod 会崩机"
+		else
+			sk "厂商模块    " "与构建时不是同一份，且量不出布局 —— 看下面 insmod 结果为准"
+			det "构建时 ${WANT:0:16}… / 设备上 ${GOT:0:16}…"
+		fi
 	fi
 fi
 
@@ -236,9 +254,32 @@ if ! grep -q '^ctn_patch ' /proc/modules; then
 fi
 if ! pgrep -x ctnd >/dev/null 2>&1; then
 	if [ -x "$MODDIR/ctnd" ]; then
-		setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
-		sleep 2
-		echo "    daemon 已拉起"
+		# 记下 daemon.log 现有行数：起不来时只打新增的那几行当"原因"
+		DL0=$(wc -l < "$MODDIR/daemon.log" 2>/dev/null)
+		[ -n "$DL0" ] || DL0=0
+		i=1
+		while [ $i -le 3 ]; do
+			setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
+			j=1
+			while [ $j -le 5 ]; do
+				pgrep -x ctnd >/dev/null 2>&1 && break
+				sleep 1
+				j=$((j+1))
+			done
+			pgrep -x ctnd >/dev/null 2>&1 && break
+			# 没起来：清掉残兵再来（锁可能被一个正在退出的 ctnd 占着）
+			pkill -x ctnd 2>/dev/null
+			sleep 1
+			i=$((i+1))
+		done
+		# 必须**确认**起来了才敢说"已拉起" —— 早期版本无条件打印，
+		# 结果上面写"已拉起"、下一项又报"没在运行"，自相矛盾（实测踩过）。
+		if pgrep -x ctnd >/dev/null 2>&1; then
+			echo "    daemon 已拉起（pid $(pgrep -x ctnd | head -1)）"
+		else
+			echo "    !! daemon 起不来（试了 3 次），本次尝试期间的新日志："
+			tail -n +$((DL0 + 1)) "$MODDIR/daemon.log" 2>/dev/null | tail -n 5 | while read -r l; do echo "       $l"; done
+		fi
 	else
 		echo "    !! 找不到 $MODDIR/ctnd"
 	fi
@@ -274,8 +315,8 @@ esac
 # daemon 时守护循环抢跑撞了一次锁，它自己退干净了，无后果），拿历史噪音判失败
 # 只会吓人。所以用「行数水位」：上次检查到的行数存进 .verify_logmark，
 # 这次只看新增的行（水位跟日志同目录；日志被轮转/清空时水位自动归零重来）。
-# 另外「已有另一个实例」单独归为自愈噪音：它意味着撞锁的进程自己退出了，
-# daemon 实际只有一个 —— 打出来让人看见，但不判失败。
+# 另外「已有另一个实例」要分两种情况看：确实有 ctnd 活着 → 是撞锁自愈（无后果）；
+# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 pgrep 区分）。
 	DLOG="$MODDIR/daemon.log"
 	if [ ! -f "$DLOG" ]; then
 		sk "daemon 日志 " "还没有 $DLOG"
@@ -306,7 +347,14 @@ esac
 				ng "daemon 日志 " "本次期间有失败记录"
 				echo "$BADF" | while read -r l; do det "$l"; done
 			elif [ "$NOISE_N" -gt 0 ] 2>/dev/null; then
-				sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（重载过渡期守护循环抢跑，无后果）"
+				# 撞锁**只有**在确实有 ctnd 活着时才算「自愈、无后果」。
+				# 没有 ctnd 在跑就说明它没自愈 —— 那几条撞锁正是起不来的原因，
+				# 这时候还写「无后果」是误导（实测踩过）。
+				if pgrep -x ctnd >/dev/null 2>&1; then
+					sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（无后果）"
+				else
+					ng "daemon 日志 " "本次期间 $NOISE_N 次撞锁，且当前没有 ctnd 在运行 —— 这就是它起不来的原因"
+				fi
 				printf '%s\n' "$NEWL" | grep -E "已有另一个 ctnd 在跑" | tail -n 3 | while read -r l; do det "$l"; done
 			else
 				ok "daemon 日志 " "本次期间无失败记录"

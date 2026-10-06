@@ -44,16 +44,32 @@ echo "执行中，日志：$LOG"
 	sh "$MODDIR/verify.sh" "$MODDIR/ctn_patch.ko"
 	RC=$?
 
-	# --- 4. 兜底：verify.sh 万一中途退出了，这里保证设备不留在坏状态 ---
-	# （都是幂等的，正常跑完这一步什么都不会做）
+	# --- 4. 兜底：保证设备不留在坏状态 ---
+	# 先摘哨兵，再确认模块和 daemon 都在。daemon 没起来就重跑 service.sh ——
+	# 它会把守护循环和 daemon 一起拉起来（光起 daemon 没有守护循环的话，
+	# 它挂了就没人重启，等于少了一层保险）。
 	rm -f "$STOP"
 	grep -q '^ctn_patch ' /proc/modules || insmod "$MODDIR/ctn_patch.ko" 2>/dev/null
-	if ! pgrep -x ctnd >/dev/null 2>&1 && [ -x "$MODDIR/ctnd" ]; then
-		setsid "$MODDIR/ctnd" >> "$DLOG" 2>&1 < /dev/null &
-		sleep 2
+
+	if ! pgrep -x ctnd >/dev/null 2>&1; then
+		echo
+		echo "daemon 没在运行，重跑 service.sh 恢复（含守护循环）"
+		sh "$MODDIR/service.sh"
+		i=1
+		while [ $i -le 10 ]; do
+			pgrep -x ctnd >/dev/null 2>&1 && break
+			sleep 1
+			i=$((i+1))
+		done
 	fi
 
 	echo
-	echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(pgrep -c -x ctnd 2>/dev/null || echo 0) 个 ｜ 节点 $(cat $NODE 2>/dev/null)"
+	if pgrep -x ctnd >/dev/null 2>&1; then
+		echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(pgrep -c -x ctnd) 个（pid $(pgrep -x ctnd | head -1)）｜ 节点 $(cat $NODE 2>/dev/null)"
+	else
+		echo "!! 当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon 仍然没起来 ｜ 节点 $(cat $NODE 2>/dev/null)"
+		echo "   daemon.log 尾部："
+		tail -n 5 "$DLOG" 2>/dev/null | sed 's/^/     /'
+	fi
 	[ "$RC" = "0" ] && echo "（自检全部通过）" || echo "（自检有失败项，看上面标 [!!] 的行）"
 } > "$LOG" 2>&1
