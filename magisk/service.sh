@@ -27,7 +27,23 @@ ctnd_pids() {
 	done
 }
 ctnd_count() { ctnd_pids | wc -l; }
-ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# 握着 .ctnd.lock 的进程：按 /proc/*/fd 扫，与进程名、pgrep 实现**都无关**。
+# 有些环境里进程的 comm 会跟预期对不上（模块升级换了文件、pgrep 实现差异），
+# 这时候只有「谁握着锁」这个事实是可靠的 —— daemon 活着的定义就是它持着锁。
+lock_holders() {
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ -r "$d/fd" ] || continue
+		for fd in $d/fd/*; do
+			case "$(readlink "$fd" 2>/dev/null)" in
+				*ctnd.lock) echo "$p"; break ;;
+			esac
+		done
+	done
+}
+ctnd_alive() { [ -n "$(ctnd_pids)$(lock_holders)" ]; }
+ctnd_one() { local p; p=$(ctnd_pids | head -1); [ -n "$p" ] && { echo "$p"; return; }; lock_holders | head -1; }
+ctnd_kill() { for p in $(ctnd_pids) $(lock_holders); do kill "$p" 2>/dev/null; done; }
 # ---- STOP="$MODDIR/.stop"
 
 # 重新加载前清掉上次卸载可能留下的哨兵
@@ -105,7 +121,7 @@ fi
 		[ -e "$STOP" ] && { echo "==== $(date) 收到 .stop，守护退出 ====" >> "$DLOG"; exit 0; }
 
 		# ctnd 正在跑就不拉新的（不然 pkill 没杀干净时，这里会叠一个）
-		if [ "$(ctnd_count)" = "0" ]; then
+		if ! ctnd_alive; then
 			echo "==== $(date) 启动 ctnd ====" >> "$DLOG"
 			"$MODDIR/ctnd" >> "$DLOG" 2>&1
 			RC=$?

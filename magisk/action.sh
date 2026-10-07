@@ -26,7 +26,23 @@ ctnd_pids() {
 	done
 }
 ctnd_count() { ctnd_pids | wc -l; }
-ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# 握着 .ctnd.lock 的进程：按 /proc/*/fd 扫，与进程名、pgrep 实现**都无关**。
+# 有些环境里进程的 comm 会跟预期对不上（模块升级换了文件、pgrep 实现差异），
+# 这时候只有「谁握着锁」这个事实是可靠的 —— daemon 活着的定义就是它持着锁。
+lock_holders() {
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ -r "$d/fd" ] || continue
+		for fd in $d/fd/*; do
+			case "$(readlink "$fd" 2>/dev/null)" in
+				*ctnd.lock) echo "$p"; break ;;
+			esac
+		done
+	done
+}
+ctnd_alive() { [ -n "$(ctnd_pids)$(lock_holders)" ]; }
+ctnd_one() { local p; p=$(ctnd_pids | head -1); [ -n "$p" ] && { echo "$p"; return; }; lock_holders | head -1; }
+ctnd_kill() { for p in $(ctnd_pids) $(lock_holders); do kill "$p" 2>/dev/null; done; }
 # ---- STOP="$MODDIR/.stop"
 NODE=/proc/game_opt/task_boost/critical_task_name
 
@@ -65,21 +81,21 @@ echo "执行中，日志：$LOG"
 	rm -f "$STOP"
 	grep -q '^ctn_patch ' /proc/modules || insmod "$MODDIR/ctn_patch.ko" 2>/dev/null
 
-	if [ "$(ctnd_count)" = "0" ]; then
+	if ! ctnd_alive; then
 		echo
 		echo "daemon 没在运行，重跑 service.sh 恢复（含守护循环）"
 		sh "$MODDIR/service.sh"
 		i=1
 		while [ $i -le 10 ]; do
-			[ "$(ctnd_count)" != "0" ] && break
+			ctnd_alive && break
 			sleep 1
 			i=$((i+1))
 		done
 	fi
 
 	echo
-	if [ "$(ctnd_count)" != "0" ]; then
-		echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(ctnd_count) 个（pid $(ctnd_pids | head -1)）｜ 节点 $(cat $NODE 2>/dev/null)"
+	if ctnd_alive; then
+		echo "当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon $(ctnd_count) 个（pid $(ctnd_one)）｜ 节点 $(cat $NODE 2>/dev/null)"
 	else
 		echo "!! 当前状态：模块 $(grep -c '^ctn_patch ' /proc/modules) 个 ｜ daemon 仍然没起来 ｜ 节点 $(cat $NODE 2>/dev/null)"
 		echo "   daemon.log 尾部："

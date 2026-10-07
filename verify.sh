@@ -44,7 +44,23 @@ ctnd_pids() {
 	done
 }
 ctnd_count() { ctnd_pids | wc -l; }
-ctnd_kill() { for p in $(ctnd_pids); do kill "$p" 2>/dev/null; done; }
+# 握着 .ctnd.lock 的进程：按 /proc/*/fd 扫，与进程名、pgrep 实现**都无关**。
+# 有些环境里进程的 comm 会跟预期对不上（模块升级换了文件、pgrep 实现差异），
+# 这时候只有「谁握着锁」这个事实是可靠的 —— daemon 活着的定义就是它持着锁。
+lock_holders() {
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ -r "$d/fd" ] || continue
+		for fd in $d/fd/*; do
+			case "$(readlink "$fd" 2>/dev/null)" in
+				*ctnd.lock) echo "$p"; break ;;
+			esac
+		done
+	done
+}
+ctnd_alive() { [ -n "$(ctnd_pids)$(lock_holders)" ]; }
+ctnd_one() { local p; p=$(ctnd_pids | head -1); [ -n "$p" ] && { echo "$p"; return; }; lock_holders | head -1; }
+ctnd_kill() { for p in $(ctnd_pids) $(lock_holders); do kill "$p" 2>/dev/null; done; }
 # ----
 
 # 写一个值、读回核对。不一致时**立刻重读**再判 —— 实测遇到过一次
@@ -267,7 +283,7 @@ echo "  --- 恢复运行状态 ---"
 if ! grep -q '^ctn_patch ' /proc/modules; then
 	insmod "$KO" 2>/dev/null && echo "    模块已重新加载" || echo "    !! 模块重新加载失败，建议重启"
 fi
-if [ "$(ctnd_count)" = "0" ]; then
+if ! ctnd_alive; then
 	if [ -x "$MODDIR/ctnd" ]; then
 		# 记下 daemon.log 现有行数：起不来时只打新增的那几行当"原因"
 		DL0=$(wc -l < "$MODDIR/daemon.log" 2>/dev/null)
@@ -277,11 +293,11 @@ if [ "$(ctnd_count)" = "0" ]; then
 			setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
 			j=1
 			while [ $j -le 5 ]; do
-				[ "$(ctnd_count)" != "0" ] && break
+				ctnd_alive && break
 				sleep 1
 				j=$((j+1))
 			done
-			[ "$(ctnd_count)" != "0" ] && break
+			ctnd_alive && break
 			# 没起来：清掉残兵再来（锁可能被一个正在退出的 ctnd 占着）
 			ctnd_kill
 			sleep 1
@@ -289,8 +305,8 @@ if [ "$(ctnd_count)" = "0" ]; then
 		done
 		# 必须**确认**起来了才敢说"已拉起" —— 早期版本无条件打印，
 		# 结果上面写"已拉起"、下一项又报"没在运行"，自相矛盾（实测踩过）。
-		if [ "$(ctnd_count)" != "0" ]; then
-			echo "    daemon 已拉起（pid $(ctnd_pids | head -1)）"
+		if ctnd_alive; then
+			echo "    daemon 已拉起（pid $(ctnd_one)）"
 		else
 			echo "    !! daemon 起不来（试了 3 次），本次尝试期间的新日志："
 			tail -n +$((DL0 + 1)) "$MODDIR/daemon.log" 2>/dev/null | tail -n 5 | while read -r l; do echo "       $l"; done
@@ -304,7 +320,7 @@ fi
 NP=$(ctnd_count)
 if [ "$NP" = "1" ]; then
 	DV=$("$MODDIR/ctnd" --version 2>/dev/null | awk '{print $2}')
-	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_pids | head -1)）"
+	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_one)）"
 elif [ "$NP" = "0" ]; then
 	ng "daemon      " "ctnd 没在运行 —— 节点不会被自动写入"
 else
@@ -365,7 +381,7 @@ esac
 				# 撞锁**只有**在确实有 ctnd 活着时才算「自愈、无后果」。
 				# 没有 ctnd 在跑就说明它没自愈 —— 那几条撞锁正是起不来的原因，
 				# 这时候还写「无后果」是误导（实测踩过）。
-				if [ "$(ctnd_count)" != "0" ]; then
+				if ctnd_alive; then
 					sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（无后果）"
 				else
 					ng "daemon 日志 " "本次期间 $NOISE_N 次撞锁，且当前没有 ctnd 在运行 —— 这就是它起不来的原因"
