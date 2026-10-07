@@ -30,7 +30,6 @@
 |---|---|
 | `ctn_patch.ko` | 外部 LKM，补出可写节点 |
 | `ctnd` | 用户态 daemon，按云控配置自动写节点 |
-| `ctn.conf` | 本地覆盖名单（手写兜底，优先级高于云控），首次开机自动铺到 `/data/adb/ctn_patch/` |
 | `ctn_patch.zip` | Magisk / KernelSU 刷入包（含上面全部） |
 
 ## 三、安装
@@ -47,8 +46,6 @@ cat /data/adb/modules/ctn_patch/daemon.log   # daemon 干活记录
 cat /proc/game_opt/task_boost/critical_task_name
 ```
 
-想手动指定某个游戏的关键线程名，编辑 `/data/adb/ctn_patch/ctn.conf`
-（首次开机自动铺好带注释的模板），见 5.4 节。
 
 ### 3.1 自检（管理器里的「操作 / Action」按钮）
 
@@ -75,7 +72,7 @@ ctn_patch 自检  v1.3
     模块已重新加载
     daemon 已拉起
 [OK]  daemon        ctnd 1.3 运行中（pid 24937）
-[OK]  daemon 依赖    sqlite=ok cosa库=ok ctn.conf=有
+[OK]  daemon 依赖    sqlite=ok cosa库=ok
 [OK]  daemon 日志   近 200 行无失败记录
 ------------------------------------------------
 结果: 15 项全过
@@ -161,16 +158,15 @@ cat /proc/game_opt/task_boost/critical_task_name
   │  HAL 在游戏启动时写 pid、退出写 -1
   └ pid 由 -1 变正数
       ├ 读 /proc/<pid>/cmdline 取包名
-      ├ ① 本地覆盖文件 /data/adb/ctn_patch/ctn.conf 命中 → 用它（优先级最高）
-      ├ ② 否则查云控库：
+      ├ 查云控库：
       │     命中缓存且库指纹没变 → 直接用（不碰库）
       │     否则拷 db + -wal 到临时目录，SQLite 查该包的 game_config
       │       库: /data/user/0/com.oplus.cosa/databases/db_game_database
-      ├ 有 ctn（明文 JSON 或 base64 编码的 JSON）→ 写进去
-      ├ 有配置无 ctn → Unity 游戏 → 写回 UnityMain UnityGfxDevice
-      ├ 库里没这个包 → OPLUS 不认识 → 写回默认值
-      ├ 配置是加密/未知形态 → 明确告警 + 提示怎么写本地覆盖 → 写回默认值
-      └ 读库失败     → 保持现状不动（宁可不动，也别写错名字）
+      ├ 有 ctn（明文 JSON 或 base64 编码的 JSON）→ **写节点**（唯一会写的情况）
+      ├ 有配置无 ctn（Unity 游戏）  → **不碰节点**，只记日志
+      ├ 库里没这个包（OPLUS 不认识）→ **不碰节点**
+      ├ 配置是加密/未知形态        → **不碰节点**，只记日志
+      └ 读库失败                  → **不碰节点**
   └ pid 连续 6 次（约 5 秒）为 -1 → 恢复默认名字
 ```
 
@@ -208,32 +204,34 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 |---|---|---|
 | 明文 JSON | 串里有 `{` | 直接取 `ctn` / `ctb` |
 | base64 编码的 JSON | 不含 `{`，但能完整 base64 解码 | 先解码，再在解码结果里取 |
-| 加密 / 未知 | 上面两条都不成立 | **不硬猜**：日志明确告警 + 告诉你怎么写本地覆盖，本次先写回默认值 |
+| 加密 / 未知 | 上面两条都不成立 | **不硬猜也不写节点**：只记日志说明读不出来，内核保持原样 |
 
 > 判定用「有没有 `{`」是因为 base64 字符集里不含 `{`，这个判别很稳，不需要猜。
 > 实测本机 84 条官方配置**全部是明文 JSON**，加密形态目前没出现过 —— 留这条
 > 分支是为了「不管云控怎么下发，注入这条路都走得通」。
 
-### 5.4 本地覆盖文件（手写兜底）
+### 5.4 「没有配置就不碰节点」—— v2.0 的行为约定
 
-`/data/adb/ctn_patch/ctn.conf`，**优先级高于云控库**。刷入后首次启动
-`service.sh` 会从模块目录把带注释的 `ctn.conf.example` 铺一份过去，照着改即可：
+这是本版最重要的一条，也是为功耗问题定的：**daemon 只在云控里真拿到 `ctn`
+时才写节点；拿不到就完全不碰**。
 
-```
-# 一行一条，等号左边包名，右边 1~2 个线程名
-com.tencent.tmgp.pubgmhd = GameThread RenderThread
-```
+| 云控里的情况 | 旧版（≤v1.9） | 现在（v2.0） |
+|---|---|---|
+| 有 `ctn` | 写进去 | **写进去**（唯一会写的情况） |
+| 有配置但没 `ctn`（Unity 游戏） | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
+| 库里没有这个游戏 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
+| 配置是加密/未知形态 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
 
-改完不用重启，ctnd 每次游戏启动都重读一遍。什么时候用得上：
+旧版那三种「写回默认值」虽然值和内核默认一样，但等于**每启动一个游戏都去动一次
+内核**（会触发内核里的 RCU 同步换指针）。现在这些情况 daemon 对内核**零影响**。
 
-- 云控没覆盖的游戏
-- 云控那条是加密内容、daemon 读不出来（日志里会明确提示）
-- 你就是想手动指定，不想被云控改
+游戏退出时也不再写死回 Unity 串，而是**恢复成启动时读到的原值** —— 万一节点被
+别的工具设过，不会被覆盖掉。
 
-放在 `/data/adb/ctn_patch/`（不是模块目录里）是有意的：模块目录升级时会被替换，
-用户手写的名单不该跟着一起没。
+> v2.0 同时**移除了本地覆盖文件 `ctn.conf`**（连同 `ctn.conf.example` 和开机
+> 铺开逻辑）。指定关键线程名现在只有一条路：云控配置里的 `ctn`。
 
-### 5.5 占用（真机实测，Ace 3 Pro）
+### 5.5 占用（真机实测，Ace 3 Pro）### 5.5 占用（真机实测，Ace 3 Pro）
 
 | 项目 | 实测值 | 说明 |
 |---|---|---|
@@ -302,7 +300,7 @@ bash daemon/test.sh      # PC 上跑解析逻辑单元测试（不需要设备�
 
 只依赖 `libc.so` / `libdl.so`，无其他运行时依赖。`test.sh` 覆盖 base64
 解码（含无填充残余）、明文/base64 JSON 取值、加密形态识别、名字归一化、
-`game_pid` 解析、本地覆盖文件解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
+`game_pid` 解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
 
 真机上还有一套端到端用例（`daemon/device_e2e.sh` + `daemon/fakepkg.c`）：
 
@@ -391,7 +389,7 @@ python build_zip.py      # 产出 ctn_patch.zip
    `/proc/sys/oplus_sched_ext/pid_unitymain`），所以补节点是补齐 6.6 标准接口 +
    让内核侧匹配名单可改。
 5. **daemon 依赖 COSA 的云控库**。库里没有的游戏（OPLUS 不认识）、或库里那条
-   是加密内容时，用默认名 —— 这种情况可以在本地覆盖文件里手写一行解决（见 5.4）。
+   是加密内容时，daemon 不碰节点（见 5.4）。
 6. 模块不持久化；刷 zip 则由 `service.sh` 开机自动加载。
 
 ## 九、许可
@@ -543,8 +541,8 @@ KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在
 | 刷入时被 `[不满足]` 拒绝 | 闸门拦住了，消息里写明是哪一条 |
 | `daemon.log` 里没有「游戏启动」 | `game_pid` 没变 → 这游戏不在 OPLUS 名单里，HAL 不认 |
 | `sqlite: 所有候选路径都加载失败` | 该机型库名/路径不同，改 `ctnd.c` 的 `SQLITE_CANDIDATES` |
-| `云控库里没有这个游戏` | OPLUS 不认识这个包 → 用默认名，或在 `ctn.conf` 里手写一行 |
-| `既不是 JSON 也不是 base64-JSON` | 该包配置是加密/未知形态 → 在 `ctn.conf` 里手写一行 |
+| `云控库里没有这个游戏` | OPLUS 不认识这个包 → daemon 不碰节点，内核保持原样 |
+| `既不是 JSON 也不是 base64-JSON` | 该包配置是加密/未知形态 → daemon 不碰节点 |
 | 节点是 `UnityMain` 但游戏是虚幻的 | 读库失败（看日志），或该包配置里确实没有 `ctn` |
 | 名字对了但没效果 | `ct_enable=0` → 见第八节第 1 条 |
 | `daemon.log` 里只有「启动」没有「游戏启动」 | `game_pid` 没变过 → HAL 没把这游戏当游戏（不在 OPLUS 名单里），或在用 `--db` 指了别的库 |

@@ -304,6 +304,13 @@ static ssize_t critical_task_name_write(struct file *file,
 	patched = true;
 	mutex_unlock(&patch_lock);
 
+	/*
+	 * 每一次改动都留一行 dmesg。排查「谁在什么时候改了名单、改成了什么」时
+	 * 直接 `dmesg | grep ctn_patch` 就够，和 ctnd 写的 /dev/kmsg 同一条时间线。
+	 * 写入频率很低（一个游戏会话两次：开始写入、退出恢复），不会刷屏。
+	 */
+	pr_info("ctn_patch: 名单更新 [%s] [%s]\n", new_name[0], new_name[1]);
+
 	*ppos = count;
 	return count;
 }
@@ -529,5 +536,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("1.1");
+MODULE_VERSION("2.0");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

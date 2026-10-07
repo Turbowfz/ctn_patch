@@ -33,7 +33,6 @@ FILES = {
     "action.sh": (MAGISK, True, True),
     "verify.sh": (HERE, True, True),
     "README.md": (MAGISK, False, False),
-    "ctn.conf.example": (MAGISK, False, True),  # service.sh 首次启动铺到 /data/adb/ctn_patch/
     "LICENSE": (HERE, False, True),   # GPL 要求：分发二进制须随附许可
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
     # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）

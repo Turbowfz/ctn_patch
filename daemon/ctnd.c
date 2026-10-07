@@ -1,6 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
- * ctnd —— critical task name daemon   v1.1
+ * ctnd —— critical task name daemon   v2.0
  * Copyright (c) Turbo
  *
  * 为什么需要它：
@@ -12,26 +11,20 @@
  * 判断链：
  *   1. 盯 /proc/game_opt/game_pid —— HAL 在游戏启动时写 pid、退出写 -1
  *   2. 游戏一起来，从 pid 取包名
- *   3. 按优先级取该游戏的关键线程名：
- *        a) 本地覆盖文件 /data/adb/ctn_patch/ctn.conf（手写兜底，优先级最高）
- *        b) COSA 云控库 /data/user/0/com.oplus.cosa/databases/db_game_database
- *           的 game_config 列，取里面的 "ctn"
- *   4. 写进 critical_task_name
+ *   3. 去 COSA 云控库 /data/user/0/com.oplus.cosa/databases/db_game_database
+ *      的 game_config 列取该包的 "ctn"
+ *   4. **只有拿到 ctn 才写节点**；写前记住节点原值，游戏退出后恢复回去
  *
- * v1.1 相对 v1.0 的改动（性能 / 占用 / 兼容性）：
- *   [性能] 配置缓存 —— 同一个包的 ctn 只解析一次；库没变（比对 db+wal 的
- *          mtime/size/inode 指纹）就直接用缓存，不再重复拷贝 600KB 的库。
- *   [性能] 轮询 500ms → 800ms；且只在 game_pid 真的变化时才干活。
- *   [占用] 只拷 db + wal，不再拷 -shm：-shm 是正在被 COSA mmap 的共享内存，
- *          拷它既没必要（SQLite 会自己重建），还可能拷到撕裂内容。省 32KB 也更安全。
- *   [占用] 缓存上限 64 条，长期运行不会无限增长。
- *   [兼容] 配置形态：明文 JSON 直接取；base64 编码的 JSON 先解码再取；
- *          两者都不是（加密/未知形态）→ 明确告警 + 回退到本地覆盖文件，
- *          而不是悄悄写个默认值了事。
- *   [兼容] 本地覆盖文件 ctn.conf：云控没覆盖的游戏、或库里是加密内容读不出来时，
- *          手写一行就能用 —— 保证「注入」这条路始终走得通。
- *   [兼容] SQLite 库 / 云控库都支持多候选路径；`--db <路径>` 可手工指定库
- *          （其他机型库不在候选列表里时的出口）。
+ * v2.0 的改动（按反馈重写，核心是「不必要时一个字都不写」）：
+ *   [移除] 本地覆盖文件 ctn.conf —— 一并去掉 ctn.conf.example 与开机铺开逻辑。
+ *   [功耗] **没有 ctn 就完全不碰节点**。旧版在「云控里没 ctn / 库里没这个游戏 /
+ *          配置是加密」这三种情况下会写回 UnityMain UnityGfxDevice —— 虽然值和
+ *          内核默认相同，但等于「每启动一个游戏都去动内核」。现在这些情况一律
+ *          只记日志、不写节点，daemon 对内核**零影响**。
+ *   [安全] 退出时恢复的是**启动时读到的原值**（不是硬编码的 Unity 串），
+ *          避免把用户/别的工具设过的值覆盖掉。
+ *   [排查] 关键事件同时写 /dev/kmsg —— dmesg 里能看到 daemon 什么时候写了什么，
+ *          和内核日志同一条时间线（排查功耗/行为问题时对着 dmesg 看就够）。
  *
  * 构建：见同目录 build.sh（NDK clang，aarch64-linux-android）
  */
@@ -56,14 +49,14 @@
 
 /* ------------------------------ 常量 ------------------------------ */
 
-#define CTND_VERSION "1.1"
+#define CTND_VERSION "2.0"
 
 #define NODE_PATH    "/proc/game_opt/task_boost/critical_task_name"
 #define CTEN_PATH    "/proc/game_opt/task_boost/ct_enable"
 #define GAMEPID_PATH "/proc/game_opt/game_pid"
 
-/* 本地覆盖文件：手写兜底，优先级高于云控库 */
-#define LOCAL_CONF   "/data/adb/ctn_patch/ctn.conf"
+/* 关键事件也写这里，让 dmesg 能看到 daemon 干了什么（查 bug 用 dmesg） */
+#define KMSG_PATH    "/dev/kmsg"
 
 /* 云控库候选路径 */
 static const char *DB_CANDIDATES[] = {
@@ -71,8 +64,6 @@ static const char *DB_CANDIDATES[] = {
 	"/data/data/com.oplus.cosa/databases/db_game_database",
 	NULL,
 };
-
-#define DEFAULT_NAMES "UnityMain UnityGfxDevice"
 
 /* SQLite 库候选路径（这台设备叫 libsqlite.so，不是 libsqlite3.so） */
 static const char *SQLITE_CANDIDATES[] = {
@@ -143,6 +134,22 @@ static void logmsg(const char *fmt, ...)
 	va_end(ap);
 	fputc('\n', stderr);
 	fflush(stderr);		/* 掉电/被杀时也别丢最后几行 */
+
+	/*
+	 * 同一条消息也写 /dev/kmsg：dmesg 里就能看到 daemon 什么时候写了什么，
+	 * 和内核日志（含 ctn_patch 的 pr_info）在同一条时间线上 —— 排查行为/功耗
+	 * 问题对着 dmesg 看就够，不用来回翻两个日志。写不进去就算了，不影响正事。
+	 */
+	{
+		int kfd = open(KMSG_PATH, O_WRONLY | O_CLOEXEC);
+
+		if (kfd >= 0) {
+			va_start(ap, fmt);
+			vdprintf(kfd, fmt, ap);
+			va_end(ap);
+			close(kfd);
+		}
+	}
 }
 
 /* --------------------------- SQLite 动态加载 --------------------------- */
@@ -225,6 +232,41 @@ static bool read_file(const char *path, char *buf, size_t len)
 		return false;
 	buf[n] = '\0';
 	return true;
+}
+
+/*
+ * 启动时读一次节点，记住它的原值。游戏退出后恢复成**这个**值，而不是硬编码的
+ * UnityMain/UnityGfxDevice —— 万一节点被别的工具/用户设过，不要把它覆盖掉。
+ * 节点读不到（模块没加载）就留空，那种情况下也不恢复（本来就没写过）。
+ */
+static char g_orig_names[NAME_MAX_LEN * 2];
+static bool g_patched;		/* 本次运行有没有动过节点 */
+
+static void remember_orig_names(void)
+{
+	char buf[NAME_MAX_LEN * 4];
+
+	g_orig_names[0] = '\0';
+	if (!read_file(NODE_PATH, buf, sizeof(buf)))
+		return;
+	/* 读回来是 "名字1:-1,名字2:-1" 这种格式，转回 "名字1 名字2" */
+	{
+		char *colon = strchr(buf, ':');
+		char *comma = strchr(buf, ',');
+
+		if (!colon || !comma)
+			return;
+		*colon = '\0';
+		{
+			char *second = comma + 1;
+			char *c2 = strchr(second, ':');
+
+			if (!c2)
+				return;
+			*c2 = '\0';
+			snprintf(g_orig_names, sizeof(g_orig_names), "%s %s", buf, second);
+		}
+	}
 }
 
 static bool write_file(const char *path, const char *data)
@@ -449,55 +491,6 @@ static bool json_get_int(const char *json, const char *key, int *out)
 
 	if (*p == '-' || (*p >= '0' && *p <= '9')) {
 		*out = atoi(p);
-		return true;
-	}
-	return false;
-}
-
-/* --------------------------- 本地覆盖文件 --------------------------- */
-/*
- * 格式（一行一条，# 开头是注释）：
- *     com.tencent.tmgp.pubgmhd = RenderThread Thread-
- * 优先级高于云控库。用途：
- *   - 云控没覆盖的游戏
- *   - 库里存的是加密内容、daemon 读不出来时手工兜底
- */
-static bool local_conf_lookup(const char *pkg, char *out, size_t outlen)
-{
-	char buf[16384];
-	char *line, *save;
-
-	if (access(LOCAL_CONF, R_OK) != 0)
-		return false;
-	if (!read_file(LOCAL_CONF, buf, sizeof(buf)))
-		return false;
-
-	for (line = strtok_r(buf, "\n", &save); line;
-	     line = strtok_r(NULL, "\n", &save)) {
-		char *eq, *k, *v, *p;
-
-		while (*line && isspace((unsigned char)*line))
-			line++;
-		p = line + strlen(line);
-		while (p > line && isspace((unsigned char)p[-1]))
-			*--p = '\0';
-		if (!*line || *line == '#')
-			continue;
-
-		eq = strchr(line, '=');
-		if (!eq)
-			continue;
-		*eq = '\0';
-		k = line;
-		v = eq + 1;
-		while (*k && isspace((unsigned char)k[strlen(k) - 1]))
-			k[strlen(k) - 1] = '\0';
-		while (*v && isspace((unsigned char)*v))
-			v++;
-		if (strcmp(k, pkg) != 0)
-			continue;
-
-		snprintf(out, outlen, "%s", v);
 		return true;
 	}
 	return false;
@@ -754,9 +747,16 @@ static bool normalize_and_write(const char *names)
 		tok[n++] = p;
 
 	if (n == 0) {
-		snprintf(out, sizeof(out), "%s", DEFAULT_NAMES);
-		logmsg("名字: 空，用默认值 [%s]", out);
-	} else if (n == 1) {
+		/*
+		 * 拿到空值 = 上游没给有效配置。**不写节点**（v2.0 起）：
+		 * 旧版这里会写回 UnityMain UnityGfxDevice，等于每来一个游戏都去动内核。
+		 * 调用方本来就只在真拿到 ctn 时才调这里，走到这说明配置是空的 ——
+		 * 那就什么都不做，让内核保持原样。
+		 */
+		logmsg("名字: 空，不写节点（内核保持原样）");
+		return false;
+	}
+	if (n == 1) {
 		snprintf(out, sizeof(out), "%s %s", tok[0], tok[0]);
 		logmsg("名字: 只有 1 个 [%s]，同名写两遍", tok[0]);
 	} else {
@@ -837,63 +837,57 @@ static void handle_game_start(pid_t pid)
 {
 	struct cfg_entry e;
 	char pkg[256] = {0};
-	char local[NAME_MAX_LEN * 2] = {0};
 
 	if (!get_package_name(pid, pkg, sizeof(pkg))) {
 		logmsg("游戏 pid=%d，但取不到包名，跳过", (int)pid);
 		return;
 	}
-	logmsg("游戏启动: pid=%d 包名=%s", (int)pid, pkg);
 
-	/* ① 本地覆盖文件优先 */
-	if (local_conf_lookup(pkg, local, sizeof(local))) {
-		logmsg("本地覆盖: [%s]", local);
-		normalize_and_write(local);
+	lookup_cfg(pkg, &e);
+
+	/*
+	 * 只有真的拿到 ctn 才写节点 —— 这是本版最重要的一条（v2.0）。
+	 * 旧版在「云控里没 ctn / 库里没这个游戏 / 配置加密」时会写回
+	 * UnityMain UnityGfxDevice，虽然值和内核默认相同，但那等于**每启动一个
+	 * 游戏就去动一次内核**；有反馈刷入后功耗异常，这条被一并去掉：
+	 * 拿不到 ctn 就完全不碰节点，daemon 对内核零影响。
+	 */
+	if (e.form == CFG_JSON || e.form == CFG_B64JSON) {
+		logmsg("游戏启动: %s → 云控 ctn=\"%s\"（%s, ctb=%d）", pkg, e.ctn,
+		       e.form == CFG_JSON ? "明文 JSON" : "base64 JSON", e.ctb);
+		if (normalize_and_write(e.ctn)) {
+			g_patched = true;	/* 记住"我们动过节点"，退出时才需要恢复 */
+			if (g_manage_cten && e.ctb >= 0) {
+				const char *want = e.ctb ? "1" : "0";
+
+				if (write_file(CTEN_PATH, want))
+					logmsg("ct_enable 置 %s（按配置 ctb=%d）", want, e.ctb);
+				else
+					logmsg("写 ct_enable 失败: %s", strerror(errno));
+			}
+		}
 		return;
 	}
 
-	/* ② 云控库 */
-	lookup_cfg(pkg, &e);
-
+	/* 其余情况：不写节点，只说明为什么（查 bug 看 dmesg / daemon.log） */
 	switch (e.form) {
 	case CFG_JSON:
-		logmsg("云控 ctn = \"%s\"（明文 JSON，ctb=%d）", e.ctn, e.ctb);
-		normalize_and_write(e.ctn);
-		break;
 	case CFG_B64JSON:
-		logmsg("云控 ctn = \"%s\"（base64 编码的 JSON，ctb=%d）", e.ctn, e.ctb);
-		normalize_and_write(e.ctn);
+		/* 上面 if 里已经处理并 return，走不到这儿 —— 列出来只为消除
+		 * -Wswitch-enum 警告（要求把枚举值都写上） */
 		break;
 	case CFG_EMPTY:
-		logmsg("云控里没有 ctn（Unity 游戏），写回默认值");
-		normalize_and_write(DEFAULT_NAMES);
+		logmsg("游戏启动: %s → 云控里没有 ctn（Unity 游戏）→ **不写节点**"
+		       "（内核默认值本来就是 UnityMain/UnityGfxDevice）", pkg);
 		break;
 	case CFG_OPAQUE:
-		/* 加密/未知形态：不硬猜，明确告诉用户怎么兜底 */
-		logmsg("云控这条配置既不是 JSON 也不是 base64-JSON（加密或未知形态），"
-		       "daemon 读不出来");
-		logmsg("  → 想给 %s 指定名字，在 %s 里写一行：", pkg, LOCAL_CONF);
-		logmsg("     %s = 名字1 名字2", pkg);
-		logmsg("  本次先写回默认值");
-		normalize_and_write(DEFAULT_NAMES);
+		logmsg("游戏启动: %s → 云控配置既不是 JSON 也不是 base64-JSON"
+		       "（加密或未知形态）→ **不写节点**", pkg);
 		break;
 	case CFG_NONE:
 	default:
-		logmsg("云控库里没有这个游戏，写回默认值");
-		normalize_and_write(DEFAULT_NAMES);
+		logmsg("游戏启动: %s → 云控库里没有这个游戏 → **不写节点**", pkg);
 		break;
-	}
-
-	/*
-	 * ct_enable 归 HAL 管（它按 game_config.ctb + 游戏场景判定来开关），
-	 * 默认我们不动它，免得两边互相打架。--enable-ctb 时才代管。
-	 */
-	if (g_manage_cten && e.ctb >= 0) {
-		const char *want = e.ctb ? "1" : "0";
-		if (write_file(CTEN_PATH, want))
-			logmsg("ct_enable 置 %s（按配置 ctb=%d）", want, e.ctb);
-		else
-			logmsg("写 ct_enable 失败: %s", strerror(errno));
 	}
 }
 
@@ -925,10 +919,9 @@ int main(int argc, char **argv)
 			       "  -d, --db <路径>    指定云控库（默认按内置候选路径找；\n"
 			       "                     换机型/库不在候选列表时用这个）\n"
 			       "  -V, --version      打印版本\n"
-			       "本地覆盖文件（优先级高于云控库）：%s\n"
-			       "  一行一条：包名 = 名字1 名字2   （# 开头是注释）\n"
-			       "日志走 stderr，由 service.sh 重定向到 daemon.log\n",
-			       CTND_VERSION, LOCAL_CONF);
+			       "只有云控里真有 ctn 才写节点；没有就完全不碰（v2.0 起）\n"
+			       "日志走 stderr（service.sh 转到 daemon.log），同时写 /dev/kmsg\n",
+			       CTND_VERSION);
 			return 0;
 		}
 	}
@@ -942,6 +935,9 @@ int main(int argc, char **argv)
 	if (!acquire_single_instance(argv[0]))
 		return EXIT_ALREADY_RUNNING;
 
+	/* 先记下节点原值：退出时恢复成它，而不是硬编码的 Unity 串 */
+	remember_orig_names();
+
 	logmsg("ctnd %s 启动（节点 %s%s%s）", CTND_VERSION, NODE_PATH,
 	       g_manage_cten ? "，代管 ct_enable" : "",
 	       g_db_override ? "，库由 --db 指定" : "");
@@ -951,9 +947,6 @@ int main(int argc, char **argv)
 	if (access(NODE_PATH, W_OK) != 0)
 		logmsg("注意: 现在写不了 %s（%s）—— ctn_patch 模块没加载？"
 		       " 节点出现后本进程会照常工作", NODE_PATH, strerror(errno));
-
-	if (access(LOCAL_CONF, R_OK) == 0)
-		logmsg("本地覆盖文件已加载: %s", LOCAL_CONF);
 
 	/* 启动时先对齐一次当前状态（比如 daemon 是被重启的，游戏已经在跑） */
 	if (read_file(GAMEPID_PATH, buf, sizeof(buf))) {
@@ -991,10 +984,23 @@ int main(int argc, char **argv)
 		 * GONE_POLLS 次 -1 才当真的退出，免得把刚写好的名字冲回默认值。
 		 */
 		if (last > 0 && ++gone >= GONE_POLLS) {
-			logmsg("游戏退出（pid 连续 %d 次为 -1），恢复默认名字", GONE_POLLS);
 			last = -1;
 			gone = 0;
-			normalize_and_write(DEFAULT_NAMES);
+			/* 只有本次真的动过节点才需要恢复；恢复成启动时读到的原值 */
+			if (g_patched) {
+				if (g_orig_names[0]) {
+					logmsg("游戏退出（连续 %d 次 -1），恢复原值 [%s]",
+					       GONE_POLLS, g_orig_names);
+					if (!write_file(NODE_PATH, g_orig_names))
+						logmsg("恢复失败: %s", strerror(errno));
+				} else {
+					logmsg("游戏退出：不知道原值（启动时节点读不到），不恢复");
+				}
+				g_patched = false;
+			} else {
+				logmsg("游戏退出（连续 %d 次 -1），本次没动过节点，什么都不做",
+				       GONE_POLLS);
+			}
 		}
 	}
 

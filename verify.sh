@@ -303,7 +303,6 @@ for p in /system/lib64/libsqlite.so /system/lib64/libsqlite3.so \
 done
 case "$D" in *sqlite*) ;; *) D="$D sqlite=缺" ;; esac
 [ -r /data/user/0/com.oplus.cosa/databases/db_game_database ] && D="$D cosa库=ok" || D="$D cosa库=缺"
-[ -r /data/adb/ctn_patch/ctn.conf ] && D="$D ctn.conf=有" || D="$D ctn.conf=无(可自动铺)"
 case "$D" in
 	*"sqlite=缺"*|*"cosa库=缺"*) ng "daemon 依赖 " "$D" ;;
 	*) ok "daemon 依赖 " "$D" ;;

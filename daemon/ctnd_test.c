@@ -98,51 +98,7 @@ int main(void)
 	check("退出", parse_game_pid("game_pid=-1 child_num=0") == -1);
 	check("缺字段", parse_game_pid("garbage") == -1);
 
-	printf("\n=== 7. 本地覆盖文件解析 ===\n");
-	{
-		/* 借 local_conf_lookup 的解析逻辑：临时写一个文件再读 */
-		const char *p = "/tmp/ctn_test.conf";
-		FILE *f = fopen(p, "w");
-		char out[128] = {0};
-
-		if (f) {
-			fprintf(f, "# 注释行\n");
-			fprintf(f, "com.foo.bar = Name1 Name2\n");
-			fprintf(f, "\n");
-			fprintf(f, "com.baz.qux=GameThread   RenderThread\n");
-			fclose(f);
-			/* LOCAL_CONF 是编译期常量，这里换个方式验证：直接测解析函数
-			 * 的等价逻辑（读文件 + 按 = 切分） */
-			char buf[4096];
-			if (read_file(p, buf, sizeof(buf))) {
-				char *line, *save;
-				int found = 0;
-				for (line = strtok_r(buf, "\n", &save); line;
-				     line = strtok_r(NULL, "\n", &save)) {
-					char *eq;
-					while (*line && isspace((unsigned char)*line)) line++;
-					if (!*line || *line == '#') continue;
-					eq = strchr(line, '=');
-					if (!eq) continue;
-					*eq = '\0';
-					while (*eq == '\0' && isspace((unsigned char)eq[-1])) eq[-1] = '\0';
-					if (!strcmp(line, "com.baz.qux")) {
-						char *v = eq + 1;
-						while (*v && isspace((unsigned char)*v)) v++;
-						snprintf(out, sizeof(out), "%s", v);
-						found = 1;
-					}
-				}
-				check("找到 com.baz.qux", found);
-				check("取到名字串", strstr(out, "GameThread") != NULL);
-			} else {
-				check("读配置文件", false);
-			}
-			remove(p);
-		} else {
-			printf("  (跳过：建不了临时文件)\n");
-		}
-	}
+	/* 第 7 节（本地覆盖文件解析）在 v2.0 随 ctn.conf 功能一起删掉了 */
 
 	printf("\n==================================\n");
 	printf("结果: %s（失败 %d 项）\n", fails ? "有问题" : "全部通过", fails);

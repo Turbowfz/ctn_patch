@@ -13,7 +13,6 @@ NODE=/proc/game_opt/task_boost/critical_task_name
 GAMEPID=/proc/game_opt/game_pid
 CTEN=/proc/game_opt/task_boost/ct_enable
 DB=/data/local/tmp/synth.db
-CONF=/data/adb/ctn_patch/ctn.conf
 LOG=/data/local/tmp/ctnd.log
 CTND=/data/local/tmp/ctnd
 FAKE=/data/local/tmp/fakepkg
@@ -36,7 +35,6 @@ cleanup() {
 	for p in $PIDS; do kill $p 2>/dev/null; done
 	echo -1 > $GAMEPID 2>/dev/null
 	kill $CTND_PID 2>/dev/null
-	rm -f "$CONF"
 	rmmod ctn_patch 2>/dev/null
 }
 trap cleanup EXIT
@@ -48,7 +46,8 @@ sleep 1
 rmmod ctn_patch 2>/dev/null
 mkdir -p /data/adb/ctn_patch
 
-cat > "$CONF" <<'EOF'
+: > /dev/null  # v2.0：本地覆盖文件功能已移除，这一段不再需要
+
 # 测试用本地覆盖
 aaa.local.test = LocalMain LocalRender
 aaa.one.test   = SoloMain
@@ -163,7 +162,6 @@ sleep 1
 echo -1 > $GAMEPID
 echo "0" > $CTEN
 rmmod ctn_patch && echo "  模块已卸载" || echo "  !! rmmod 失败"
-rm -f "$CONF"
 rm -f /data/adb/modules/ctn_patch/.stop
 
 echo

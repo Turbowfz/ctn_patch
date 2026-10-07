@@ -394,7 +394,6 @@ set_perm "$MODPATH/service.sh"       0 0 0755
 set_perm "$MODPATH/uninstall.sh"     0 0 0755
 set_perm "$MODPATH/action.sh"        0 0 0755
 set_perm "$MODPATH/verify.sh"        0 0 0755
-set_perm "$MODPATH/ctn.conf.example" 0 0 0644
 
 ui_print "- 重启后自动加载；日志 /data/adb/modules/ctn_patch/boot.log"
-ui_print "- daemon 按云控配置自动填名字；手动指定见 ctn.conf（5.4 节）"
+ui_print "- daemon 只在云控里有 ctn 时才动节点；没有就完全不碰（见 README 5.4）"
