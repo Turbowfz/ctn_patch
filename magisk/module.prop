@@ -2,7 +2,7 @@
 id=ctn_patch
 name=CTN Patch
 version=v2.0
-versionCode=24
+versionCode=20
 author=Turbo
 description=给 6.1 内核补上 critical_task_name 节点，并按云控配置自动为每个游戏填入关键线程名
 updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json

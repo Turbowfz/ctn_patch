@@ -1,6 +1,6 @@
 # 更新日志
 
-## v2.0（versionCode 24）
+## v2.0（versionCode 20）
 
 **按「性能、速度、占用、兼容性」整体重写。** 这一版把 v1.x 的一堆历史包袱砍掉，
 并按功耗反馈收窄了「什么时候会去动内核」。
@@ -110,7 +110,7 @@ ctn_patch: 名单更新 [UnityMain] [UnityGfxDevice]       ← 恢复
 ```
 ctn_patch.ko  sha256 2b40becca988958606447908135ad720e4c2b58e7ba04e320410dac3e82533cf
 ctnd          sha256 a621a09a189c4552cdb27577f579347677a4d03043a9553b67d5a4a37798af4a
-zip           sha256 1e394eb80e9be97195e32e2a724b90a04649064fb72caf759c19394a74362597
+zip           sha256 c7508551fc22d9a1ea8dd505a7dbcab67d89e3d533e697041e510ab42e919324
 ```
 
 ## v1.9（versionCode 19）
