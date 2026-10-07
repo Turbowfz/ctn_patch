@@ -7,9 +7,9 @@ tree / parent / author / committer / date / message 原样搬过去，
 算出来的 SHA 和本地一致 —— 这样两边历史不会分叉。
 
 用法：
-    python gh_api_push.py <本地提交sha> <远端父提交sha> [分支]
-例：
-    python gh_api_push.py ff1cffc 17c448a main
+    python gh_api_push.py <本地提交sha> [分支]
+
+父提交不用传 —— 脚本自己从提交里读（传错过一次，见文件末尾的守卫说明）。
 """
 import base64
 import datetime
@@ -62,15 +62,18 @@ def git(*args, binary=False):
 
 def main():
     global TOKEN
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         sys.exit(__doc__)
-    local, parent = sys.argv[1], sys.argv[2]
-    branch = sys.argv[3] if len(sys.argv) > 3 else "main"
+    local = sys.argv[1]
+    branch = sys.argv[2] if len(sys.argv) > 2 else "main"
     TOKEN = gh_token()
 
     # GitHub 的 API 只收完整 40 位 sha，短 sha 一律 422
     local = git("rev-parse", local).strip()
-    parent = git("rev-parse", parent).strip()
+    # 父提交**从本地提交里读**，不要调用方传 —— 传错过一次（用了个过期的 tip），
+    # 结果树对得上、提交却对不上，SHA 守卫才拦下来。少一个能传错的参数。
+    parent = git("rev-parse", local + "^").strip()
+    print("  父提交（从提交里读）:", parent[:12])
 
     meta = git("cat-file", "-p", local)
     lines = meta.splitlines()
