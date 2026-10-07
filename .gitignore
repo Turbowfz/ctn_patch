@@ -2,7 +2,6 @@
 *.ko
 daemon/ctnd
 daemon/fakepkg
-daemon/synth.db
 *.o
 *.mod
 *.mod.c
@@ -25,6 +24,9 @@ ck.sh
 dv.sh
 __pycache__/
 *.pyc
+
+# daemon/synth.db 例外：那是**纯合成**的测试夹具（只有 aaa.* 假包名），随仓库走，
+# 让 device_e2e.sh 能自包含地跑；下面忽略的是从设备拉下来的真库。
 
 # 从设备拉下来的 COSA 云控数据库（含你手机的应用/游戏数据，绝不能进公开仓库）
 db_game_database*

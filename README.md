@@ -248,6 +248,8 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 现在用 **TTL（600 秒）**：这段时间内直接用缓存的 `ctn`，过了才重查一次。
 代价是云控改了配置最多 10 分钟后生效 —— 重启 daemon（或重启手机）立刻生效。
 
+占用怎么量的：`daemon/measure.sh`（推到设备上 root 跑，会打出内存/CPU/磁盘）。
+
 **不做的优化**：不 `dlclose` libsqlite —— 实测 bionic 的 `dlclose` 不会真卸载
 （Android 已知行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。
 

@@ -56,6 +56,22 @@ int main(void)
 	expect("空 JSON",
 	       "{}", CFG_EMPTY, "", -1);
 
+
+	/* 取值器必须只认「键」：某条数据的值恰好等于 "ctn" 时不能被骗到
+
+
+	/* 取值器必须只认「键」：某条数据的值恰好等于 "ctn" 时不能被骗到。
+	 * v2.0 修过这个 —— 旧写法 strstr 命中那个值就 return false，真名字反而漏掉。*/
+	printf("\n=== 2.5 JSON 键 vs 值（取值器只认键）===\n");
+	{
+		struct cfg_entry e2;
+
+		parse_cfg("{\"x\":\"ctn\",\"ctn\":\"RealOne RealTwo\"}", &e2);
+		check("值里出现 ctn 也不被骗", strcmp(e2.ctn, "RealOne RealTwo") == 0);
+		parse_cfg("{\"note\":\"ctb\",\"ctb\":7,\"ctn\":\"N1 N2\"}", &e2);
+		check("值里出现 ctb 也不被骗", e2.ctb == 7);
+	}
+
 	printf("\n=== 3. 形态二：base64 编码的 JSON ===\n");
 	{
 		/* 把上面那段 JSON 手工 base64 一下 */

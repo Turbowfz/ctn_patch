@@ -106,11 +106,37 @@ ctn_patch: 名单更新 [UnityMain] [UnityGfxDevice]       ← 恢复
 行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。做无用功
 不如不做。
 
+### 10. 发布后的代码复查（同一版号内修订）
+
+复查时又找到 4 个问题，都修在这一版里：
+
+- **JSON 取值器会被「值」骗到**：原来按 `strstr` 找 `"ctn"` 的第一次出现，
+  再检查它后面是不是冒号。如果 game_config 里**某条数据的值**恰好等于 `ctn`
+  （`{"a":"ctn","ctn":"真名字"}`），就会先命中那个值、冒号检查不过直接返回失败，
+  **真名字反而读不到**。现在往后逐个候选找，只认后面跟冒号的**键**。
+  （已加两条防回归用例。）
+- **缓存对「库里没这个游戏」不生效**：命中条件原来带 `form != CFG_NONE`，
+  于是 OPLUS 不认识的游戏每次启动都要重拷一遍库。改用 `used` + 时间戳判断。
+- **锁文件/pidfile 路径取的是 `argv[0]`**：如果进程名是不含 `/` 的相对路径
+  （被别的程序 execv 拉起、或从别处调进来），算出的目录会落到当前工作目录，
+  脚本就找不到 `ctnd.pid` 了。改用 `/proc/self/exe`，与调用方式无关。
+- **`-wal` 拷失败时静默**：主库还在，但可能读到没合并进主库的旧配置。现在出声。
+
+顺带三件清理：
+
+- `daemon/device_e2e.sh` 按新语义重写 —— 原来还期望「没 ctn 时写回默认值」，
+  在新版下那几项全部会失败；
+- 合成测试库 `daemon/synth.db` 纳入仓库（纯 `aaa.*` 假包名，无设备数据），
+  让那个测试脚本能自包含地跑；
+- 删掉 4 个已没人引用的旧脚本：`arch_final_build.sh`、`device_check.sh`、
+  `device_verify.sh`、`test_parse.c` —— 后三者的功能已被 `customize.sh` /
+  `verify.sh` / 设备自检覆盖，而且 `test_parse.c` 的期望值还是「单名必须被拒」。
+
 **校验值**
 ```
 ctn_patch.ko  sha256 2b40becca988958606447908135ad720e4c2b58e7ba04e320410dac3e82533cf
-ctnd          sha256 a621a09a189c4552cdb27577f579347677a4d03043a9553b67d5a4a37798af4a
-zip           sha256 c7508551fc22d9a1ea8dd505a7dbcab67d89e3d533e697041e510ab42e919324
+ctnd          sha256 c6f175478384aa1daf621683258e05eb4b2cb643c55f7b6ff6be85733dfd5c68
+zip           sha256 72052c40bb7554448e439ae5a4418f220a6d4f5e5cabe1266c20bdebbb47cbea
 ```
 
 ## v1.9（versionCode 19）

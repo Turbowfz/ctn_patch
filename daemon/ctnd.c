@@ -419,16 +419,25 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
 	size_t k = 0;
 
 	snprintf(pat, sizeof(pat), "\"%s\"", key);
-	p = strstr(json, pat);
+	/*
+	 * 必须找到的是**键**：挑到候选位置后要求后面紧跟冒号。
+	 * 不能只用 strstr 取第一次出现 —— game_config 里某条**数据**的值如果正好
+	 * 等于 "ctn"（比如 {"a":"ctn","ctn":"真名字"}），strstr 会先命中那个值，
+	 * 冒号检查不过就直接 return false，真名字反而漏掉。所以这里往后逐个候选试。
+	 */
+	for (p = strstr(json, pat); p; p = strstr(p + 1, pat)) {
+		const char *q2 = p + strlen(pat);
+
+		while (*q2 && isspace((unsigned char)*q2))
+			q2++;
+		if (*q2 == ':') {
+			p = q2;
+			break;
+		}
+	}
 	if (!p)
 		return false;
-	p += strlen(pat);
-
-	while (*p && isspace((unsigned char)*p))
-		p++;
-	if (*p != ':')
-		return false;
-	p++;
+	p++;				/* 原代码在冒号检查后本来就有这一句，别再加 */
 	while (*p && isspace((unsigned char)*p))
 		p++;
 	if (*p != '"')
@@ -462,14 +471,18 @@ static bool json_get_int(const char *json, const char *key, int *out)
 	const char *p;
 
 	snprintf(pat, sizeof(pat), "\"%s\"", key);
-	p = strstr(json, pat);
-	if (!p)
-		return false;
-	p += strlen(pat);
+	/* 同上：只认后面跟冒号的**键** */
+	for (p = strstr(json, pat); p; p = strstr(p + 1, pat)) {
+		const char *q2 = p + strlen(pat);
 
-	while (*p && isspace((unsigned char)*p))
-		p++;
-	if (*p != ':')
+		while (*q2 && isspace((unsigned char)*q2))
+			q2++;
+		if (*q2 == ':') {
+			p = q2;
+			break;
+		}
+	}
+	if (!p)
 		return false;
 	p++;
 	while (*p && isspace((unsigned char)*p))
@@ -522,9 +535,15 @@ static bool stage_db(const char *src, char *out_path, size_t outlen)
 		snprintf(s, sizeof(s), "%s%s", src, suffixes[i]);
 		snprintf(d, sizeof(d), "%s/db%s", TMP_DIR, suffixes[i]);
 		unlink(d);
-		if (!copy_file(s, d) && suffixes[i][0] == '\0') {
-			logmsg("库: 拷贝 %s 失败: %s", s, strerror(errno));
-			return false;
+		if (!copy_file(s, d)) {
+			if (suffixes[i][0] == '\0') {
+				logmsg("库: 拷贝 %s 失败: %s", s, strerror(errno));
+				return false;
+			}
+			/* -wal 没拷到：主库还在，但可能读到**没合并进主库的**旧配置。
+			 * 出声，别静默按旧数据办事。 */
+			logmsg("库: 拷贝 %s 失败: %s（可能读到旧配置）",
+			       s, strerror(errno));
 		}
 	}
 	/* 清掉可能残留的旧 -shm，让 SQLite 自己重建 */
@@ -603,8 +622,12 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 	 * 会立刻重读）。
 	 */
 	c = cache_get(pkg);
-	if (c->form != CFG_NONE && c->ts &&
-	    (time(NULL) - c->ts) < CACHE_TTL_S) {
+	/*
+	 * 命中条件用 used + 时间戳，**不要**再加 form != CFG_NONE：
+	 * 「库里没这个游戏」也是一种结论，同样该缓存 —— 否则每启动一个 OPLUS
+	 * 不认识的游戏（很常见）都要重拷库、重查一遍。
+	 */
+	if (c->used && c->ts && (time(NULL) - c->ts) < CACHE_TTL_S) {
 		*e = *c;		/* 命中缓存：不拷库、不开 SQLite、不查 */
 		return;
 	}
@@ -793,12 +816,24 @@ static bool acquire_single_instance(const char *exe)
 {
 	char path[PATH_MAX];
 	char *slash;
+	ssize_t n;
 	int fd;
 
-	snprintf(path, sizeof(path), "%s", exe);
+	/*
+	 * 用 /proc/self/exe 拿自己的真实路径，不用调用方给的 argv[0]：
+	 * argv[0] 若是不含 '/' 的相对名字（被别的程序 execv("ctnd",...) 拉起、
+	 * 或从别处调进来），按它算出的目录会落到**当前工作目录** —— 锁和 pidfile
+	 * 就跟脚本找的位置（$MODDIR/ctnd.pid）对不上了。exe 不受调用方式影响。
+	 */
+	n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+	if (n > 0) {
+		path[n] = '\0';
+	} else {
+		snprintf(path, sizeof(path), "%s", exe);	/* 极端兜底 */
+	}
 	slash = strrchr(path, '/');
 	if (slash)
-		slash[1] = 0;			/* 截到最后一个 / 之后 */
+		slash[1] = '\0';		/* 截到最后一个 / 之后 */
 	else
 		snprintf(path, sizeof(path), "./");
 	strncat(path, ".ctnd.lock", sizeof(path) - strlen(path) - 1);
