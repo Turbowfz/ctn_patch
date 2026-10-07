@@ -31,37 +31,36 @@ ok()  { PASS=$((PASS+1)); row OK "$1" "$2"; }
 ng()  { FAIL=$((FAIL+1)); row '!!' "$1" "$2"; }
 sk()  { SKIP=$((SKIP+1)); row '--' "$1" "$2"; }
 det() { printf '        %s\n' "$*"; }
-# ---- ctnd 进程探测/击杀：不依赖 pgrep/pkill ----
-# KernelSU 的 action 环境会把 PATH 指到 busybox，busybox 的 pgrep/pkill -x
-# 匹配的是**整条命令行**（cmdline 是完整路径），永远匹配不上 —— 表现就是
-# 「daemon 明明活着却报 0 个」「pkill 杀不掉导致重试全撞锁」（实测踩过）。
-# 所以自己扫 /proc/*/comm，与 pgrep 的实现无关。
-ctnd_pids() {
-	for d in /proc/[0-9]*; do
-		[ -r "$d/comm" ] || continue
-		read -r n < "$d/comm" 2>/dev/null
-		[ "$n" = "ctnd" ] && echo "${d#/proc/}"
+# ---- ctnd 进程探测/击杀：读 pidfile ----
+# 判断 daemon 在不在跑 = 读它自己写的 ctnd.pid（模块目录下）+ 确认 /proc/<pid>
+# 还在、comm 是 ctnd。O(1)，只读一个文件、看一眼目录。
+#
+# 为什么不用别的（都试过，都不行）：
+#   - pgrep/pkill -x：语义因实现而异（busybox 比的是整条命令行），永远匹配不上；
+#   - 扫 /proc/*/fd 找「谁握着锁」：结果对，但**极慢** —— 有的进程 800+ 个 fd，
+#     全系统扫一遍是几万次 readlink。而守护循环每 2 秒跑一次，等于持续在后台
+#     扒全系统的 fd（实测执行轨迹 6.7 万行还没跑完）—— 这本身就是实打实的
+#     后台 CPU/功耗开销，v2.1 干掉。
+# pidfile 陈旧（被 kill -9）也没关系：下面会再确认 /proc/<pid> 和 comm。
+CTND_PIDFILE="$MODDIR/ctnd.pid"
+
+ctnd_pid() {
+	_p=$(cat "$CTND_PIDFILE" 2>/dev/null)
+	_p=${_p%%[!0-9]*}
+	if [ -n "$_p" ] && [ -r "/proc/$_p/comm" ]; then
+		read -r _n < "/proc/$_p/comm" 2>/dev/null
+		[ "$_n" = "ctnd" ] && { echo "$_p"; return; }
+	fi
+	for _d in /proc/[0-9]*; do	# 兜底：pidfile 没有/失效时扫名字（便宜）
+		[ -r "$_d/comm" ] || continue
+		read -r _n < "$_d/comm" 2>/dev/null
+		[ "$_n" = "ctnd" ] && { echo "${_d#/proc/}"; return; }
 	done
 }
-ctnd_count() { ctnd_pids | wc -l; }
-# 握着 .ctnd.lock 的进程：按 /proc/*/fd 扫，与进程名、pgrep 实现**都无关**。
-# 有些环境里进程的 comm 会跟预期对不上（模块升级换了文件、pgrep 实现差异），
-# 这时候只有「谁握着锁」这个事实是可靠的 —— daemon 活着的定义就是它持着锁。
-lock_holders() {
-	for d in /proc/[0-9]*; do
-		p=${d#/proc/}
-		[ -r "$d/fd" ] || continue
-		for fd in $d/fd/*; do
-			case "$(readlink "$fd" 2>/dev/null)" in
-				*ctnd.lock) echo "$p"; break ;;
-			esac
-		done
-	done
-}
-ctnd_alive() { [ -n "$(ctnd_pids)$(lock_holders)" ]; }
-ctnd_one() { local p; p=$(ctnd_pids | head -1); [ -n "$p" ] && { echo "$p"; return; }; lock_holders | head -1; }
-ctnd_kill() { for p in $(ctnd_pids) $(lock_holders); do kill "$p" 2>/dev/null; done; }
-# ----
+
+ctnd_alive() { [ -n "$(ctnd_pid)" ]; }
+ctnd_kill()  { _p=$(ctnd_pid); [ -n "$_p" ] && kill "$_p" 2>/dev/null; rm -f "$CTND_PIDFILE"; }
+# ---- 
 
 # 写一个值、读回核对。不一致时**立刻重读**再判 —— 实测遇到过一次
 # 「读回好几轮之前的旧值」（模块刚重载 + 连续写的场景；之后 300 轮压测复现不出来）。
@@ -274,7 +273,7 @@ if ! ctnd_alive; then
 		# 必须**确认**起来了才敢说"已拉起" —— 早期版本无条件打印，
 		# 结果上面写"已拉起"、下一项又报"没在运行"，自相矛盾（实测踩过）。
 		if ctnd_alive; then
-			echo "    daemon 已拉起（pid $(ctnd_one)）"
+			echo "    daemon 已拉起（pid $(ctnd_pid)）"
 		else
 			echo "    !! daemon 起不来（试了 3 次），本次尝试期间的新日志："
 			tail -n +$((DL0 + 1)) "$MODDIR/daemon.log" 2>/dev/null | tail -n 5 | while read -r l; do echo "       $l"; done
@@ -285,10 +284,10 @@ if ! ctnd_alive; then
 fi
 
 # ---------------------------------------------------------------- 13 daemon
-NP=$(ctnd_count)
+NP=$(ctnd_alive && echo 1 || echo 0)
 if [ "$NP" = "1" ]; then
 	DV=$("$MODDIR/ctnd" --version 2>/dev/null | awk '{print $2}')
-	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_one)）"
+	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_pid)）"
 elif [ "$NP" = "0" ]; then
 	ng "daemon      " "ctnd 没在运行 —— 节点不会被自动写入"
 else
@@ -314,7 +313,7 @@ esac
 # 只会吓人。所以用「行数水位」：上次检查到的行数存进 .verify_logmark，
 # 这次只看新增的行（水位跟日志同目录；日志被轮转/清空时水位自动归零重来）。
 # 另外「已有另一个实例」要分两种情况看：确实有 ctnd 活着 → 是撞锁自愈（无后果）；
-# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 ctnd_pids 区分）。
+# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 ctnd_alive 区分）。
 	DLOG="$MODDIR/daemon.log"
 	if [ ! -f "$DLOG" ]; then
 		sk "daemon 日志 " "还没有 $DLOG"

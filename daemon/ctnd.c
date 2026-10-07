@@ -49,7 +49,7 @@
 
 /* ------------------------------ 常量 ------------------------------ */
 
-#define CTND_VERSION "2.0"
+#define CTND_VERSION "2.1"
 
 #define NODE_PATH    "/proc/game_opt/task_boost/critical_task_name"
 #define CTEN_PATH    "/proc/game_opt/task_boost/ct_enable"
@@ -782,6 +782,9 @@ static bool normalize_and_write(const char *names)
 /* --------------------------- 单实例锁 --------------------------- */
 
 static int g_lock_fd = -1;
+/* 锁文件/pidfile 路径，由 acquire_single_instance() 填（给 write_pidfile 用） */
+static char g_lock_path[PATH_MAX];
+static char g_pid_path[PATH_MAX];
 
 static bool acquire_single_instance(const char *exe)
 {
@@ -809,7 +812,63 @@ static bool acquire_single_instance(const char *exe)
 		return false;
 	}
 	g_lock_fd = fd;
+
+	/*
+	 * 顺手把锁文件路径记下来：pidfile 放在同一个目录。
+	 * （pidfile 是给脚本用的 —— 见下面 write_pidfile 的说明。）
+	 */
+	snprintf(g_lock_path, sizeof(g_lock_path), "%s", path);
 	return true;
+}
+
+/*
+ * 把自己的 pid 写进 <模块目录>/ctnd.pid，退出时删掉。
+ *
+ * 为什么需要它：脚本（service.sh 的守护循环、verify.sh、action.sh）要判断
+ * 「daemon 在不在跑」。之前试过两条路都不行：
+ *   - pgrep -x ctnd：语义因实现而异（busybox 比的是整条命令行），匹配不上；
+ *   - 扫 /proc/<pid>/fd 找「谁握着锁」：能对上，但**极慢** —— 有的进程有 800+
+ *     个 fd，全系统扫一遍要几万次 readlink，而守护循环每 2 秒就跑一次，
+ *     等于持续在后台扒全系统的 fd（实测执行轨迹 6.7 万行还没跑完，
+ *     而且这本身就是一笔实打实的后台 CPU/功耗开销）。
+ * pidfile 是 O(1)：脚本读一个文件、看一眼 /proc/<pid> 在不在就够了。
+ *
+ * 注意：pidfile 只是"提示"，**唯一权威仍然是 flock 锁**（见上）。pidfile
+ * 因为 kill -9 之类变成陈旧的没关系 —— 脚本会再确认 /proc/<pid> 在不在。
+ */
+static void write_pidfile(void)
+{
+	char buf[32];
+	int fd;
+	size_t n;
+
+	if (!g_lock_path[0])
+		return;
+	snprintf(g_pid_path, sizeof(g_pid_path), "%s", g_lock_path);
+	n = strlen(g_pid_path);
+	{
+		/* 注意 "\.ctnd.lock" 是 10 个字符不是 8 —— 写死 8 会剥不掉，
+		 * 文件名就成了 ".ctnd.lockctnd.pid"（实测踩过），所以用 strlen 算 */
+		static const char suffix[] = ".ctnd.lock";
+		size_t sl = sizeof(suffix) - 1;
+
+		if (n > sl && !strcmp(g_pid_path + n - sl, suffix))
+			g_pid_path[n - sl] = '\0';
+	}
+	strncat(g_pid_path, "ctnd.pid", sizeof(g_pid_path) - strlen(g_pid_path) - 1);
+
+	fd = open(g_pid_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+	(void)write(fd, buf, strlen(buf));
+	close(fd);
+}
+
+static void remove_pidfile(void)
+{
+	if (g_pid_path[0])
+		unlink(g_pid_path);
 }
 
 /* --------------------------- 主循环 --------------------------- */
@@ -935,6 +994,8 @@ int main(int argc, char **argv)
 	if (!acquire_single_instance(argv[0]))
 		return EXIT_ALREADY_RUNNING;
 
+	write_pidfile();
+
 	/* 先记下节点原值：退出时恢复成它，而不是硬编码的 Unity 串 */
 	remember_orig_names();
 
@@ -1005,6 +1066,7 @@ int main(int argc, char **argv)
 	}
 
 	logmsg("ctnd 退出");
+	remove_pidfile();
 	if (g_lock_fd >= 0)
 		close(g_lock_fd);
 	return 0;

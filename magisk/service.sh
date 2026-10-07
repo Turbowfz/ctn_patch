@@ -14,37 +14,38 @@
 MODDIR=${0%/*}
 LOG="$MODDIR/boot.log"
 DLOG="$MODDIR/daemon.log"
-# ---- ctnd 进程探测/击杀：不依赖 pgrep/pkill ----
-# KernelSU 的 action 环境会把 PATH 指到 busybox，busybox 的 pgrep/pkill -x
-# 匹配的是**整条命令行**（cmdline 是完整路径），永远匹配不上 —— 表现就是
-# 「daemon 明明活着却报 0 个」「pkill 杀不掉导致重试全撞锁」（实测踩过）。
-# 所以自己扫 /proc/*/comm，与 pgrep 的实现无关。
-ctnd_pids() {
-	for d in /proc/[0-9]*; do
-		[ -r "$d/comm" ] || continue
-		read -r n < "$d/comm" 2>/dev/null
-		[ "$n" = "ctnd" ] && echo "${d#/proc/}"
+# ---- ctnd 进程探测/击杀：读 pidfile ----
+# 判断 daemon 在不在跑 = 读它自己写的 ctnd.pid（模块目录下）+ 确认 /proc/<pid>
+# 还在、comm 是 ctnd。O(1)，只读一个文件、看一眼目录。
+#
+# 为什么不用别的（都试过，都不行）：
+#   - pgrep/pkill -x：语义因实现而异（busybox 比的是整条命令行），永远匹配不上；
+#   - 扫 /proc/*/fd 找「谁握着锁」：结果对，但**极慢** —— 有的进程 800+ 个 fd，
+#     全系统扫一遍是几万次 readlink。守护循环每 2 秒跑一次，等于持续在后台扒全
+#     系统的 fd（实测执行轨迹 6.7 万行没跑完）—— 这本身就是实打实的后台开销。
+# pidfile 陈旧（被 kill -9）也没关系：下面会再确认 /proc/<pid> 和 comm。
+# ★ 注意：插这段时曾经把它的结束标记和下一行粘在一起，把 STOP=... 注释掉了，
+#   结果守护循环永远收不到 .stop、不停重启 daemon（撞锁刷屏 + 后台白跑）。
+#   改这段时务必确认后面那行还在。★
+CTND_PIDFILE="$MODDIR/ctnd.pid"
+
+ctnd_pid() {
+	_p=$(cat "$CTND_PIDFILE" 2>/dev/null)
+	_p=${_p%%[!0-9]*}
+	if [ -n "$_p" ] && [ -r "/proc/$_p/comm" ]; then
+		read -r _n < "/proc/$_p/comm" 2>/dev/null
+		[ "$_n" = "ctnd" ] && { echo "$_p"; return; }
+	fi
+	for _d in /proc/[0-9]*; do	# 兜底：pidfile 没有/失效时扫名字（便宜）
+		[ -r "$_d/comm" ] || continue
+		read -r _n < "$_d/comm" 2>/dev/null
+		[ "$_n" = "ctnd" ] && { echo "${_d#/proc/}"; return; }
 	done
 }
-ctnd_count() { ctnd_pids | wc -l; }
-# 握着 .ctnd.lock 的进程：按 /proc/*/fd 扫，与进程名、pgrep 实现**都无关**。
-# 有些环境里进程的 comm 会跟预期对不上（模块升级换了文件、pgrep 实现差异），
-# 这时候只有「谁握着锁」这个事实是可靠的 —— daemon 活着的定义就是它持着锁。
-lock_holders() {
-	for d in /proc/[0-9]*; do
-		p=${d#/proc/}
-		[ -r "$d/fd" ] || continue
-		for fd in $d/fd/*; do
-			case "$(readlink "$fd" 2>/dev/null)" in
-				*ctnd.lock) echo "$p"; break ;;
-			esac
-		done
-	done
-}
-ctnd_alive() { [ -n "$(ctnd_pids)$(lock_holders)" ]; }
-ctnd_one() { local p; p=$(ctnd_pids | head -1); [ -n "$p" ] && { echo "$p"; return; }; lock_holders | head -1; }
-ctnd_kill() { for p in $(ctnd_pids) $(lock_holders); do kill "$p" 2>/dev/null; done; }
-# ---- STOP="$MODDIR/.stop"
+
+ctnd_alive() { [ -n "$(ctnd_pid)" ]; }
+ctnd_kill()  { _p=$(ctnd_pid); [ -n "$_p" ] && kill "$_p" 2>/dev/null; rm -f "$CTND_PIDFILE"; }
+STOP="$MODDIR/.stop"
 
 # 重新加载前清掉上次卸载可能留下的哨兵
 rm -f "$STOP"
