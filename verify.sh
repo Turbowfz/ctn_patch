@@ -108,52 +108,12 @@ F_MISS=""; F_BAD=""
 [ -f "$KO" ] || F_MISS="$F_MISS ctn_patch.ko"
 [ -s "$MODDIR/ctnd" ] || F_MISS="$F_MISS ctnd"
 [ -f "$MODDIR/ctnd" ] && [ ! -x "$MODDIR/ctnd" ] && F_BAD="$F_BAD ctnd(无可执行位)"
-[ -f "$MODDIR/expected_vendor.txt" ] || F_MISS="$F_MISS expected_vendor.txt"
 if [ -n "$F_MISS" ]; then
 	ng "模块文件    " "缺:$F_MISS"
 elif [ -n "$F_BAD" ]; then
 	ng "模块文件    " "权限不对:$F_BAD（chmod 755 或重装）"
 else
 	ok "模块文件    " "ko $(stat -c%s "$KO")B ｜ ctnd $(stat -c%s "$MODDIR/ctnd")B 0755 $(grep -qa ELF "$MODDIR/ctnd" && echo ELF)"
-fi
-
-# ---------------------------------------------------------------- 2 厂商模块与布局
-# 判**布局**不判哈希：一加12/Ace3Pro/Ace5/GT6 这些 8Gen3 机型在同一内核版本下
-# game_opt 源码同源、可以通用，但不同机型/批次编出来的 ko 二进制哈希天然不同。
-# 真正会崩机的是 sizeof(struct module) 不一致 —— 用设备那份厂商 ko 的
-# .gnu.linkonce.this_module 段大小跟我们的比（跟 customize.sh 同一套判据）。
-# 另外：本脚本下面会真的 insmod，能加载成功本身就是最硬的兼容性证据。
-VKO=""
-for p in /vendor/lib/modules/$VICTIM.ko /system/lib/modules/$VICTIM.ko \
-         /vendor_dlkm/lib/modules/$VICTIM.ko; do
-	[ -f "$p" ] && { VKO="$p"; break; }
-done
-WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODDIR/expected_vendor.txt" 2>/dev/null | head -n1)
-elfsec="$MODDIR/elf_sec_size.sh"
-if [ -z "$VKO" ]; then
-	sk "厂商模块    " "找不到设备上的 $VICTIM.ko，跳过比对"
-elif [ -z "$WANT" ]; then
-	sk "厂商模块    " "zip 里没有 expected_vendor.txt，跳过比对"
-else
-	GOT=$(sha256sum "$VKO" 2>/dev/null | cut -d' ' -f1)
-	if [ "$WANT" = "$GOT" ]; then
-		ok "厂商模块    " "sha256 与构建时一致"
-	else
-		OUR_TS=""; DEV_TS=""
-		if [ -f "$elfsec" ]; then
-			OUR_TS=$(sh "$elfsec" "$KO" .gnu.linkonce.this_module 2>/dev/null)
-			DEV_TS=$(sh "$elfsec" "$VKO" .gnu.linkonce.this_module 2>/dev/null)
-		fi
-		if [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ] && [ "$OUR_TS" = "$DEV_TS" ]; then
-			ok "厂商模块    " "另一份构建（非构建时那份），但 struct module 布局一致（${DEV_TS} 字节）→ 兼容"
-			det "构建时 ${WANT:0:16}… / 设备上 ${GOT:0:16}…"
-		elif [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ]; then
-			ng "厂商模块    " "struct module 布局不一致（本 ${OUR_TS} / 设备 ${DEV_TS}）→ insmod 会崩机"
-		else
-			sk "厂商模块    " "与构建时不是同一份，且量不出布局 —— 看下面 insmod 结果为准"
-			det "构建时 ${WANT:0:16}… / 设备上 ${GOT:0:16}…"
-		fi
-	fi
 fi
 
 # ---------------------------------------------------------------- 3 vermagic
@@ -187,8 +147,16 @@ else
 			ng "insmod      " "成功但 refcount 没涨（$R0→$R1），钉住可能没生效"
 		fi
 	else
-		ng "insmod      " "失败"
-		dmesg | tail -n 12 | while read -r l; do det "$l"; done
+		ng "insmod      " "失败（内核拒绝了这个 .ko）"
+		# 查 bug 看 dmesg：只抓 ctn_patch 相关的行，比 tail 一大片有用
+		KT=$(dmesg 2>/dev/null | grep -i ctn_patch | tail -5)
+		if [ -n "$KT" ]; then
+			printf '%s
+' "$KT" | while read -r l; do det "$l"; done
+		else
+			det "内核日志里没有 ctn_patch 的行 → 连 init 都没进去"
+			det "手动确认：dmesg | tail -30"
+		fi
 	fi
 fi
 

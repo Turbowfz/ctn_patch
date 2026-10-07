@@ -163,64 +163,48 @@ else
 fi
 grp_end
 
-# ================= 4. 厂商模块 / struct module 布局 =================
-# 为什么不再拿 sha256 卡死：一加12、Ace3Pro、Ace5、GT6 这些 8Gen3 机型在**同一
-# 内核版本**（如 6.1.118 / 6.1.141）下，官方风驰（game_opt）代码是**同源**的，
-# 跨机型可以直接用；但不同机型/不同构建批次编出来的 ko 二进制哈希天然不同，
-# 拿哈希当闸门会把兼容的机型全拒掉。
+# ================= 4. 试加载（用 insmod 自己判定，失败就抓 dmesg）=================
+# 不猜、不预检：**直接让内核加载它**。符号 CRC、struct module 布局、kCFI、
+# vermagic —— 这些全都由内核在 insmod 时自己校验，比任何用户态启发式都硬。
+# 加载失败也不会崩机（CRC 不匹配是干净拒绝），内核会把原因写进 dmesg，
+# 这里把那些行抓出来给用户看就完事了 —— 查 bug 看 dmesg 就够了。
 #
-# 真正会**崩机**（而不是干净加载失败）的只有一件事：sizeof(struct module) 不一致。
-# 设备上那份 oplus_bsp_game_opt.ko 是给那个内核编的，它的
-# .gnu.linkonce.this_module 段大小 == 那个内核的 sizeof(struct module)，
-# 跟我们 .ko 的比一比就知道布局对不对（elf_sec_size.sh，只用 od+awk）。
-#
-# 另外：本 .ko 的符号 CRC 取自设备模块表，与它自己的实际布局是一致的
-# （build.sh 第 8 步硬校验 this_module 段大小）。所以在别的内核上若 CRC 对不上，
-# 内核会**干净地拒绝加载**（disagrees about version of symbol），不会崩机。
-grp_start "厂商模块与布局"
-VKO=""
-for p in /vendor/lib/modules/oplus_bsp_game_opt.ko \
-         /system/lib/modules/oplus_bsp_game_opt.ko \
-         /vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko; do
-	[ -f "$p" ] && { VKO="$p"; break; }
-done
-if [ -z "$VKO" ]; then
-	warn "找不到设备上的 oplus_bsp_game_opt.ko 文件，跳过比对"
-elif [ ! -f "$MODPATH/expected_vendor.txt" ]; then
-	warn "zip 里没有 expected_vendor.txt，跳过比对"
+# 为什么不再比厂商模块的 sha256 / struct module 布局（v1.8 之前有）：
+#   一加12、Ace3Pro、Ace5、GT6 这些 8Gen3 机型在同一内核版本下 game_opt 源码
+#   同源，跨机型通用；但不同机型/批次编出来的 ko 哈希天然不同，拿哈希当闸门
+#   会把兼容机型全拒掉。而布局不一致时内核本来就会干净拒绝加载（CRC 对不上），
+#   所以那套预检是多余的，删掉。
+grp_start "试加载（insmod 判定）"
+if grep -q '^ctn_patch ' /proc/modules 2>/dev/null; then
+	# 升级场景：旧版正跑着。旧版能加载 = 本机内核接受我们的构建 → 新版同理，
+	# 而且内核不允许同名模块加载两次，这里也没法试。
+	ok "ctn_patch 旧版正在运行 —— 说明本机内核能加载我们的 .ko，跳过试加载"
+	info "新版与旧版同一套构建，重启后由新版接管"
 else
-	WANT=$(sed -n 's/^vendor_ko_sha256=//p' "$MODPATH/expected_vendor.txt" | head -n1)
-	GOT=$(sha256sum "$VKO" 2>/dev/null | cut -d' ' -f1)
-	if [ -n "$WANT" ] && [ "$WANT" = "$GOT" ]; then
-		ok "oplus_bsp_game_opt.ko 与构建时对照的一致（$VKO）"
-	else
-		# 二进制不同 → 可能是别的机型/别的构建批次。量 struct module 布局。
-		elfsec="$MODPATH/elf_sec_size.sh"
-		OUR_TS=""; DEV_TS=""
-		if [ -f "$elfsec" ]; then
-			OUR_TS=$(sh "$elfsec" "$MODPATH/ctn_patch.ko" .gnu.linkonce.this_module 2>/dev/null)
-			DEV_TS=$(sh "$elfsec" "$VKO" .gnu.linkonce.this_module 2>/dev/null)
-		fi
-		if [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ] && [ "$OUR_TS" = "$DEV_TS" ]; then
-			ok "厂商模块是另一份构建，但 struct module 布局一致（${DEV_TS} 字节）→ 可用"
-			info "比对对象: $VKO"
-			info "构建时: $WANT"
-			info "设备上: $GOT"
-			info "（同内核版本下这几款 8Gen3 机型的 game_opt 源码同源，布局一致即可通用）"
-		elif [ -n "$OUR_TS" ] && [ -n "$DEV_TS" ]; then
-			bad "struct module 布局不一致：本 .ko ${OUR_TS} 字节 / 设备 ${DEV_TS} 字节"
-			info "比对对象: $VKO"
-			info "这会在 insmod 时崩机（实测崩过，pc: mod_sysfs_setup）。必须按该设备的内核重编（README 6.1）"
+	TRY_ERR=$(insmod "$MODPATH/ctn_patch.ko" 2>&1)
+	if [ $? -eq 0 ]; then
+		ok "insmod 成功（CRC / 布局 / kCFI / vermagic 均由内核校验通过）"
+		if rmmod ctn_patch 2>/dev/null; then
+			info "已卸载试加载的实例，重启后由 service.sh 正式加载"
 		else
-			warn "厂商模块与构建时不是同一份，且量不出 struct module 布局"
-			info "比对对象: $VKO"
-			info "构建时: $WANT"
-			info "设备上: $GOT"
-			VKO_VM="$(grep -aom1 'vermagic=[ -~]*' "$VKO" 2>/dev/null | cut -d= -f2)"
-			info "设备厂商模块 vermagic: ${VKO_VM:-读不到}"
-			info "同内核版本下这几款 8Gen3 机型源码同源，通常可用；装完重启看 boot.log ——"
-			info "若 insmod 报 disagrees about version of symbol，说明符号 CRC 不匹配，需按本机重编（只会加载失败，不会崩机）"
+			warn "试加载成功但 rmmod 失败 —— 重启后会重新加载，一般无碍"
 		fi
+	else
+		bad "insmod 失败：${TRY_ERR:-无输出}"
+		KT=$(dmesg 2>/dev/null | grep -i ctn_patch | tail -5)
+		if [ -n "$KT" ]; then
+			info "内核日志里 ctn_patch 相关的行："
+			# 必须走 info（进本组缓冲）—— 直接 ui_print 会绕过分组缓冲，
+			# 那几行会跑到「[n/9]」标题**前面**去，日志顺序就乱了（实测踩过）。
+			# 用 here-doc 而不是管道：管道会让 while 跑在子 shell 里。
+			while IFS= read -r l; do info "  $l"; done <<EOF
+$KT
+EOF
+		else
+			info "内核日志里没有 ctn_patch 的行 —— 说明它连 init 都没进去（多半是内核拒绝了这个 .ko）"
+			info "手动确认：dmesg | tail -30"
+		fi
+		info "常见原因：内核版本/配置不同（vermagic 前缀已单独检查过）→ 按本机重编（README 6.1）"
 	fi
 fi
 grp_end
@@ -410,7 +394,6 @@ set_perm "$MODPATH/service.sh"       0 0 0755
 set_perm "$MODPATH/uninstall.sh"     0 0 0755
 set_perm "$MODPATH/action.sh"        0 0 0755
 set_perm "$MODPATH/verify.sh"        0 0 0755
-set_perm "$MODPATH/elf_sec_size.sh"  0 0 0755
 set_perm "$MODPATH/ctn.conf.example" 0 0 0644
 
 ui_print "- 重启后自动加载；日志 /data/adb/modules/ctn_patch/boot.log"

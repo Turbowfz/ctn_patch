@@ -38,9 +38,6 @@ FILES = {
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
     # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）
     "ctnd": (HERE / "daemon", True, True),
-    # customize.sh 用它读设备厂商 ko 的 .gnu.linkonce.this_module 段大小，
-    # 判断 struct module 布局是否一致（跨机型通用性的依据）
-    "elf_sec_size.sh": (HERE, True, True),
 }
 
 TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt", ".example"}
@@ -113,20 +110,6 @@ def main() -> None:
                 data = text.encode("utf-8")
             z.writestr(info, data)
             print(f"  + {name}  ({len(data)} 字节, {'0755' if executable else '0644'})")
-
-    # 把「构建时对照的设备厂商模块」的 sha256 一并写进 zip，供 customize.sh 刷入时核对：
-    # 设备上的 oplus_bsp_game_opt.ko 一旦换了，我们这版 .ko 的 struct module 布局
-    # 就可能不匹配（会硬崩），必须重编。
-    devko = Path(r"C:/Users/User/Desktop/风驰/6.1_一加ace3pro/01_手机提取/modules/oplus_bsp_game_opt.ko")
-    if devko.is_file():
-        import hashlib
-        h = hashlib.sha256(devko.read_bytes()).hexdigest()
-        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
-            info = zipfile.ZipInfo("expected_vendor.txt")
-            info.create_system = 3
-            info.external_attr = (0o644 << 16) | 0o100000
-            z.writestr(info, "vendor_ko_sha256=%s\n" % h)
-        print("  + expected_vendor.txt  (构建时对照的厂商模块 sha256=%s...)" % h[:16])
 
     # 回读校验：确认写进去的权限位真的能读出来，而且 create_system=3。
     # 这一步是为了挡住上面那个坑 —— 权限位写错了 zip 照样打得出来，
