@@ -98,7 +98,15 @@ def main():
 
     entries = []
     for ln in changed:
-        st, path = ln.split("\t", 1)
+        st, path = ln.split("	", 1)
+        if st == "D":
+            # 删除文件：tree 条目 sha 设 null，GitHub 会把它从树里去掉。
+            # （原来没处理这分支 —— `git show <提交>:<被删路径>` 直接失败，
+            #   整个推送崩在那里，实测踩过。）
+            entries.append({"path": path, "mode": "100644",
+                            "type": "blob", "sha": None})
+            print("  del  %-20s (删除)" % path)
+            continue
         blob = git("show", "%s:%s" % (local, path), binary=True)
         _, res = req("/git/blobs", {"content": base64.b64encode(blob).decode(),
                                     "encoding": "base64"}, "POST")
