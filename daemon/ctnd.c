@@ -49,7 +49,7 @@
 
 /* ------------------------------ 常量 ------------------------------ */
 
-#define CTND_VERSION "2.1"
+#define CTND_VERSION "2.2"
 
 #define NODE_PATH    "/proc/game_opt/task_boost/critical_task_name"
 #define CTEN_PATH    "/proc/game_opt/task_boost/ct_enable"
@@ -86,6 +86,10 @@ static const char *SQLITE_CANDIDATES[] = {
 
 /* 配置缓存：同一个包只解析一次，库没变就一直复用 */
 #define CACHE_MAX    64
+/* 缓存有效期（秒）。见 lookup_cfg 里的说明：云控库的 -wal 一直在变，
+ * 「按指纹判失效」等于永不命中，每个游戏每次启动都要重拷 600KB 库 + 开
+ * SQLite。改成 TTL：这么长时间内直接用缓存，过一个周期才重查一次。 */
+#define CACHE_TTL_S  600
 #define CACHE_PKG    256          /* 和调用方的 pkg[256] 对齐，免得截断告警 */
 #define CACHE_NAME   256
 
@@ -103,12 +107,11 @@ struct cfg_entry {
 	char ctn[CACHE_NAME];
 	int  ctb;
 	enum cfg_form form;
-	unsigned long long dbver;	/* 读这条时的库指纹 */
+	time_t ts;			/* 这条缓存的写入时刻（TTL 用） */
 	bool used;
 };
 
 static struct cfg_entry g_cache[CACHE_MAX];
-static unsigned long long g_dbver;	/* 当前库指纹 */
 
 /* ------------------------------ 日志 ------------------------------ */
 
@@ -217,6 +220,12 @@ static bool load_sqlite(void)
 	return true;
 }
 
+/*
+ * 关于 libsqlite 的内存：查完库本来想 dlclose 卸掉，实测**没用** ——
+ * bionic 的 dlclose 不会真的 unmapp（这是 Android 的已知行为，库上常带
+ * DT_NODELETE）。而且 libsqlite.so 是全系统共享的库，多一个进程映射它，
+ * 边际成本只是页表那点，实际占不了多少。所以不做无用的卸载。
+ */
 /* --------------------------- 文件小工具 --------------------------- */
 
 static bool read_file(const char *path, char *buf, size_t len)
@@ -307,29 +316,6 @@ static bool copy_file(const char *src, const char *dst)
 	return n >= 0;
 }
 
-/*
- * 库指纹：把 db 和 -wal 的 (mtime, size, inode) 揉成一个数。
- * 库没变就不用重拷、也不用重新解析 —— 同一个包反复启停时能省掉绝大多数拷贝。
- */
-static unsigned long long db_fingerprint(const char *db)
-{
-	static const char *suffixes[] = { "", "-wal", NULL };
-	unsigned long long fp = 1469598103934665603ULL;	/* FNV offset */
-	int i;
-
-	for (i = 0; suffixes[i]; i++) {
-		char p[PATH_MAX];
-		struct stat st;
-
-		snprintf(p, sizeof(p), "%s%s", db, suffixes[i]);
-		if (stat(p, &st) != 0)
-			continue;
-		fp = (fp ^ (unsigned long long)st.st_mtime) * 1099511628211ULL;
-		fp = (fp ^ (unsigned long long)st.st_size)  * 1099511628211ULL;
-		fp = (fp ^ (unsigned long long)st.st_ino)   * 1099511628211ULL;
-	}
-	return fp;
-}
 
 /* 找一个可读的云控库。--db 指定过就直接用它（其他机型库不在候选列表里时的出口）。 */
 static const char *g_db_override;
@@ -597,7 +583,6 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 	sqlite3 *sq = NULL;
 	sqlite3_stmt *st = NULL;
 	const unsigned char *txt;
-	unsigned long long fp;
 	int rc;
 
 	memset(e, 0, sizeof(*e));
@@ -609,15 +594,18 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 		return;
 	}
 
-	fp = db_fingerprint(db);
-	if (fp != g_dbver) {
-		g_dbver = fp;
-		logmsg("库: 内容有变（指纹 %016llx），缓存失效", fp);
-	}
-
+	/*
+	 * 缓存命中判定用 TTL，**不再比库指纹**。
+	 * 原因：云控库是 WAL 模式，-wal 每秒都在变（COSA 自己也在写），
+	 * 指纹判失效的结果就是「永不命中」—— 每个游戏每次启动都要重拷
+	 * 600KB 库、再开一次 SQLite（实测日志里每次都是「内容有变，缓存失效」）。
+	 * TTL 的代价是云控改了配置最多 N 秒后才生效，这个可以接受（重启 daemon
+	 * 会立刻重读）。
+	 */
 	c = cache_get(pkg);
-	if (c->form != CFG_NONE && c->dbver == g_dbver) {
-		*e = *c;		/* 命中缓存，省掉一次拷贝 + 解析 */
+	if (c->form != CFG_NONE && c->ts &&
+	    (time(NULL) - c->ts) < CACHE_TTL_S) {
+		*e = *c;		/* 命中缓存：不拷库、不开 SQLite、不查 */
 		return;
 	}
 
@@ -655,13 +643,27 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 
 	p_sqlite3_finalize(st);
 	p_sqlite3_close(sq);
+	/*
+	 * 用完就把临时库删掉：一是空闲时不留那 600KB（占用），
+	 * 二是别把用户的云控库副本一直摊在 /data/local/tmp 上（隐私）。
+	 * 下一次查库会重新拷一份（现在有 TTL，查库本来就很少）。
+	 */
+	unlink(dbpath);
+	{
+		char wal[PATH_MAX];
+
+		snprintf(wal, sizeof(wal), "%s-wal", dbpath);
+		unlink(wal);
+		snprintf(wal, sizeof(wal), "%s-shm", dbpath);
+		unlink(wal);
+	}
 
 	/* 写回缓存（连同这次的库指纹） */
 	snprintf(c->pkg, CACHE_PKG, "%s", pkg);
 	snprintf(c->ctn, CACHE_NAME, "%s", e->ctn);
 	c->ctb = e->ctb;
 	c->form = e->form;
-	c->dbver = g_dbver;
+	c->ts = time(NULL);
 	c->used = true;
 }
 
@@ -757,8 +759,9 @@ static bool normalize_and_write(const char *names)
 		return false;
 	}
 	if (n == 1) {
-		snprintf(out, sizeof(out), "%s %s", tok[0], tok[0]);
-		logmsg("名字: 只有 1 个 [%s]，同名写两遍", tok[0]);
+		/* 只给一个名字就直接写 —— v2.2 起内核自己也接受单名（会把第二个
+		 * 槽填成同一个），不用在这儿补一遍 */
+		snprintf(out, sizeof(out), "%s", tok[0]);
 	} else {
 		snprintf(out, sizeof(out), "%s %s", tok[0], tok[1]);
 		if (n > 2)

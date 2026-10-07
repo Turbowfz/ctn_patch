@@ -209,7 +209,8 @@ static int parse_names(const char __user *ubuf, size_t count,
 {
 	char input[CT_INPUT_LEN];
 	const char *cursor;
-	int i;
+	const char *after_first;
+	int ret;
 
 	if (!count || count >= sizeof(input))
 		return -E2BIG;
@@ -219,13 +220,32 @@ static int parse_names(const char __user *ubuf, size_t count,
 		return -EINVAL;
 	input[count] = '\0';
 
+	/* 第一个名字必须有 */
 	cursor = input;
-	for (i = 0; i < CT_NUM; i++) {
-		int ret = parse_one_name(&cursor, out[i]);
+	ret = parse_one_name(&cursor, out[0]);
+	if (ret)
+		return ret;
 
-		if (ret)
-			return ret;
+	/*
+	 * 第二个名字**可选**：只写一个时，复制到第二个槽。
+	 *
+	 * 官方 6.6 的接口是 sscanf("%99s %99s")，要求恰好两个，写一个会被
+	 * -EINVAL 拒掉。这里放宽成「一个也行」，理由：
+	 *   - 内核里两个槽记同一个线程**等价于一个**（decide_boost_status 只是
+	 *     对同一个 CPU 重复 cpumask_set_cpu，不会双倍加成）；
+	 *   - 很多游戏真正关心的就是一个渲染线程，让调用方不必为了绕开限制
+	 *     把名字写两遍。
+	 * 三个及以上仍然拒绝 —— 多出来的字符会被下面的检查发现。
+	 */
+	after_first = cursor;
+	ret = parse_one_name(&cursor, out[1]);
+	if (ret) {
+		/* 没有第二个：复制第一个，游标退回原位，好让后面
+		 * 「还有没有多余字符」的检查从正确位置继续 */
+		cursor = after_first;
+		strscpy(out[1], out[0], CT_NAME_LEN);
 	}
+
 	while (*cursor && is_space_char(*cursor))
 		cursor++;
 	if (*cursor)

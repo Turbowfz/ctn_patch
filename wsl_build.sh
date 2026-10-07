@@ -145,6 +145,22 @@ make -C "$KERNEL" O="$OUT" M="$SRC" ARCH=arm64 LLVM=1 CC="$NDK/bin/clang" \
 [ -f "$SRC/ctn_patch.ko" ] || { echo "    !! 编译失败"; exit 1; }
 echo "    $(ls -la "$SRC/ctn_patch.ko")"
 
+# ---------- 7.5 剥掉调试段（体积 304KB → ~35KB）----------
+# 内核安装模块时 INSTALL_MOD_STRIP=1 做的就是这件事（strip --strip-debug）。
+# 这个 .ko 里 .debug_info + 它的重定位 + .debug_str 等占了约 270KB ——
+# 装载器一个都不用，留着只是让刷入包更大、写 flash 更慢。
+# 只剥 .debug_*，绝不碰这些：.text / .modinfo / .gnu.linkonce.this_module /
+# __versions / .rela.*（modpost 与装载器要用的）。下面的校验跑在**剥完之后**，
+# 所以校验的就是最终产物。
+step "7.5/8 剥调试段"
+SZ_BEFORE=$(stat -c%s "$SRC/ctn_patch.ko")
+"$NDK/bin/llvm-strip" --strip-debug "$SRC/ctn_patch.ko" || { echo "    !! strip 失败"; exit 1; }
+SZ_AFTER=$(stat -c%s "$SRC/ctn_patch.ko")
+echo "    $SZ_BEFORE -> $SZ_AFTER 字节（省 $(( (SZ_BEFORE-SZ_AFTER)/1024 ))KB）"
+# 剥完必须确认关键段还在、大小没变（尤其 1088 的 this_module）
+"$NDK/bin/llvm-readelf" -S "$SRC/ctn_patch.ko" | grep -q 'gnu.linkonce.this_module' 	|| { echo "    !! this_module 段没了，strip 过头了"; exit 1; }
+grep -qa 'vermagic=' "$SRC/ctn_patch.ko" || { echo "    !! modinfo/vermagic 没了"; exit 1; }
+
 # ---------- 8. 校验 + 拷回 ----------
 step "8/8 校验"
 VM=$(grep -aom1 'vermagic=[ -~]*' "$SRC/ctn_patch.ko" | cut -d= -f2)
