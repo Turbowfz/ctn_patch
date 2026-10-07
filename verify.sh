@@ -193,13 +193,17 @@ if [ -z "$RCU_BAD" ]; then ok "反复写      " "8/8 正确（双缓冲/RCU 路�
 
 # ---------------------------------------------------------------- 9 边界输入
 E=""
-echo "onlyone" > "$NODE" 2>/dev/null && E="$E 单名被接受(应拒)"
+# v2.2 起：**单名也接受**（内核把第二个槽填成同名）。旧版要求和官方 6.6 一样
+# 「恰好两个」，写一个会被 -EINVAL 拒 —— 这条期望值跟着改了，别忘了。
+echo "onlyone" > "$NODE" 2>/dev/null || E="$E 单名被拒(应接受并补成两槽)"
+[ "$(cat "$NODE")" = "onlyone:-1,onlyone:-1" ] || E="$E 单名没补成两槽[$([ "$(cat "$NODE")" = "onlyone:-1,onlyone:-1" ] || cat "$NODE")]"
 echo "A B C"   > "$NODE" 2>/dev/null && E="$E 三名被接受(应拒)"
 echo "ABCDEFGHIJKLMNO0 ABCDEFGHIJKLMNO1" > "$NODE" 2>/dev/null || E="$E 16字符被拒(应接受)"
 LONG=$(printf 'x%.0s' $(seq 1 120) 2>/dev/null)
 echo "$LONG test" > "$NODE" 2>/dev/null && E="$E 120字符被接受(应拒)"
+printf " " > "$NODE" 2>/dev/null && E="$E 全空白被接受(应拒)"
 if [ -z "$E" ]; then
-	ok "边界输入    " "单名/三名/120字符 被拒，16字符 接受"
+	ok "边界输入    " "单名接受(补成两槽)/16字符 接受；三名/120字符/全空白 被拒"
 else
 	ng "边界输入    " "不符合预期:$E"
 fi
