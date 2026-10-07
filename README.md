@@ -114,7 +114,7 @@ cat /proc/game_opt/task_boost/critical_task_name
 | 输入 | 结果 |
 |---|---|
 | `A B` / `A    B` / `A<TAB>B` | 接受 |
-| `onlyone`（只填一个） | 拒绝 `-EINVAL`，节点不变 |
+| `onlyone`（只填一个） | **接受**，第二个槽自动填成同名 → `OnlyOne:-1,OnlyOne:-1` |
 | `A B C`（三个） | 拒绝 `-EINVAL` |
 | 全是空白（如一个空格） | 拒绝 `-EINVAL` |
 | `write(fd, buf, 0)` | 拒绝 `-E2BIG`（注意 `: > 节点` 这类 shell 写法压根不产生 write 调用，是空操作，不是被接受） |
@@ -123,8 +123,8 @@ cat /proc/game_opt/task_boost/critical_task_name
 **写入是整体替换**，不保留原值。想留着 Unity 默认名就自己带上：
 `echo "UnityMain MyGameMain" > ...`
 
-**只盯一个线程**：同名写两遍（`echo "A A" > ...`）。内核里两个槽记同一线程、
-同一 CPU，等价于只填一个，不会双倍加成。
+**只盯一个线程**：直接 `echo "A" > ...` 就行（v2.2 起内核会自己把第二个槽填成同名）。
+内核里两个槽记同一线程、同一 CPU，等价于只填一个，不会双倍加成。
 
 **名字建议 ≤15 字符**：接口放到 99 是为了跟官方对齐，但内核比对用的是
 `strncmp(task->comm, name, strlen(name))`，而 `task->comm` 只有 16 字节（含 NUL），
@@ -231,21 +231,27 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 > v2.0 同时**移除了本地覆盖文件 `ctn.conf`**（连同 `ctn.conf.example` 和开机
 > 铺开逻辑）。指定关键线程名现在只有一条路：云控配置里的 `ctn`。
 
-### 5.5 占用（真机实测，Ace 3 Pro）### 5.5 占用（真机实测，Ace 3 Pro）
+### 5.5 占用与性能（真机实测，Ace 3 Pro）
 
 | 项目 | 实测值 | 说明 |
 |---|---|---|
-| 常驻内存 | **约 5.7 MB**（峰值 7.5 MB） | 单线程；`VmSize` 显示的 2.2 GB 是 bionic 预留的地址空间，不是真占用 |
-| 二进制 | 21 KB | 单文件，只依赖 `libc.so` / `libdl.so` |
-| 磁盘 | 616 KB | `/data/local/tmp/.ctnd` 里那份云控库拷贝（db 180K + wal 412K + SQLite 自建的 shm 32K） |
-| 空闲 CPU | **约 0.017%**（单核） | 每 800ms 读一次几十字节的 `/proc/game_opt/game_pid`，60 秒才耗 1 个 tick |
-| 一次注入的 CPU | **约 10 ms** | 拷库 + 开 SQLite + 查一行 + 解 JSON + 写节点，整条链一次 |
+| **内核模块** | **27.8 KB** | 已剥掉 `.debug_*`（构建脚本里 `llvm-strip --strip-debug`，内核装模块时也是这么做的）。带调试段时是 305KB —— 装载器一个字节都用不到 |
+| **刷入包** | **117 KB** | 上面是主要贡献 |
+| daemon 常驻内存 | **3.7 MB** | 不查云控库时**根本不加载** `libsqlite.so`；单线程 |
+| daemon 磁盘 | **0** | 查完库立刻把临时副本删掉（以前会留 600KB） |
+| 空闲 CPU | **约 0.017%**（单核） | 每 800ms 读一次几十字节的 `/proc/game_opt/game_pid` |
+| 启动一个游戏 | **10 ms** CPU | 命中 TTL 缓存；第一次查库是 20ms（要拷库 + 开 SQLite） |
+| 自检（操作按钮） | **3 秒** | v2.1 之前会卡几分钟（那版在扫全系统的文件描述符） |
 
-同一个包第二次进游戏会走缓存（库没变就直接用），连那 10ms 里最贵的拷库都省了。
+**云控库的缓存策略**：库是 WAL 模式，`-wal` 每秒都在变，所以按「库指纹」判失效
+等于**永不命中**（旧版每个游戏每次启动都重拷 600KB + 重开一次 SQLite）。
+现在用 **TTL（600 秒）**：这段时间内直接用缓存的 `ctn`，过了才重查一次。
+代价是云控改了配置最多 10 分钟后生效 —— 重启 daemon（或重启手机）立刻生效。
 
-量法见 `daemon/measure.sh`（推到设备上 root 跑）。
+**不做的优化**：不 `dlclose` libsqlite —— 实测 bionic 的 `dlclose` 不会真卸载
+（Android 已知行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。
 
-### 5.6 手动跑 ctnd（排查用）
+### 5.6 手动跑 ctnd（排查用）### 5.6 手动跑 ctnd（排查用）
 
 开机时由 `service.sh` 自动拉起，平时不用管。想手动跑或改行为：
 
