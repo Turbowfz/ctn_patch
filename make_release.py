@@ -105,6 +105,14 @@ def gh_release():
     if st == 200:
         rel = json.loads(raw)
         print("  GitHub: Release %s 已存在 (id=%s)" % (TAG, rel["id"]))
+        # 正文跟着 CHANGELOG 走 —— 否则改了 changelog 之后 Release 页面还是旧的
+        want = body_from_changelog()
+        if (rel.get("body") or "").strip() != want.strip():
+            st2, _ = req("%s/releases/%s" % (api, rel["id"]),
+                         data=json.dumps({"body": want}).encode(),
+                         headers=dict(h, **{"Content-Type": "application/json"}),
+                         method="PATCH")
+            print("  GitHub: 正文已更新 (http=%s)" % st2)
     else:
         payload = json.dumps({"tag_name": TAG, "name": NAME,
                               "body": body_from_changelog()}).encode()
@@ -149,6 +157,15 @@ def gitee_release(tok: str):
     rel = json.loads(raw) if (st == 200 and raw.strip() not in (b"null", b"")) else None
     if rel:
         print("  Gitee : Release %s 已存在 (id=%s)" % (TAG, rel["id"]))
+        want = body_from_changelog()
+        if (rel.get("body") or "").strip() != want.strip():
+            body = urllib.parse.urlencode({
+                "access_token": tok, "name": NAME, "body": want,
+            }).encode()
+            st2, _ = req(api + "/" + str(rel["id"]), data=body,
+                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                         method="PATCH")
+            print("  Gitee : 正文已更新 (http=%s)" % st2)
     else:
         body = urllib.parse.urlencode({
             "access_token": tok, "tag_name": TAG, "name": NAME,
