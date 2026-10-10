@@ -390,6 +390,7 @@ fi
 # 带 #! 的脚本会被解包器/管理器补上 0755，但没有 shebang 的二进制不会。
 set_perm "$MODPATH/ctn_patch.ko"     0 0 0644
 set_perm "$MODPATH/ctnd"             0 0 0755
+set_perm "$MODPATH/fakethreads"      0 0 0755
 set_perm "$MODPATH/service.sh"       0 0 0755
 set_perm "$MODPATH/uninstall.sh"     0 0 0755
 set_perm "$MODPATH/action.sh"        0 0 0755

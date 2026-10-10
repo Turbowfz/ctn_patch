@@ -37,6 +37,8 @@ FILES = {
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找
     # ctnd：没有它节点永远停在默认值（HAL 不写这个节点）
     "ctnd": (HERE / "daemon", True, True),
+    # verify.sh 用它造出已知 comm 的线程，验证「名字→pid」那条链
+    "fakethreads": (HERE / "daemon", True, True),
 }
 
 TEXT_SUFFIXES = {".sh", ".prop", ".md", ".txt", ".example"}

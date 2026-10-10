@@ -19,6 +19,7 @@ last_kmsg.txt
 *.btf
 
 # 调试/临时
+t_*.sh
 _usb.ps1
 ck.sh
 dv.sh

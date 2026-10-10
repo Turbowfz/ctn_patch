@@ -1,132 +1,60 @@
 <!-- 由 gen_changelog.py 自动生成，请勿手改。要改内容请改 CHANGELOG.md 后重跑本脚本。 -->
-## v2.0（versionCode 20）
+## v2.1（versionCode 21）
 
-**按「性能、速度、占用、兼容性」整体重写。** 这一版把 v1.x 的一堆历史包袱砍掉，
-并按功耗反馈收窄了「什么时候会去动内核」。
+**把 6.6（一加13）的 pid 机制完整移植过来：节点读出来的是真实 pid，不再是写死的 -1。**
+另外确认了「云控只给一个线程名」这条路端到端能走通。
 
-### 一句话总结
+### 1. 移植来源（一加13 官方源码，逐条对照）
 
-| 项目 | v1.9 | v2.0 |
-|---|---|---|
-| 内核模块 | 304,640 字节 | **27,776 字节（-91%）** |
-| 刷入包 | 394,340 字节 | **117,552 字节（-70%）** |
-| daemon 空闲内存 | 5.7 MB | **3.7 MB** |
-| 空闲磁盘 | 600 KB（云控库副本常驻） | **0** |
-| 每次启动游戏 | 重拷 600KB 库 + 开 SQLite | **命中缓存，10 ms** |
-| 自检耗时 | 卡几分钟 | **3 秒** |
-| daemon 存活检测 | 扫全系统 fd（持续后台开销） | **读 pidfile，O(1)** |
+| 6.6 原文（`vendor/oplus/kernel/cpu/game_opt/`） | 本模块怎么补 |
+|---|---|
+| `critical_task_boost.c:78` `char critical_task[2][100]` | 6.1 是 `const char*[2]` 且在只读段 → 仍用 `vmap` 可写别名（不变） |
+| `critical_task_boost.c:80` `pid_t critical_task_pids[2]` | **6.1 没有这个数组** → 改为读节点时**现算** |
+| `critical_task_boost.c:602` 写入 `sscanf("%99s %99s")` | 一致；本模块额外接受单名（见第 3 点） |
+| `critical_task_boost.c:631` 读取 `"%s:%d,%s:%d
+"` | 一致，但 pid 换成现算的真值 |
+| `rt_info.c:492` `check_task_name()`（名字须 < `TASK_COMM_LEN`） | 照搬 |
+| `rt_info.c:528` `is_matching_thread()`（两槽不重 pid） | 照搬（含 `last_pid` 去重） |
+| `rt_info.c:543` `find_critical_task_pid()` | 照搬匹配逻辑，数据源换成 **6.1 自己的 `related_threads[]`** |
+| `rt_info.c:568` `update_critical_task_pids()`（先槽 1、再槽 0） | 解析顺序一致 |
 
-### 1. 没有配置就一个字节都不碰节点（功耗）
+**数据源怎么找的**：6.1 的 `rt_info.c` 里有 `struct render_related_thread related_threads[256]`
+（`pid` + `task_struct*` + `wake_count`）和 `total_num` / `have_valid_render_pid` /
+`rt_info_rwlock`，全是模块里的符号 —— 用 `模块名:符号名` 通过 kallsyms 拿到地址直接读。
+读取时按厂商自己的做法**拿 `rt_info_rwlock` 的读锁**（他们改这个数组是持写锁的），
+拿不到锁符号就退化为不加锁 —— 那也和厂商自己的热路径 `get_critical_task_state()`
+一样，不会更差。
 
-| 云控里的情况 | v1.x | 现在 |
-|---|---|---|
-| 有 `ctn` | 写进去 | **写进去**（唯一会写的情况） |
-| 有配置但没 `ctn`（Unity 游戏） | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-| 库里没有这个游戏 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-| 配置是加密/未知形态 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-
-v1.x 那三种「写回默认值」虽然值和内核默认相同，但等于**每启动一个游戏都去动一次
-内核**（每次写都要在内核里做一次 RCU 同步换指针）。现在这些情况 daemon 对内核
-**零影响**。退出时也不再硬编码写回 Unity 串，而是恢复成**启动时读到的原值**；
-本次没动过节点的话，退出时什么都不做。
-
-### 2. 写一个线程名也生效（兼容性）
-
-旧版要求和官方 6.6 一样「**恰好两个**」名字（`sscanf("%99s %99s")`），写一个会被
-`-EINVAL` 拒掉。现在**一个也行**，内核把第二个槽自动填成同名 —— 内核里两槽记同一
-线程本来就等价于一个（`decide_boost_status` 只是对同一个 CPU 重复
-`cpumask_set_cpu`，不会双倍加成）。三个名字 / 全空白仍然拒绝。
-
-### 3. 内核模块剥掉调试段：305KB → 27.8KB
-
-`.debug_info`（84KB）+ 它的重定位（136KB）+ `.debug_str`（26KB）等调试段占了约
-**270KB**，而**装载器一个都不用** —— 内核安装模块时（`INSTALL_MOD_STRIP=1`）做的
-就是这件事，现在构建脚本里也补上了（`llvm-strip --strip-debug`）。
-
-只剥 `.debug_*`，绝不碰 `.text` / `.modinfo` / `.gnu.linkonce.this_module` /
-`__versions` / `.rela.*`。**校验跑在剥完之后**：段大小仍是 **1088**（与设备模块
-一致）、vermagic 一致、kCFI 类型号一致。
-
-### 4. daemon 不再每次启动游戏都重拷云控库
-
-旧版缓存用「库指纹」判失效，但云控库是 WAL 模式，**`-wal` 每秒都在变**
-（COSA 自己也在写）→ 指纹每次都变 → **缓存永不命中** → 每个游戏每次启动都要重拷
-600KB 库 + 重开一次 SQLite（日志里那句「内容有变，缓存失效」每次都出现）。
-
-改成 **TTL 缓存（600 秒）**：这段时间内直接用缓存，过了才重查。代价是云控改了
-配置最多 10 分钟后生效（重启 daemon 立刻生效）。实测同一包连开三次：第 1 次
-20ms CPU，第 2、3 次 10ms。
-
-### 5. 查完就删临时库
-
-以前查完那 600KB 的库副本会一直摊在 `/data/local/tmp/.ctnd/`。现在查完立刻删
-（db + wal + shm），空闲时只剩一个空目录 —— 既省盘，也**不把用户云控库的副本
-一直留在盘上**。
-
-### 6. 移除本地覆盖文件 `ctn.conf`
-
-示例文件、开机铺开逻辑、daemon 里的查找逻辑一起删掉。指定关键线程名现在只有一条
-路：云控配置里的 `ctn`。zip 从 13 个文件减到 10 个。
-
-### 7. dmesg 成为调试主场
-
-- **内核模块**：每次写节点打一行 —— `ctn_patch: 名单更新 [A] [B]`
-- **daemon**：关键事件除了写 `daemon.log`，**同时写 `/dev/kmsg`**
-- 于是**内核和 daemon 在同一条时间线上**，一条命令看全：
-
-```bash
-dmesg | grep -E 'ctn_patch:|游戏启动|不写节点|恢复原值'
-```
-
-实测输出（5 个场景只有 2 个真写了节点）：
+**行为实测**（真机，用 `fakethreads` 起真线程 + 走厂商接口登记）：
 
 ```
-ctn_patch: 名单更新 [JsonMain] [JsonRender]            ← 有 ctn → 写
-游戏启动: xxx → 云控里没有 ctn → **不写节点**
-游戏启动: xxx → 云控库里没有这个游戏 → **不写节点**
-游戏启动: xxx → 加密形态 → **不写节点**
-游戏退出（连续 6 次 -1），恢复原值 [UnityMain UnityGfxDevice]
-ctn_patch: 名单更新 [UnityMain] [UnityGfxDevice]       ← 恢复
+线程 RenderThread=28728 / GameThread=28729，写进 /proc/game_opt/rt_info
+写 "RenderThread GameThread" → 读回 RenderThread:28728,GameThread:28729   ✓
+写 "RenderThread"（单名）   → 读回 RenderThread:28728,RenderThread:28728  ✓
+写 "NoSuchThreadXyz"        → 读回 NoSuchThreadXyz:-1,NoSuchThreadXyz:-1  ✓
 ```
 
-### 8. 修掉两个一直在后台耗电的 bug
+**为什么要造 `fakethreads`**：内核匹配的是 `task->comm`，而 `fakepkg` 只改 `argv[0]`
+（影响 `/proc/<pid>/cmdline`）—— 名字对不上，测不出这条链。`fakethreads` 用
+`prctl(PR_SET_NAME)` 开真线程改 `comm`，并随模块一起打包，自检会用它做这项验证。
 
-- **daemon 存活检测原来在扫全系统的文件描述符**：v1.9 为了绕开 `pgrep` 的语义差异，
-  用「扫 `/proc/<pid>/fd` 找谁握着锁」判断 daemon 在不在跑 —— 结果对，但**极慢**
-  （有的进程 800+ 个 fd），而 `service.sh` 的守护循环**每 2 秒**调一次。改成
-  daemon 写 `ctnd.pid`、脚本 O(1) 读它。**自检从卡几分钟变成 3 秒。**
-- **`.stop` 哨兵被一行注释吞掉了**：插代码时结尾标记和下一行粘在一起，把
-  `STOP="$MODDIR/.stop"` 变成注释 → 守护循环永远收不到停止信号、**不停重启
-  daemon**（日志反复刷「锁: 已有另一个 ctnd 在跑」就是这个，一直有后台活动）。
+### 2. 单名写入端到端（db → 节点）
 
-### 9. 不做的优化
+云控 `game_config` 的 `ctn` 只给一个名字时，现在从 db 到节点全程走通：
 
-不 `dlclose` libsqlite —— 实测 **bionic 的 `dlclose` 不会真卸载**（Android 已知
-行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。做无用功
-不如不做。
+```
+db 里 ctn="SoloThread"（单名）
+  → ctnd 日志：已写入 [SoloThread]
+  → 节点读回：SoloThread:6238,SoloThread:6238   ← 内核补的第二槽，pid 也是真的
+  → dmesg：ctn_patch: 名单更新 [SoloThread:6238] [SoloThread:6238]
+```
 
-### 10. 发布后的代码复查（同一版号内修订）
+### 3. 自检加了「pid 机制」两项
 
-复查时又找到 4 个问题，都修在这一版里：
+`verify.sh` 现在会：起 `fakethreads` → 登记进 `rt_info` → 写节点 → 核对 pid 对不对，
+再单独验单名两槽是否同名同 pid。**真机 15 项全过**。
 
-- **JSON 取值器会被「值」骗到**：原来按 `strstr` 找 `"ctn"` 的第一次出现，
-  再检查它后面是不是冒号。如果 game_config 里**某条数据的值**恰好等于 `ctn`
-  （`{"a":"ctn","ctn":"真名字"}`），就会先命中那个值、冒号检查不过直接返回失败，
-  **真名字反而读不到**。现在往后逐个候选找，只认后面跟冒号的**键**。
-  （已加两条防回归用例。）
-- **缓存对「库里没这个游戏」不生效**：命中条件原来带 `form != CFG_NONE`，
-  于是 OPLUS 不认识的游戏每次启动都要重拷一遍库。改用 `used` + 时间戳判断。
-- **锁文件/pidfile 路径取的是 `argv[0]`**：如果进程名是不含 `/` 的相对路径
-  （被别的程序 execv 拉起、或从别处调进来），算出的目录会落到当前工作目录，
-  脚本就找不到 `ctnd.pid` 了。改用 `/proc/self/exe`，与调用方式无关。
-- **`-wal` 拷失败时静默**：主库还在，但可能读到没合并进主库的旧配置。现在出声。
+### 4. insmod 失败抓 dmesg
 
-顺带三件清理：
-
-- `daemon/device_e2e.sh` 按新语义重写 —— 原来还期望「没 ctn 时写回默认值」，
-  在新版下那几项全部会失败；
-- 合成测试库 `daemon/synth.db` 纳入仓库（纯 `aaa.*` 假包名，无设备数据），
-  让那个测试脚本能自包含地跑；
-- 删掉 4 个已没人引用的旧脚本：`arch_final_build.sh`、`device_check.sh`、
-  `device_verify.sh`、`test_parse.c` —— 后三者的功能已被 `customize.sh` /
-  `verify.sh` / 设备自检覆盖，而且 `test_parse.c` 的期望值还是「单名必须被拒」。
+这条 v1.9 起就在安装器里（`customize.sh` 第 4 组）：模块没加载时先试 `insmod`，
+失败就把 `dmesg` 里 `ctn_patch` 的行打出来并拒绝安装。本轮复核确认仍在。

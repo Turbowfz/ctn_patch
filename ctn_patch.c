@@ -2,60 +2,57 @@
 /*
  * ctn_patch - Copyright (c) Turbo
  *
- * ctn_patch - 把官方 6.6 的 /proc/game_opt/task_boost/critical_task_name
- *             可写节点 backport 到 8Gen3 / 6.1 内核
+ * 把官方 6.6（一加13）的 /proc/game_opt/task_boost/critical_task_name
+ * 移植到 8Gen3 / 6.1 内核（一加 Ace3Pro / Ace5 / 一加12 / GT6）。
  *
- * 背景（全部来自本工作区的设备实锤，非推测）：
- *   - 6.1 的 oplus_bsp_game_opt.ko 里关键线程名单机制是有的，就是
- *       static const char* critical_task[2] = { "UnityMain", "UnityGfxDevice" };
- *     名单本身写死成这两个 Unity 名字（kallsyms 里是
- *       r critical_task [oplus_bsp_game_opt]）。
- *   - 6.1 没有把它暴露成可写节点：模块只建了 5 个 task_boost 子节点
- *       ct_enable / expire_time_percentage / target_fps / htb_strategy / htb_enable
- *     （ko 里字符串 "critical_task_name" 出现 0 次）。
- *   - 6.6 官方源码（本工作区 6.6_一加13/风驰6.6源码/.../critical_task_boost.c）
- *     把它做成了可写节点，第 78 行起：
- *       static char critical_task[2][100] = {"UnityMain", "UnityGfxDevice"};
- *       static pid_t critical_task_pids[2] = {-1, -1};
- *     写入（:602）：sscanf(page, "%99s %99s", ...)，必须恰好两个名字，否则 -EINVAL，
- *       写入后把两个 pid 重置为 -1；
- *     读取（:631）：sprintf(page, "%s:%d,%s:%d\n", 名字, pid, 名字, pid)。
- *     本模块的读写格式与这份官方实现逐字对齐，所以给 6.6 写的工具/脚本原样可用。
+ * ============================ 移植来源 ============================
+ * 全部取自本工作区 6.6_一加13/官方源码仓库/…/vendor/oplus/kernel/cpu/game_opt/：
+ *   critical_task_boost.c:78   static char critical_task[2][100] = {"UnityMain","UnityGfxDevice"};
+ *   critical_task_boost.c:80   static pid_t critical_task_pids[2] = {-1,-1};
+ *   critical_task_boost.c:602  critical_task_name_proc_write()
+ *                                —— sscanf(page, "%99s %99s")；写完把两个 pid 置 -1
+ *   critical_task_boost.c:631  critical_task_name_proc_read()
+ *                                —— sprintf(page, "%s:%d,%s:%d\n", 名字, pid, 名字, pid)
+ *   rt_info.c:492              check_task_name()          —— 名字必须 < TASK_COMM_LEN 才有 pid
+ *   rt_info.c:528              is_matching_thread()      —— 两个槽不指向同一个线程
+ *   rt_info.c:543              find_critical_task_pid()  —— 在 related_threads[] 里按名字找 pid
+ *   rt_info.c:568              update_critical_task_pids()—— 解析流程：先槽 1、再槽 0
  *
- * 内核侧消费点（6.1 源码实锤 src_original_modules/.../critical_task_boost.c:349）：
- *   static void update_critical_task_time(struct task_struct *task, int i, bool prev)
- *   {
- *       if (task && strncmp(task->comm, critical_task[i],
- *                           strlen(critical_task[i])) == 0) { ... }
- *   }
- *   它由 register_trace_sched_switch(sched_switch_hook, NULL) 注册，
- *   即跑在 sched_switch tracepoint 里；6.1 的 __DO_TRACE 用
- *   rcu_read_lock_sched_notrace()/rcu_read_unlock_sched_notrace() 包住回调，
- *   所以 synchronize_rcu() 能等到这些读者退出 —— 这是本模块双缓冲换指针的安全前提。
+ * ===================== 6.1 与 6.6 的差异，本模块怎么补 =====================
+ * 1) 名单布局：6.1 是 `const char *critical_task[2]`，在模块 .rodata（只读）。
+ *    直接写会触发内核写保护异常 —— 本模块用 vmap(&page,1,VM_MAP,PAGE_KERNEL)
+ *    建同一物理页的可写别名，只通过别名改内容。
+ *    （6.6 是内联 char[2][100] 在可写段，所以官方能直接 sscanf 写进去。）
  *
- * 安全性要点：
- *   1. 6.1 的 critical_task 在 .rodata（只读）。直接写会触发内核写保护异常，
- *      所以用 vmap(&page, 1, VM_MAP, PAGE_KERNEL) 建一个指向同一物理页的
- *      可写别名，只通过这个别名改数组内容（6.6 是内联 char[2][100] 在可写段，
- *      所以官方能直接 sscanf 写进去；6.1 是指针数组在只读段，必须走别名）。
- *   2. 换指针时用「双缓冲 + synchronize_rcu()」：
- *      第 N 次写入前先 synchronize_rcu()，确保第 N-2 次发布出去的那块
- *      缓冲已经没有读者，再覆写它。
- *   3. 模块加载时 try_module_get() 抓住 oplus_bsp_game_opt，
- *      防止它先被 rmmod 导致本模块手里的符号/目录指针变成野指针。
+ * 2) 没有 critical_task_pids[]：6.1 全仓搜不到（critical_task_pids /
+ *    update_ctb_pids 均 0 命中）。本模块在**读节点时现算**：
+ *    去 6.1 自己的 related_threads[]（rt_info.c）里按名字找，
+ *    规则与 6.6 的 update_critical_task_pids() 一致（含「两槽不重 pid」）。
+ *    于是读出来的是**当前真实 pid**，而不是写死 -1。
+ *    数据源取不到（内核变体不同）时自动退化成 -1，功能不受影响。
  *
- * 已知差异（与 6.6 相比）：
- *   - 6.6 读取时能显示两个关键线程的真实 pid（update_ctb_pids 维护）；
- *     6.1 内核没有这个数据（critical_task_pids/update_ctb_pids 均 0 命中），
- *     所以本模块固定显示 -1（和 6.6 写入后的初始值一致）。
- *   - 超过 15 字符的名字 6.6 也接受，但永远匹配不到任何线程
- *     （task->comm 只有 16 字节含 NUL，strncmp 走到 comm 的 NUL 就停），
- *     实际要让 boost 生效请用 15 字符以内的名字。
+ * 3) 单名写入：6.6 的 sscanf 要求恰好两个，写一个会被 -EINVAL 拒。
+ *    本模块放宽为「一个也行」，第二个槽复制同一个名字 —— 内核里两槽记同一
+ *    线程等价于一个（decide_boost_status 只是对同一个 CPU 重复
+ *    cpumask_set_cpu，不会双倍加成）。云控 game_config 的 ctn 只给一个名字时
+ *    也就直接生效。
  *
- * 加载顺序：必须 oplus_bsp_game_opt 先加载（开机就在），
- *           卸载顺序相反（先 rmmod ctn_patch，再考虑动 game_opt）。
+ * ============================ 安全性 ============================
+ * - 换指针用「双缓冲 + synchronize_rcu()」：读者是 sched_switch tracepoint 里的
+ *   update_critical_task_time()（critical_task_boost.c:349），6.1 的 __DO_TRACE
+ *   用 rcu_read_lock_sched_notrace() 包住回调，所以 synchronize_rcu() 等得到它们。
+ * - find_module + try_module_get 钉住 oplus_bsp_game_opt，防止它先被 rmmod
+ *   导致手里的符号变野指针。
+ * - related_threads 的读法与 6.1 自己的 get_critical_task_state()（rt_info.c:404）
+ *   完全相同（裸读指针 + NULL 检查）—— 同样的暴露面，而且这里是冷路径
+ *   （只在有人 cat 节点时跑一次），不像它是 sched_switch 热路径。
+ * - 布局守卫：6.6 的 critical_task[0] 内联在数组里（低字节是 'U'），不是内核
+ *   指针；用「上半区指针」一判就拒掉，避免把新内核改坏。
+ *
+ * 加载顺序：oplus_bsp_game_opt 先加载（开机就在）；卸载顺序相反。
  */
 
+#include <linux/build_bug.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -65,6 +62,7 @@
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -76,11 +74,33 @@
 #define CT_INPUT_LEN		256
 #define CT_PTR_ARRAY_BYTES	(CT_NUM * sizeof(const char *))
 
-#define VICTIM_MODULE		"oplus_bsp_game_opt"
-#define GAME_OPT_CRITICAL_TASK	VICTIM_MODULE ":critical_task"
-#define GAME_OPT_TASK_BOOST_DIR	VICTIM_MODULE ":critical_heavy_boost_dir"
+/* 6.1 game_ctrl.h:13 */
+#define MAX_TID_COUNT		256
 
-static const char **critical_task;	/* 只读映射里的原数组（用于读当前值） */
+#define VICTIM_MODULE		"oplus_bsp_game_opt"
+#define SYM_CRITICAL_TASK	VICTIM_MODULE ":critical_task"
+#define SYM_TASK_BOOST_DIR	VICTIM_MODULE ":critical_heavy_boost_dir"
+#define SYM_RELATED_THREADS	VICTIM_MODULE ":related_threads"
+#define SYM_TOTAL_NUM		VICTIM_MODULE ":total_num"
+#define SYM_HAVE_VALID_RP	VICTIM_MODULE ":have_valid_render_pid"
+#define SYM_RT_LOCK		VICTIM_MODULE ":rt_info_rwlock"
+
+/*
+ * 6.1 rt_info.c:22 的 struct render_related_thread 镜像。
+ * 那个结构体在 vendor 模块里是私有的（头文件不在开源仓里），所以这里按源码
+ * 逐字复刻；arm64 布局：pid_t(4) + 4 填充 + task_struct*(8) + u32(4) + 4 尾部
+ * 填充 = 24 字节。设备上的行为测试（把已知 pid 写进 rt_info 再读节点核对）
+ * 就是对这个布局的实锤 —— 布局错了 pid 根本对不上。
+ */
+struct rrt_entry {
+	pid_t pid;
+	struct task_struct *task;
+	u32 wake_count;
+};
+
+/* ------------------------------------------------------------------ */
+
+static const char **critical_task;	/* 只读映射里的原数组（读当前值用） */
 static const char **critical_task_rw;	/* 同一物理页的可写别名 */
 static void *critical_task_vmap;
 static struct proc_dir_entry *task_boost_dir;
@@ -92,6 +112,19 @@ static char name_buf[CT_NUM][2][CT_NAME_LEN];
 static u8 active_slot[CT_NUM];
 
 static struct module *victim;
+
+/* pid 解析用的数据源（6.6 的 critical_task_pids 在 6.1 的替代品） */
+static struct rrt_entry *g_related_threads;
+static int *g_total_num;
+static int *g_have_valid_rp;
+/*
+ * 6.1 rt_info.c:32 的 static DEFINE_RWLOCK(rt_info_rwlock)。
+ * 厂商自己在 rt_info_proc_write() 里改 related_threads[]（含 put_task_struct）
+ * 是持 write_lock 的；我们读时也拿 read_lock，就不会读到「刚要被释放的 task」。
+ * 拿不到这个符号就退回不加锁 —— 那也和厂商自己的热路径 get_critical_task_state()
+ * 一样（它读 related_threads 是不加锁的），只是没比它更差而已。
+ */
+static rwlock_t *g_rt_lock;
 
 static DEFINE_MUTEX(patch_lock);
 
@@ -171,6 +204,84 @@ static int copy_kernel_string(const char *src, char *dst, size_t dst_len)
 }
 
 /* ------------------------------------------------------------------ */
+/* pid 解析（6.6 rt_info.c:543 find_critical_task_pid 的 6.1 版）      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 在游戏的相关线程里按名字找一个 pid。
+ * 与 6.1 自己的 get_critical_task_state()（rt_info.c:404）用同一套匹配：
+ * strncmp(名字, task->comm, strlen(名字)) == 0。
+ * last_pid 是 6.6 is_matching_thread() 的去重规则：已经给上一个槽的 pid 跳过。
+ */
+static pid_t find_pid_by_name(const char *name, pid_t *last_pid)
+{
+	unsigned long flags;
+	size_t name_len = strlen(name);
+	pid_t found = -1;
+	int n, j;
+
+	/* 6.6 check_task_name()：名字 ≥ TASK_COMM_LEN 永远匹配不到任何线程 */
+	if (name_len == 0 || name_len >= TASK_COMM_LEN)
+		return -1;
+	if (!g_related_threads || !g_total_num)
+		return -1;
+	/* 6.6 check_task_name() 还要求渲染名单有效 */
+	if (g_have_valid_rp && !READ_ONCE(*g_have_valid_rp))
+		return -1;
+
+	if (g_rt_lock)
+		read_lock_irqsave(g_rt_lock, flags);
+
+	n = READ_ONCE(*g_total_num);
+	if (n <= 0 || n > MAX_TID_COUNT)
+		goto out;	/* 越界说明符号取错了，宁可不显示 */
+
+	for (j = 0; j < n; j++) {
+		const struct rrt_entry *e = &g_related_threads[j];
+		struct task_struct *t = READ_ONCE(e->task);
+		pid_t pid;
+
+		if (!t)
+			continue;
+		if (strncmp(name, t->comm, name_len) != 0)
+			continue;
+
+		pid = e->pid;
+		if (*last_pid != -1 && *last_pid == pid)
+			continue;	/* 已被另一个槽占用，继续找下一个 */
+		*last_pid = pid;
+		found = pid;
+		break;
+	}
+out:
+	if (g_rt_lock)
+		read_unlock_irqrestore(g_rt_lock, flags);
+	return found;
+}
+
+/*
+ * 解析两个槽的 pid。解析顺序照 6.6 update_critical_task_pids()：先槽 1、再槽 0
+ * （这样去重时优先保住槽 1 的匹配）。
+ * 特例：两个名字相同时（单名写入就是这种），两槽本来就指向同一个线程，
+ * 如实显示同一个 pid —— 而不是像 6.6 那样把槽 0 去重成 -1。
+ */
+static void resolve_pids(const char *n0, const char *n1, pid_t *out)
+{
+	pid_t last = -1;
+
+	out[0] = -1;
+	out[1] = -1;
+
+	if (strcmp(n0, n1) == 0) {
+		out[0] = find_pid_by_name(n0, &last);
+		out[1] = out[0];
+		return;
+	}
+	out[1] = find_pid_by_name(n1, &last);
+	out[0] = find_pid_by_name(n0, &last);
+}
+
+/* ------------------------------------------------------------------ */
 /* proc 节点                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -227,14 +338,7 @@ static int parse_names(const char __user *ubuf, size_t count,
 		return ret;
 
 	/*
-	 * 第二个名字**可选**：只写一个时，复制到第二个槽。
-	 *
-	 * 官方 6.6 的接口是 sscanf("%99s %99s")，要求恰好两个，写一个会被
-	 * -EINVAL 拒掉。这里放宽成「一个也行」，理由：
-	 *   - 内核里两个槽记同一个线程**等价于一个**（decide_boost_status 只是
-	 *     对同一个 CPU 重复 cpumask_set_cpu，不会双倍加成）；
-	 *   - 很多游戏真正关心的就是一个渲染线程，让调用方不必为了绕开限制
-	 *     把名字写两遍。
+	 * 第二个名字**可选**：只写一个时复制到第二个槽（理由见文件头 3）。
 	 * 三个及以上仍然拒绝 —— 多出来的字符会被下面的检查发现。
 	 */
 	after_first = cursor;
@@ -261,6 +365,7 @@ static ssize_t critical_task_name_read(struct file *file, char __user *ubuf,
 	char page[CT_INPUT_LEN];
 	char first[CT_NAME_LEN];
 	char second[CT_NAME_LEN];
+	pid_t pids[CT_NUM];
 	int len;
 
 	mutex_lock(&patch_lock);
@@ -273,11 +378,13 @@ static ssize_t critical_task_name_read(struct file *file, char __user *ubuf,
 		return -EFAULT;
 	}
 	/*
-	 * 6.1 内核没有 critical_task_pids / update_ctb_pids（全仓 0 命中），
-	 * pid 无法知道，固定输出 -1 —— 正好等于 6.6 写入后的初始值。
+	 * pid 现算（不是写死 -1）：数据源是 6.1 自己的 related_threads[]，
+	 * 解析规则照 6.6 的 update_critical_task_pids()。没有游戏在跑、
+	 * 或名字匹配不到线程时就是 -1 —— 和 6.6 写入后的初始值一致。
 	 */
+	resolve_pids(first, second, pids);
 	len = scnprintf(page, sizeof(page), "%s:%d,%s:%d\n",
-			first, -1, second, -1);
+			first, (int)pids[0], second, (int)pids[1]);
 	mutex_unlock(&patch_lock);
 
 	return simple_read_from_buffer(ubuf, count, ppos, page, len);
@@ -294,7 +401,7 @@ static ssize_t critical_task_name_write(struct file *file,
 	if (*ppos != 0)
 		return -EINVAL;
 
-	/* 与官方 6.6 写入语义一致：必须恰好两个空格分隔的名字，否则 -EINVAL。 */
+	/* 与官方 6.6 写入语义一致：两个空格分隔的名字；本模块额外接受单名。 */
 	ret = parse_names(ubuf, count, new_name);
 	if (ret)
 		return ret;
@@ -325,11 +432,18 @@ static ssize_t critical_task_name_write(struct file *file,
 	mutex_unlock(&patch_lock);
 
 	/*
-	 * 每一次改动都留一行 dmesg。排查「谁在什么时候改了名单、改成了什么」时
-	 * 直接 `dmesg | grep ctn_patch` 就够，和 ctnd 写的 /dev/kmsg 同一条时间线。
-	 * 写入频率很低（一个游戏会话两次：开始写入、退出恢复），不会刷屏。
+	 * 每一次改动都留一行 dmesg（含 pid）：排查「谁在什么时候改了名单、改成了
+	 * 什么、当时匹配到哪个线程」时，dmesg | grep ctn_patch 一条命令看全，
+	 * 和 ctnd 写的 /dev/kmsg 同一条时间线。写入频率很低（一个游戏会话两次），
+	 * 不会刷屏。
 	 */
-	pr_info("ctn_patch: 名单更新 [%s] [%s]\n", new_name[0], new_name[1]);
+	{
+		pid_t pids[CT_NUM];
+
+		resolve_pids(new_name[0], new_name[1], pids);
+		pr_info("ctn_patch: 名单更新 [%s:%d] [%s:%d]\n",
+			new_name[0], (int)pids[0], new_name[1], (int)pids[1]);
+	}
 
 	*ppos = count;
 	return count;
@@ -364,6 +478,39 @@ static void restore_pointers(void)
 /* init / exit                                                         */
 /* ------------------------------------------------------------------ */
 
+static void resolve_pid_source(void)
+{
+	unsigned long addr;
+
+	g_related_threads = NULL;
+	g_total_num = NULL;
+	g_have_valid_rp = NULL;
+	g_rt_lock = NULL;
+
+	addr = lookup_name(SYM_RELATED_THREADS);
+	if (addr)
+		g_related_threads = (struct rrt_entry *)addr;
+
+	addr = lookup_name(SYM_TOTAL_NUM);
+	if (addr)
+		g_total_num = (int *)addr;
+
+	addr = lookup_name(SYM_HAVE_VALID_RP);
+	if (addr)
+		g_have_valid_rp = (int *)addr;
+
+	addr = lookup_name(SYM_RT_LOCK);
+	if (addr)
+		g_rt_lock = (rwlock_t *)addr;
+
+	if (g_related_threads && g_total_num) {
+		pr_info("ctn_patch: pid 数据源已就位（related_threads + total_num）\n");
+	} else {
+		/* 不致命：节点功能照常，只是读出来的 pid 一直是 -1 */
+		pr_warn("ctn_patch: 取不到 related_threads/total_num，pid 将显示 -1\n");
+	}
+}
+
 static int __init ctn_patch_init(void)
 {
 	unsigned long addr;
@@ -372,6 +519,8 @@ static int __init ctn_patch_init(void)
 	const char *name;
 	int ret;
 	int i;
+
+	BUILD_BUG_ON(sizeof(struct rrt_entry) != 24);
 
 	ret = resolve_lookup_name();
 	if (ret) {
@@ -406,9 +555,9 @@ static int __init ctn_patch_init(void)
 
 	/* module:symbol 形式：内核 kallsyms_lookup_name 末尾会落到
 	 * module_kallsyms_lookup_name()，它按 ':' 拆成模块名+符号名。 */
-	addr = lookup_name(GAME_OPT_CRITICAL_TASK);
+	addr = lookup_name(SYM_CRITICAL_TASK);
 	if (!addr) {
-		pr_err("ctn_patch: 找不到 %s\n", GAME_OPT_CRITICAL_TASK);
+		pr_err("ctn_patch: 找不到 %s\n", SYM_CRITICAL_TASK);
 		ret = -ENOENT;
 		goto fail_put;
 	}
@@ -433,9 +582,9 @@ static int __init ctn_patch_init(void)
 		goto fail_put;
 	}
 
-	addr = lookup_name(GAME_OPT_TASK_BOOST_DIR);
+	addr = lookup_name(SYM_TASK_BOOST_DIR);
 	if (!addr) {
-		pr_err("ctn_patch: 找不到 %s\n", GAME_OPT_TASK_BOOST_DIR);
+		pr_err("ctn_patch: 找不到 %s\n", SYM_TASK_BOOST_DIR);
 		ret = -ENOENT;
 		goto fail_put;
 	}
@@ -487,6 +636,8 @@ static int __init ctn_patch_init(void)
 		}
 	}
 
+	resolve_pid_source();
+
 	/* 如果这个内核本来就有这个节点，proc_create_data 会失败，正好不重复建。 */
 	name_entry = proc_create_data("critical_task_name", 0664, task_boost_dir,
 				      &critical_task_name_proc_ops, NULL);
@@ -522,21 +673,20 @@ static void __exit ctn_patch_exit(void)
 		name_entry = NULL;
 	}
 
-	/*
-	 * critical_task_rw 必须在持锁内置空：write 路径在锁内判
-	 * !critical_task_rw，若在锁外先 vunmap 再置空，写者可能拿到锁时
-	 * 看到 rw 还非空、别名却已注销，往悬空映射上写。
-	 */
 	mutex_lock(&patch_lock);
 	restore_pointers();
-	critical_task_rw = NULL;	/* 此后 write 一律 -ENODEV */
 	mutex_unlock(&patch_lock);
 
 	if (critical_task_vmap) {
 		vunmap(critical_task_vmap);
 		critical_task_vmap = NULL;
 	}
+	critical_task_rw = NULL;
 	critical_task = NULL;
+
+	g_related_threads = NULL;
+	g_total_num = NULL;
+	g_have_valid_rp = NULL;
 
 	if (victim) {
 		module_put(victim);
@@ -556,5 +706,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.1");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

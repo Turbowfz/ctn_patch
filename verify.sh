@@ -174,6 +174,56 @@ case "$V" in
 	*)         ng "读格式      " "不是 名字:pid,名字:pid 格式：[$V]" ;;
 esac
 
+# ---------------------------------------------------------------- 6.5 pid 机制
+# v2.1 起把 6.6 的 critical_task_pids 移植过来了：读节点时现算真实 pid
+# （数据源是 6.1 自己的 related_threads[]）。没游戏跑时显示 -1 是正常的，
+# 所以这里只检查「格式对不对」+「名字匹配得到线程时 pid 是不是真的」。
+#
+# 怎么造一个能匹配上的线程：fakethreads 起两个线程、comm 改成给定名字，
+# 再用厂商自己的接口把它们的 tid 写进 /proc/game_opt/rt_info 登记 —— 走的是
+# 游戏运行时 HAL 走的那条完全相同的路。
+PIDCHK="skip"
+FT="$MODDIR/fakethreads"
+if [ -x "$FT" ] && [ -w /proc/game_opt/rt_info ]; then
+	FTLOG=/data/local/tmp/.ctn_ft.out
+	rm -f "$FTLOG"
+	"$FT" CtnPidChkA CtnPidChkB > "$FTLOG" 2>&1 &
+	FTPID=$!
+	sleep 3
+	TA=$(awk '/CtnPidChkA/{print $3}' "$FTLOG" 2>/dev/null)
+	TB=$(awk '/CtnPidChkB/{print $3}' "$FTLOG" 2>/dev/null)
+	if [ -n "$TA" ] && [ -n "$TB" ]; then
+		echo "$TA $TB" > /proc/game_opt/rt_info 2>/dev/null
+		sleep 1
+		echo "CtnPidChkA CtnPidChkB" > "$NODE" 2>/dev/null
+		sleep 1
+		GOT=$(cat "$NODE" 2>/dev/null)
+		if [ "$GOT" = "CtnPidChkA:$TA,CtnPidChkB:$TB" ]; then
+			ok "pid 机制    " "名字→真 pid 正确（$TA / $TB）"
+		else
+			ng "pid 机制    " "pid 不对"
+			det "期望 CtnPidChkA:$TA,CtnPidChkB:$TB"
+			det "实际 $GOT"
+		fi
+		# 单名：两槽同名同 pid
+		echo "CtnPidChkA" > "$NODE" 2>/dev/null
+		sleep 1
+		GOT=$(cat "$NODE" 2>/dev/null)
+		if [ "$GOT" = "CtnPidChkA:$TA,CtnPidChkA:$TA" ]; then
+			ok "pid 单名    " "两槽同名同 pid（$TA）"
+		else
+			ng "pid 单名    " "单名两槽不一致"
+			det "实际 $GOT"
+		fi
+	else
+		sk "pid 机制    " "fakethreads 没起来，跳过（不影响其它项）"
+	fi
+	kill $FTPID 2>/dev/null
+	rm -f "$FTLOG"
+else
+	sk "pid 机制    " "没有 fakethreads 或 rt_info 不可写，跳过"
+fi
+
 # ---------------------------------------------------------------- 7 写入读回
 if wread "CTNTestMain CTNTestGfx" "CTNTestMain:-1,CTNTestGfx:-1" "写入读回"; then
 	ok "写入读回    " "正确"
