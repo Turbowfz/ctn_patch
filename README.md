@@ -109,11 +109,15 @@ cat /proc/game_opt/task_boost/critical_task_name
 # 名字1:-1,名字2:-1
 ```
 
-读回格式是官方 6.6 的 `名字:pid,名字:pid`（6.1 内核没有 pid 数据，固定 `-1`）。
+读回格式是官方 6.6 的 `名字:pid,名字:pid`。**pid 是真实值**（v2.1 起）：
+模块会去 6.1 自己的 `related_threads[]`（游戏运行时 HAL 登记的相关线程）里按名字
+找对应线程，匹配规则与 6.6 的 `find_critical_task_pid()` 一致。没有游戏在跑、
+或名字匹配不到线程时显示 `-1`（和 6.6 写入后的初始值一样）。
 
 | 输入 | 结果 |
 |---|---|
 | `A B` / `A    B` / `A<TAB>B` | 接受 |
+| `A`（单个） | **接受**，第二槽自动补成同名 |
 | `onlyone`（只填一个） | **接受**，第二个槽自动填成同名 → `OnlyOne:-1,OnlyOne:-1` |
 | `A B C`（三个） | 拒绝 `-EINVAL` |
 | 全是空白（如一个空格） | 拒绝 `-EINVAL` |
@@ -391,8 +395,9 @@ python build_zip.py      # 产出 ctn_patch.zip
    `ctnd -e` 会按配置的 `ctb` 直接写 `ct_enable`（代价是绕过了 HAL 的场景门控，
    可能影响功耗/温控，自己权衡）。
 2. **名字超过 15 字符匹配不到**（见第四节）。
-3. **读取里的 pid 固定是 -1**：6.1 没有 `critical_task_pids` / `update_ctb_pids`
-   （全仓 0 命中），而 -1 正好等于 6.6 写入后的初始值，格式不受影响。
+3. ~~读取里的 pid 固定是 -1~~ —— **v2.1 已解决**：pid 改成读节点时现算（数据源是
+   6.1 自己的 `related_threads[]`，规则照 6.6 的 `find_critical_task_pid()`）。
+   只在「没有游戏在跑」或「名字匹配不到线程」时才是 -1。
 4. **本设备 6.1 的 HAL 不读这个节点**（走
    `/proc/sys/oplus_sched_ext/pid_unitymain`），所以补节点是补齐 6.6 标准接口 +
    让内核侧匹配名单可改。
