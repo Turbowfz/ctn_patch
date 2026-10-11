@@ -37,10 +37,10 @@ jobs:
           set -o pipefail
           {
             apt-get update
-            apt-get install -y --no-install-recommends \
-              clang-17 lld-17 llvm-17 ca-certificates \
-              build-essential bc bison flex libssl-dev libelf-dev \
-              python3 git curl
+          apt-get install -y --no-install-recommends \
+            clang-17 lld-17 llvm-17 ca-certificates dwarves \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 git curl
             echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
             clang --version | head -1
@@ -95,11 +95,14 @@ jobs:
       - name: 汇总产物信息
         if: success()
         run: |
+          # grep -a 在含 NUL 的二进制上 '[ -~]*' 会匹配 0 字符（GNU grep 3.11 实测），
+          # vermagic 用 python 正则抽，不受 NUL 影响
+          VERMAGIC=$(python3 -c "import re; m = re.search(rb'vermagic=([\x20-\x7e]+)', open('ctn_patch.ko','rb').read()); print(m.group(1).decode() if m else '')")
           {
             echo "## ctn_patch 构建结果（debian:13 + clang-17）"
             echo
             echo '```'
-            echo "vermagic : $(grep -aom1 'vermagic=[ -~]*' ctn_patch.ko | cut -d= -f2)"
+            echo "vermagic : $VERMAGIC"
             echo "ko       : $(stat -c%s ctn_patch.ko) 字节  sha256 $(sha256sum ctn_patch.ko | cut -d' ' -f1)"
             echo "ctnd     : $(stat -c%s daemon/ctnd) 字节  sha256 $(sha256sum daemon/ctnd | cut -d' ' -f1)"
             echo "zip      : $(stat -c%s ctn_patch.zip) 字节  sha256 $(sha256sum ctn_patch.zip | cut -d' ' -f1)"

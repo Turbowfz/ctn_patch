@@ -40,6 +40,7 @@ TARGET_LOCALVERSION="-android14-11-o-gdc1b6a03413f"
 
 WORK="$HERE/build_work"
 SRCDIR=""
+MODDIR=""
 CLANG_BIN=""
 JOBS="$(nproc 2>/dev/null || echo 4)"
 
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
 		--clang)  CLANG_BIN="$2"; shift 2 ;;
 		--jobs)   JOBS="$2"; shift 2 ;;
 		--work)   WORK="$2"; shift 2 ;;
+		--moddir) MODDIR="$2"; shift 2 ;;
 		-h|--help) sed -n '2,30p' "$0"; exit 0 ;;
 		*) echo "未知参数: $1"; exit 2 ;;
 	esac
@@ -151,6 +153,100 @@ if [ "$SRC_VER" != "6.1.141" ]; then
 	exit 1
 fi
 
+# ---------- 1.5 vendor 断链重指 + 补 Kconfig（不传 --moddir 就跳过）----------
+# OnePlusOSS 内核仓的 Oplus 私有目录全是符号链接（kernel/oplus_cpu ->
+# ../../../vendor/oplus/kernel/...），vendor/ 真身在 modules 仓里。
+# 单独下载内核源码（tar 或 git）时这些链接全是断的，olddefconfig 直接死：
+# init/Kconfig:901: can't open file "kernel/oplus_cpu/sched/Kconfig"。
+# CI 上把 modules 仓的 tar 也下载解包，用 --moddir 指进来重指断链。
+if [ -n "$MODDIR" ]; then
+	echo "[1.5/7] 重指 vendor 断链（modules 仓: $MODDIR）..."
+	python3 - "$SRC" "$MODDIR" <<'PYRELINK'
+import os, sys
+
+src_root, modroot = sys.argv[1], sys.argv[2]
+fixed = kept = still_bad = 0
+for root, dirs, files in os.walk(src_root):
+    for name in dirs + files:
+        p = os.path.join(root, name)
+        try:
+            if not os.path.islink(p):
+                continue
+            t = os.readlink(p)
+            full = t if os.path.isabs(t) else os.path.join(os.path.dirname(p), t)
+            if os.path.exists(full):
+                kept += 1
+                continue
+        except OSError:
+            continue
+        rest = None
+        idx = t.rfind("vendor/")
+        if idx >= 0:
+            rest = t[idx:]
+        else:
+            idx = t.rfind("qcom/")
+            if idx >= 0:
+                rest = "qcom/" + t[idx + len("qcom/"):]
+        if rest is None:
+            still_bad += 1
+            continue
+        new_target = os.path.join(modroot, rest)
+        if not os.path.exists(new_target):
+            still_bad += 1
+            continue
+        os.unlink(p)
+        os.symlink(new_target, p)
+        fixed += 1
+print("   断链重指 %d 个，原本就好 %d 个，仍缺失 %d 个" % (fixed, kept, still_bad))
+PYRELINK
+	# 裸 source 引用、但两个仓都没有的 Kconfig：补空文件（名单照 arch_relink.sh）
+	python3 - "$SRC" <<'PYSTUB'
+import os, re, shutil, sys
+
+os.chdir(sys.argv[1])
+TARGETS = [
+    "mm/mm_osvelte/Kconfig",
+    "drivers/base/kernelFwUpdate/Kconfig",
+    "drivers/base/touchpanel_notify/Kconfig",
+    "drivers/misc/vibrator/aw8697_haptic/Kconfig",
+    "drivers/misc/vibrator/si_haptic/Kconfig",
+    "drivers/misc/vibrator/oplus_haptic/Kconfig",
+    "kernel/oplus_cpu/uad/Kconfig",
+    "drivers/oplus_inject/Kconfig",
+    "kernel/oplus_cpu/sched/Kconfig",
+]
+for t in TARGETS:
+    if os.path.isfile(t):
+        continue
+for f in set(glob_stub := __import__("glob").glob("**/Kconfig*", recursive=True) + ["Kconfig"]):
+    if not os.path.isfile(f) or f.endswith(".orig_ctnpatch"):
+        continue
+    try:
+        txt = open(f, errors="ignore").read()
+    except Exception:
+        continue
+    changed = False
+    for t in TARGETS:
+        if os.path.isfile(t):
+            continue
+        pat = re.compile(r'^(?P<i>\s*)source\s+"' + re.escape(t) + r'"\s*$', re.M)
+        if pat.search(txt):
+            txt = pat.sub(lambda m: m.group("i") + "# [ctn_patch] missing " + t
+                                + "\n" + m.group("i") + '# source "' + t + '"',
+                          txt, count=1)
+            changed = True
+    if changed:
+        if not os.path.exists(f + ".orig_ctnpatch"):
+            shutil.copy(f, f + ".orig_ctnpatch")
+        open(f, "w").write(txt)
+for t in TARGETS:
+    if not os.path.isfile(t):
+        os.makedirs(os.path.dirname(t) or ".", exist_ok=True)
+        open(t, "w").write("# empty (ctn_patch stub)\n")
+        print("   建空 Kconfig:", t)
+PYSTUB
+fi
+
 # ---------- 2. 铺配置 ----------
 echo "[2/7] 写入设备真实配置 ..."
 mkdir -p "$OUT"
@@ -209,8 +305,24 @@ make "${MAKE_COMMON[@]}" -j"$JOBS" modules_prepare
 
 # ---------- 5. 塞设备符号表 ----------
 echo "[5/7] 安装设备符号表 Module.symvers ..."
-cp "$HERE/Module.symvers.device" "$OUT/Module.symvers"
-echo "      $(wc -l < "$OUT/Module.symvers") 个符号"
+python3 - "$HERE/Module.symvers.device" "$OUT/Module.symvers" <<'PYSYM'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src, encoding="utf-8", errors="replace").read().splitlines()
+out = []
+for l in lines:
+    l = l.strip()
+    if not l:
+        continue
+    parts = l.split("\t")
+    # 设备抠出来的表是 3 列（CRC、名字、EXPORT_SYMBOL），modpost 只认 4 列
+    # （CRC、名字、模块名、EXPORT_SYMBOL）—— 中间补 vmlinux，CRLF 顺手归一
+    if len(parts) >= 3 and parts[2] in ("EXPORT_SYMBOL", "EXPORT_SYMBOL_GPL"):
+        parts = parts[:2] + ["vmlinux"] + parts[2:]
+    out.append("\t".join(parts) + "\t")
+open(dst, "w", newline="\n").write("\n".join(out) + "\n")
+print("   规范化 %d 个符号（3 列补成 4 列，modpost 才认）" % len(out))
+PYSYM
 
 # ---------- 6. 编模块 ----------
 echo "[6/7] 编译 ctn_patch.ko ..."
@@ -225,7 +337,7 @@ fi
 
 # ---------- 7. 校验 vermagic ----------
 echo "[7/7] 校验 vermagic ..."
-GOT="$(grep -aom1 'vermagic=[ -~]*' "$HERE/ctn_patch.ko" | cut -d= -f2)"
+GOT="$(python3 -c "import re; m = re.search(rb'vermagic=([\x20-\x7e]+)', open('$HERE/ctn_patch.ko','rb').read()); print(m.group(1).decode() if m else '')")"
 echo "      产物 vermagic: $GOT"
 echo "      目标 vermagic: $TARGET_VERMAGIC"
 if [ "$GOT" = "$TARGET_VERMAGIC" ]; then
@@ -259,7 +371,7 @@ def sec_size(path, want):
         S.append(dict(n=v[0], off=v[4], size=v[5]))
     stroff = S[strx]["off"]
     for s in S:
-        e = d.find(b" ", stroff + s["n"])
+        e = d.find(b"\x00", stroff + s["n"])
         s["name"] = d[stroff + s["n"]:e].decode()
     for s in S:
         if s["name"] == want:
