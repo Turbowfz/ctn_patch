@@ -38,7 +38,7 @@ jobs:
           {
             apt-get update
             apt-get install -y --no-install-recommends \
-              clang-17 lld-17 llvm-17 \
+              clang-17 lld-17 llvm-17 ca-certificates \
               build-essential bc bison flex libssl-dev libelf-dev \
               python3 git curl
             echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
