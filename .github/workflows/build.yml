@@ -44,7 +44,8 @@ jobs:
           unzip -q /tmp/ndk.zip -d /opt
           echo "/opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           echo "NDK=/opt/android-ndk-r26b" >> "$GITHUB_ENV"
-          clang --version | head -1
+          # GITHUB_PATH 对后续 step 才生效，本 step 里验证用绝对路径
+          /opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version | head -1
 
       - name: 编内核模块 ko（克隆 OnePlusOSS 内核 + modules_prepare + 编译）
         run: |
