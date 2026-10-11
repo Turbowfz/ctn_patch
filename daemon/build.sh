@@ -9,6 +9,10 @@
 # 用法：
 #   bash daemon/build.sh                    # 默认用 NDK r26b
 #   NDK=/path/to/ndk bash daemon/build.sh
+#
+# v2.2：-Os + 按节裁剪 + strip —— 常驻守护进程，体积和内存占用都往小了做
+#（-Os 对这种 IO 密集的轮询进程没有可测的性能损失；gc-sections 能把
+#  base64/JSON 这些只在查库时用到的死代码之外的引用收干净）。
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,9 +29,10 @@ echo "=== 编译 ctnd ==="
 echo "  编译器: $CC"
 "$CC" --version | head -1 | sed 's/^/  /'
 
-"$CC" -O2 -Wall -Wextra -Wno-unused-parameter \
+"$CC" -Os -Wall -Wextra -Wno-unused-parameter \
+	-ffunction-sections -fdata-sections \
 	-fno-strict-aliasing \
-	-Wl,--build-id=none \
+	-Wl,--gc-sections -Wl,--build-id=none \
 	-o "$HERE/ctnd" "$HERE/ctnd.c" -ldl 2>&1 | sed 's/^/  /'
 
 RC=${PIPESTATUS[0]}
@@ -35,6 +40,9 @@ if [ $RC -ne 0 ] || [ ! -f "$HERE/ctnd" ]; then
 	echo "!! 编译失败 rc=$RC"
 	exit 1
 fi
+
+# 常驻进程不需要符号表和调试信息，strip 掉（v2.1 的 ctnd 21784B 是没 strip 的）。
+"$TOOL/llvm-strip" "$HERE/ctnd"
 
 echo
 echo "=== 产物 ==="

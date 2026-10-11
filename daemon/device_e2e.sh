@@ -12,7 +12,8 @@
 #   游戏退出                  → 恢复成启动时读到的原值
 #
 # 用法：
-#   adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh daemon/synth.db /data/local/tmp/
+#   adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh daemon/synth.db \
+#        daemon/synth2.db daemon/synth_removed.db ctn_patch.ko /data/local/tmp/
 #   adb push ctn_patch.ko /data/local/tmp/
 #   adb shell su -c 'sh /data/local/tmp/device_e2e.sh'
 
@@ -39,11 +40,12 @@ cleanup() {
 	echo -1 > $GAMEPID 2>/dev/null
 	[ -n "$CTND_PID" ] && kill $CTND_PID 2>/dev/null
 	rmmod ctn_patch 2>/dev/null
+	[ -f "$DB.bak" ] && cp "$DB.bak" "$DB" 2>/dev/null
 }
 trap cleanup EXIT
 
 echo "=== 0. 准备 ==="
-for f in "$CTND" "$FAKE" "$DB" "$KO"; do
+for f in "$CTND" "$FAKE" "$DB" "$KO" "$DB.2" "$DB.r"; do
 	[ -f "$f" ] || { echo "  缺 $f，见脚本头部用法"; exit 1; }
 done
 for d in /proc/[0-9]*; do			# 停掉现役 daemon，避免互相干扰
@@ -54,10 +56,12 @@ done
 sleep 2; rmmod ctn_patch 2>/dev/null
 insmod "$KO" || { echo "  insmod 失败"; exit 1; }
 rm -rf /data/local/tmp/.ctnd
+chmod 755 "$CTND" "$FAKE"   # adb push（Windows 侧）不带 exec 位   # adb push（Windows 侧）不带 exec 位
 dmesg -c >/dev/null 2>&1
+cp "$DB" "$DB.bak"	# 5d/5e 会覆盖库，备份以便复跑
 : > "$LOG"
 
-"$CTND" --db "$DB" >> "$LOG" 2>&1 &
+"$CTND" --db "$DB" -r 5 >> "$LOG" 2>&1 &
 CTND_PID=$!
 sleep 2
 echo "  起始节点: $(cat $NODE)"
@@ -73,7 +77,14 @@ run() {		# run <包名>：伪造进程 + 写 game_pid + 等一拍
 echo
 echo "=== 1. 有 ctn（单名）→ 内核补成两槽 ==="
 run aaa.single.test
-check "单名 ctn 补成两槽" "SoloThread:-1,SoloThread:-1" "$(cat $NODE)"
+# pid 槽是读时现算的真实 pid（v2.2 起数据源可用），不再写死 -1 —— 只校验名字
+OUT=$(cat $NODE)
+FIRST=${OUT%%,*}; SECOND=${OUT##*,}
+if [ "${FIRST%%:*}" = "SoloThread" ] && [ "${SECOND%%:*}" = "SoloThread" ]; then
+	echo "  [PASS] 单名 ctn 补成两槽（pid 现算: $OUT）"; ok=$((ok+1))
+else
+	echo "  [FAIL] 单名 ctn 补成两槽"; echo "         期望: SoloThread:<pid>,SoloThread:<pid>"; echo "         实际: [$OUT]"; fail=$((fail+1))
+fi
 
 echo
 echo "=== 2. 有 ctn（两名，明文 JSON）==="
@@ -104,6 +115,23 @@ run aaa.opaque.test
 check "未知形态不写节点" "$BEFORE" "$(cat $NODE)"
 
 echo
+echo "=== 5d. 运行中云控 ctn 变化 → 自动重新应用（v2.2）==="
+# 当前"游戏"（fakepkg，pid 没变）还在跑：把云控库换成有效 ctn 的版本，
+# 一个复查周期（-r 5 → 5 秒）内应当被自动应用 —— 这就是
+# 「db 里的 ctn 参数被修改也要应用」的主路径。
+cp /data/local/tmp/synth2.db "$DB"
+sleep 12
+check "运行中 ctn 变化重新应用" "NewMain:-1,NewRender:-1" "$(cat $NODE)"
+
+echo
+echo "=== 5e. 云控里 ctn 被移除 → 恢复原值（v2.2）==="
+# 云控把 ctn 整个下掉了：复查应当撤销本次应用、恢复启动时的原值
+cp /data/local/tmp/synth_removed.db "$DB"
+sleep 12
+check "运行中 ctn 移除恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
+cp "$DB.bak" "$DB"	# 恢复库，下一轮 e2e 才是干净起点
+
+echo
 echo "=== 6. 游戏退出 → 恢复启动时的原值 ==="
 echo -1 > $GAMEPID
 sleep 7
@@ -112,7 +140,9 @@ check "退出后恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
 echo
 echo "=== 7. dmesg：内核侧只该有真写过的那些 ==="
 UPDATES=$(dmesg | grep -c "名单更新")
-check "写入次数（4 次写入 + 1 次恢复）" "5" "$UPDATES"
+# 6 条 = 5 次写入（用例 1-4 + 5d）+ 1 次恢复（5e）；
+# 用例 6 的退出恢复在 5e 已复位 g_patched 后不再重复写 —— 这是设计行为
+check "写入次数（5 次写入 + 1 次恢复）" "6" "$UPDATES"
 
 echo
 echo "=== 8. 决策日志 ==="

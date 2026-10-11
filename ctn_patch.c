@@ -50,6 +50,9 @@
  *   指针；用「上半区指针」一判就拒掉，避免把新内核改坏。
  *
  * 加载顺序：oplus_bsp_game_opt 先加载（开机就在）；卸载顺序相反。
+ * v2.2：不再依赖外部保证顺序 —— 本模块先于 game_opt 加载时（比如 insmod
+ * 早了/服务脚本没等够），init 不再失败退出，而是挂一个延迟工作队列
+ * （10 秒一次，最多 60 次），目标模块一出现就自动补丁并建节点。
  */
 
 #include <linux/build_bug.h>
@@ -67,6 +70,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #define CT_NUM			2
 /* 官方 6.6 用 char[2][100]、写入上限 "%99s"：名字最长 99 字符 + NUL。 */
@@ -127,6 +131,16 @@ static int *g_have_valid_rp;
 static rwlock_t *g_rt_lock;
 
 static DEFINE_MUTEX(patch_lock);
+
+/*
+ * v2.2：加载顺序兼容 —— 目标模块还没加载时，每 PROBE_RETRY_MS 重试一次
+ * try_patch()（最多 PROBE_MAX_TRIES 次），它一出现就自动补丁并建节点。
+ * exit 时 cancel_delayed_work_sync，不会留下还在跑的工作。
+ */
+static struct delayed_work probe_work;
+static int probe_tries;
+#define PROBE_RETRY_MS		10000
+#define PROBE_MAX_TRIES		60	/* 10 秒 × 60 = 10 分钟 */
 
 static unsigned long (*lookup_name)(const char *name);
 static struct module *(*find_module_fn)(const char *name);
@@ -511,7 +525,14 @@ static void resolve_pid_source(void)
 	}
 }
 
-static int __init ctn_patch_init(void)
+/*
+ * 实际打补丁：从「钉住目标模块」到「建节点」的全部动作。
+ * 返回 0 = 成功；-ENOENT = 目标模块/符号/proc 目录还没就绪（值得重试）；
+ * 其它 = 真失败（重试也没用）。
+ * 从 ctn_patch_init 拆出来的：init 只做符号解析准备，补丁本体在这里，
+ * 这样 v2.2 的延迟重试工作队列也能调它。
+ */
+static int try_patch(void)
 {
 	unsigned long addr;
 	unsigned long offset;
@@ -520,31 +541,10 @@ static int __init ctn_patch_init(void)
 	int ret;
 	int i;
 
-	BUILD_BUG_ON(sizeof(struct rrt_entry) != 24);
-
-	ret = resolve_lookup_name();
-	if (ret) {
-		pr_err("ctn_patch: kallsyms_lookup_name 不可用: %d\n", ret);
-		return ret;
-	}
-
-	find_module_fn = (void *)lookup_name("find_module");
-	if (!find_module_fn) {
-		pr_err("ctn_patch: 找不到 find_module\n");
-		return -ENOENT;
-	}
-
-	/* 非导出符号，只能运行时取（见 copy_kernel_string 上方说明）。 */
-	copy_from_kernel_nofault_fn =
-		(void *)lookup_name("copy_from_kernel_nofault");
-	if (!copy_from_kernel_nofault_fn)
-		pr_warn("ctn_patch: 取不到 copy_from_kernel_nofault，退回 memcpy 读串\n");
-
 	/* 先把目标模块钉住，避免它在后面被 rmmod 造成野指针。 */
 	victim = find_module_fn(VICTIM_MODULE);
 	if (!victim) {
-		pr_err("ctn_patch: 模块 %s 未加载，请先 insmod 它\n",
-		       VICTIM_MODULE);
+		pr_debug("ctn_patch: 模块 %s 尚未加载\n", VICTIM_MODULE);
 		return -ENOENT;
 	}
 	if (!try_module_get(victim)) {
@@ -666,8 +666,75 @@ fail_put:
 	return ret;
 }
 
+/*
+ * game_opt 还没加载时的重试体：ENOENT 继续等，其它失败放弃（重试无用）。
+ * 成功就收工 —— 节点已建好，本模块转入静默值守状态。
+ */
+static void probe_work_fn(struct work_struct *w)
+{
+	int ret;
+
+	ret = try_patch();
+	if (!ret) {
+		pr_info("ctn_patch: 延迟补丁成功（第 %d 次尝试）\n",
+			probe_tries + 1);
+		return;
+	}
+	if (ret == -ENOENT && ++probe_tries < PROBE_MAX_TRIES) {
+		schedule_delayed_work(&probe_work,
+				      msecs_to_jiffies(PROBE_RETRY_MS));
+		return;
+	}
+	pr_err("ctn_patch: 延迟补丁放弃（ret=%d，共尝试 %d 次）—— %s 一直没出现\n",
+	       ret, probe_tries + 1, VICTIM_MODULE);
+}
+
+static int __init ctn_patch_init(void)
+{
+	int ret;
+
+	BUILD_BUG_ON(sizeof(struct rrt_entry) != 24);
+
+	ret = resolve_lookup_name();
+	if (ret) {
+		pr_err("ctn_patch: kallsyms_lookup_name 不可用: %d\n", ret);
+		return ret;
+	}
+
+	find_module_fn = (void *)lookup_name("find_module");
+	if (!find_module_fn) {
+		pr_err("ctn_patch: 找不到 find_module\n");
+		return -ENOENT;
+	}
+
+	/* 非导出符号，只能运行时取（见 copy_kernel_string 上方说明）。 */
+	copy_from_kernel_nofault_fn =
+		(void *)lookup_name("copy_from_kernel_nofault");
+	if (!copy_from_kernel_nofault_fn)
+		pr_warn("ctn_patch: 取不到 copy_from_kernel_nofault，退回 memcpy 读串\n");
+
+	INIT_DELAYED_WORK(&probe_work, probe_work_fn);
+
+	ret = try_patch();
+	if (ret == -ENOENT) {
+		/*
+		 * v2.2：目标模块还没加载 —— 不再 init 失败一走了之，
+		 * 挂起延迟重试，它一出现就自动补上（启动顺序自愈）。
+		 */
+		pr_warn("ctn_patch: %s 未加载，每 %dms 重试一次（最多 %d 次）\n",
+			VICTIM_MODULE, PROBE_RETRY_MS, PROBE_MAX_TRIES);
+		schedule_delayed_work(&probe_work,
+				      msecs_to_jiffies(PROBE_RETRY_MS));
+		return 0;
+	}
+	return ret;
+}
+
 static void __exit ctn_patch_exit(void)
 {
+	/* 重试工作可能还在等：先取消（同步等在跑的那次结束），再做清理 */
+	cancel_delayed_work_sync(&probe_work);
+
 	if (name_entry) {
 		proc_remove(name_entry);
 		name_entry = NULL;
@@ -706,5 +773,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("2.1");
+MODULE_VERSION("2.2");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);
