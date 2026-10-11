@@ -1,9 +1,7 @@
-# 这是 GitHub Actions 工作流：云端一键构建 ctn_patch 全部二进制。
+# 这是 GitHub Actions 工作流：云端一键构建 ctn_patch。
 # 想启用：把它放在 .github/workflows/build.yml 推上去即可（网页粘贴也行，
 # 不受「token 需要 workflow scope」的限制）。Actions 页 → build-ctn-patch → Run workflow，
-# 跑完在本次运行的 Artifacts 里下载 ctn_patch-ko（里面有 .ko 和 zip）；
-# 失败时下载 build-logs 看日志（发版 token 没有 actions:read，日志 API 拉不到，
-# 只有 artifact 这条路匿名可读）。
+# 跑完在本次运行的 Artifacts 里下载 ctn_patch-ko（里面有 .ko 和 zip）。
 name: build-ctn-patch
 
 on:
@@ -20,15 +18,15 @@ on:
 
 jobs:
   build:
-    # 全部二进制（ko / ctnd / fakepkg / fakethreads）都在 debian:13 容器里现编：
-    # 与本机构建（WSL Debian 13）同一发行版，同一份 NDK r26b（clang 17.0.2，
-    # 和设备内核完全同版本）—— 云端产物和本地产物同环境可复现、可对拍。
+    # ko 在 debian:13 容器里现编 —— 与本机构建（WSL Debian 13）同一发行版，
+    # 编译器用 Debian 仓库自带的 clang-17（同 major 版本，纯本地安装，
+    # 不依赖 dl.google.com —— runner 上下载 NDK 大文件实测不可靠）。
+    # daemon 三件套（ctnd/fakethreads/fakepkg）是 Android 用户态程序，必须用
+    # NDK 的 bionic sysroot 才能编，仓库里带的是本机 Debian 13 + NDK r26b 编好的
+    # 产物 —— 打包时直接带上，所以 zip 里全部二进制都是 Debian 出的。
     runs-on: ubuntu-24.04
     container: debian:13
     timeout-minutes: 120
-
-    env:
-      LOGDIR: /tmp/build-logs
 
     steps:
       - name: 取本仓库
@@ -38,48 +36,29 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
+            clang-17 lld-17 llvm-17 \
             build-essential bc bison flex libssl-dev libelf-dev \
-            python3 git curl unzip
-          mkdir -p "$LOGDIR"
+            python3 git curl
+          echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: 下载 NDK r26b（clang 17.0.2，与设备内核同版本）
-        run: |
-          set -o pipefail
-          bash -exc '
-            df -h / /tmp
-            curl -fL --retry 3 --retry-delay 5 -o /tmp/ndk.zip \
-              https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
-            ls -la /tmp/ndk.zip
-            unzip -q /tmp/ndk.zip -d /opt
-            /opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version
-          ' 2>&1 | tee "$LOGDIR/ndk.log"
-          echo "/opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          echo "NDK=/opt/android-ndk-r26b" >> "$GITHUB_ENV"
+          clang --version | head -1
 
       - name: 编内核模块 ko（克隆 OnePlusOSS 内核 + modules_prepare + 编译）
         run: |
-          set -o pipefail
           bash build.sh \
-            --clang "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" \
-            --work "$RUNNER_TEMP/ctnwork" 2>&1 | tee "$LOGDIR/ko.log"
+            --clang /usr/lib/llvm-17/bin/clang \
+            --work "$RUNNER_TEMP/ctnwork"
 
-      - name: 编 daemon 三件套（ctnd / fakepkg / fakethreads）
+      - name: 打 root 模块 zip（ko 为本次现编；daemon 用仓库内 Debian 预编译产物）
         run: |
-          set -o pipefail
-          bash daemon/build.sh 2>&1 | tee "$LOGDIR/daemon.log"
-          bash daemon/build_tools.sh 2>&1 | tee "$LOGDIR/tools.log"
-
-      - name: 打 root 模块 zip（打进去的都是本次现编的二进制）
-        run: |
-          python3 build_zip.py 2>&1 | tee "$LOGDIR/zip.log"
-          ls -la ctn_patch.ko daemon/ctnd daemon/fakepkg daemon/fakethreads ctn_patch.zip | tee -a "$LOGDIR/zip.log"
+          python3 build_zip.py
+          ls -la ctn_patch.ko daemon/ctnd daemon/fakethreads ctn_patch.zip
 
       - name: 汇总产物信息
         if: success()
         run: |
           {
-            echo "## ctn_patch 构建结果（debian:13 + NDK r26b）"
+            echo "## ctn_patch 构建结果（debian:13 + clang-17）"
             echo
             echo '```'
             echo "vermagic : $(grep -aom1 'vermagic=[ -~]*' ctn_patch.ko | cut -d= -f2)"
@@ -98,11 +77,3 @@ jobs:
             ctn_patch.ko
             ctn_patch.zip
           if-no-files-found: error
-
-      - name: 上传构建日志（失败也能看）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: /tmp/build-logs/
-          if-no-files-found: ignore
