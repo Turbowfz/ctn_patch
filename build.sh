@@ -127,7 +127,8 @@ fi
 
 # ---------- 1. 内核源码 ----------
 mkdir -p "$WORK"
-if [ ! -d "$SRC/.git" ]; then
+# 有 .git 是完整克隆；没有 .git 但有 Makefile 说明是解包的源码 tar（CI 的 codeload 产物）——同样复用
+if [ ! -d "$SRC/.git" ] && [ ! -f "$SRC/Makefile" ]; then
 	echo "[1/7] 克隆内核源码（depth=1，约 1.5~2GB，第一次慢）..."
 	if ! git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" "$SRC"; then
 		echo "      主地址失败，换镜像：$KERNEL_REPO_MIRROR"
