@@ -34,25 +34,40 @@ jobs:
 
       - name: 装依赖（容器里是 root，不用 sudo）
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            clang-17 lld-17 llvm-17 \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            python3 git curl
-          echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          clang --version | head -1
+          set -o pipefail
+          {
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              clang-17 lld-17 llvm-17 \
+              build-essential bc bison flex libssl-dev libelf-dev \
+              python3 git curl
+            echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            clang --version | head -1
+          } 2>&1 | tee /tmp/apt.log || tail -c 3800 /tmp/apt.log | python3 -c \
+            "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
 
       - name: 编内核模块 ko（克隆 OnePlusOSS 内核 + modules_prepare + 编译）
         run: |
+          set -o pipefail
           bash build.sh \
             --clang /usr/lib/llvm-17/bin/clang \
-            --work "$RUNNER_TEMP/ctnwork"
+            --work "$RUNNER_TEMP/ctnwork" 2>&1 | tee /tmp/ko.log || {
+            # 发版 token 没有 actions:read（日志/artifact API 全 403），
+            # 把日志尾部塞进 error 注解 —— 注解走 check-run API 匿名可读
+            tail -c 3800 /tmp/ko.log | python3 -c \
+              "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
+            exit 1
+          }
 
       - name: 打 root 模块 zip（ko 为本次现编；daemon 用仓库内 Debian 预编译产物）
         run: |
-          python3 build_zip.py
-          ls -la ctn_patch.ko daemon/ctnd daemon/fakethreads ctn_patch.zip
+          set -o pipefail
+          {
+            python3 build_zip.py
+            ls -la ctn_patch.ko daemon/ctnd daemon/fakethreads ctn_patch.zip
+          } 2>&1 | tee /tmp/zip.log || tail -c 3800 /tmp/zip.log | python3 -c \
+            "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
 
       - name: 汇总产物信息
         if: success()
