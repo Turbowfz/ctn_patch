@@ -64,7 +64,7 @@ ctn_patch 自检  v1.3
 [OK]  读格式        [UnityMain:-1,UnityGfxDevice:-1]
 [OK]  写入读回      正确
 [OK]  反复写        8/8 正确（双缓冲/RCU 路径）
-[OK]  边界输入      单名/三名/120字符 被拒，16字符 接受
+[OK]  边界输入      单名接受(补成两槽)/16字符 接受；三名/120字符/全空白 被拒
 [OK]  恢复默认值    UnityMain/UnityGfxDevice
 [OK]  dmesg 异常    本次无 BUG/WARNING/oops/CFI failure
 [OK]  卸载          rmmod 后节点已消失，refcount 还原
@@ -101,7 +101,7 @@ adb shell su -c 'sh /data/local/tmp/stress_node.sh 2000'
 
 ## 四、用法
 
-节点要求**恰好两个名字**，空格分隔（制表符、换行也行）：
+节点接受**一到两个名字**，空格分隔（制表符、换行也行；只填一个时第二槽自动补成同名，见下表）：
 
 ```bash
 echo "名字1 名字2" > /proc/game_opt/task_boost/critical_task_name
@@ -117,8 +117,7 @@ cat /proc/game_opt/task_boost/critical_task_name
 | 输入 | 结果 |
 |---|---|
 | `A B` / `A    B` / `A<TAB>B` | 接受 |
-| `A`（单个） | **接受**，第二槽自动补成同名 |
-| `onlyone`（只填一个） | **接受**，第二个槽自动填成同名 → `OnlyOne:-1,OnlyOne:-1` |
+| `A`（只填一个） | **接受**，第二槽自动补成同名 → `A:-1,A:-1` |
 | `A B C`（三个） | 拒绝 `-EINVAL` |
 | 全是空白（如一个空格） | 拒绝 `-EINVAL` |
 | `write(fd, buf, 0)` | 拒绝 `-E2BIG`（注意 `: > 节点` 这类 shell 写法压根不产生 write 调用，是空操作，不是被接受） |
@@ -127,8 +126,8 @@ cat /proc/game_opt/task_boost/critical_task_name
 **写入是整体替换**，不保留原值。想留着 Unity 默认名就自己带上：
 `echo "UnityMain MyGameMain" > ...`
 
-**只盯一个线程**：直接 `echo "A" > ...` 就行（v2.2 起内核会自己把第二个槽填成同名）。
-内核里两个槽记同一线程、同一 CPU，等价于只填一个，不会双倍加成。
+**只盯一个线程**：直接 `echo "A" > ...` 就行。两个槽记同一线程、同一 CPU，
+等价于只填一个，不会双倍加成。
 
 **名字建议 ≤15 字符**：接口放到 99 是为了跟官方对齐，但内核比对用的是
 `strncmp(task->comm, name, strlen(name))`，而 `task->comm` 只有 16 字节（含 NUL），
