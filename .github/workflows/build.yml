@@ -39,13 +39,28 @@ jobs:
 
       - name: 下载 NDK r26b（clang 17.0.2，与设备内核同版本）
         run: |
-          curl -fsSL -o /tmp/ndk.zip \
-            https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
-          unzip -q /tmp/ndk.zip -d /opt
+          set -o pipefail
+          bash -exc '
+            df -h / /tmp
+            curl -fL --retry 3 --retry-delay 5 -o /tmp/ndk.zip \
+              https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+            ls -la /tmp/ndk.zip
+            unzip -q /tmp/ndk.zip -d /opt
+            /opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version | head -1
+          ' 2>&1 | tee /tmp/ndk.log || {
+            # 日志 API 需要 actions:read 权限（本仓库发版 token 没有），
+            # 失败详情写 step summary —— summary 是匿名可读的
+            {
+              echo "## NDK 下载步骤失败（日志尾部）"
+              echo ""
+              echo '```'
+              tail -60 /tmp/ndk.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
           echo "/opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           echo "NDK=/opt/android-ndk-r26b" >> "$GITHUB_ENV"
-          # GITHUB_PATH 对后续 step 才生效，本 step 里验证用绝对路径
-          /opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --version | head -1
 
       - name: 编内核模块 ko（克隆 OnePlusOSS 内核 + modules_prepare + 编译）
         run: |
