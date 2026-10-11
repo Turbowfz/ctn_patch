@@ -47,39 +47,39 @@ jobs:
           } 2>&1 | tee /tmp/apt.log || tail -c 3800 /tmp/apt.log | python3 -c \
             "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
 
-      - name: 下内核源码 tar（codeload 内网直连，比 git clone 的 checkout 阶段稳）
+      - name: 下内核/modules 两个仓的 tar（codeload 内网直连，比 git clone 的 checkout 阶段稳）
         run: |
           set -o pipefail
           bash -exc '
+            mkdir -p "$RUNNER_TEMP/ctnwork" "$RUNNER_TEMP/ctnwork/mods"
             curl -fL --retry 3 -o /tmp/kernel.tar.gz \
               "https://codeload.github.com/OnePlusOSS/android_kernel_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_ace_3_pro"
-            ls -la /tmp/kernel.tar.gz
-            mkdir -p "$RUNNER_TEMP/ctnwork"
             tar -xzf /tmp/kernel.tar.gz -C "$RUNNER_TEMP/ctnwork"
+            curl -fL --retry 3 -o /tmp/mods.tar.gz \
+              "https://codeload.github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_ace_3_pro"
+            tar -xzf /tmp/mods.tar.gz -C "$RUNNER_TEMP/ctnwork/mods" --strip-components=1
+            ls "$RUNNER_TEMP/ctnwork" "$RUNNER_TEMP/ctnwork/mods/vendor"
           ' 2>&1 | tee /tmp/src.log || {
             tail -c 3800 /tmp/src.log | python3 -c \
               "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
             exit 1
           }
 
-      - name: 编内核模块 ko（modules_prepare + 编译）
+      - name: 编内核模块 ko（重指断链 + modules_prepare + 编译）
         run: |
           set -o pipefail
           SRC=$(ls -d "$RUNNER_TEMP"/ctnwork/android_kernel_oneplus_sm8650-* | head -1)
           echo "源码树: $SRC"
           bash build.sh \
             --srcdir "$SRC" \
+            --moddir "$RUNNER_TEMP/ctnwork/mods" \
             --clang /usr/lib/llvm-17/bin/clang \
             --work "$RUNNER_TEMP/ctnwork" 2>&1 | tee /tmp/ko.log || {
             # 发版 token 没有 actions:read（日志/artifact API 全 403），
-            # 把日志分多条注解带出来 —— 注解走 check-run API 匿名可读
-            tail -c 15000 /tmp/ko.log | fold -w 3800 > /tmp/ko.parts
-            i=0
-            while IFS= read -r part; do
-              i=$((i+1))
-              printf '%s' "$part" | python3 -c \
-                "import sys; print('::error::ko 日志 %d/%d：' + sys.stdin.buffer.read().decode('utf-8','replace').replace(chr(10), '%0A'))" "$i" "$(wc -l < /tmp/ko.parts)" || break
-            done < /tmp/ko.parts
+            # 把日志尾部塞进 error 注解 —— 注解走 check-run API 匿名可读。
+            # 单条注解上限 4000 字符；base64 单行最稳（不怕换行/转义折损）
+            tail -c 2800 /tmp/ko.log | base64 -w0 | python3 -c \
+              "import sys; print('::error::ko 日志尾部(base64)=' + sys.stdin.read())"
             exit 1
           }
 
