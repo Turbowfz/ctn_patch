@@ -1,0 +1,85 @@
+# 这是 GitHub Actions 工作流：云端一键构建 ctn_patch 全部二进制。
+# 想启用：把它放在 .github/workflows/build.yml 推上去即可（网页粘贴也行，
+# 不受「token 需要 workflow scope」的限制）。Actions 页 → build-ctn-patch → Run workflow，
+# 跑完在本次运行的 Artifacts 里下载 ctn_patch-ko（里面有 .ko 和 zip）。
+name: build-ctn-patch
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ctn_patch.c'
+      - 'Kbuild'
+      - 'device_kernel.config'
+      - 'Module.symvers.device'
+      - 'build.sh'
+      - 'daemon/**'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    # 全部二进制（ko / ctnd / fakepkg / fakethreads）都在 debian:13 容器里现编：
+    # 与本机构建（WSL Debian 13）同一发行版，同一份 NDK r26b（clang 17.0.2，
+    # 和设备内核完全同版本）—— 云端产物和本地产物同环境可复现、可对拍。
+    runs-on: ubuntu-24.04
+    container: debian:13
+    timeout-minutes: 120
+
+    steps:
+      - name: 取本仓库
+        uses: actions/checkout@v4
+
+      - name: 装依赖（容器里是 root，不用 sudo）
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 git curl unzip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: 下载 NDK r26b（clang 17.0.2，与设备内核同版本）
+        run: |
+          curl -fsSL -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "/opt/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "NDK=/opt/android-ndk-r26b" >> "$GITHUB_ENV"
+          clang --version | head -1
+
+      - name: 编内核模块 ko（克隆 OnePlusOSS 内核 + modules_prepare + 编译）
+        run: |
+          bash build.sh \
+            --clang "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" \
+            --work "$RUNNER_TEMP/ctnwork"
+
+      - name: 编 daemon 三件套（ctnd / fakepkg / fakethreads）
+        run: |
+          bash daemon/build.sh
+          bash daemon/build_tools.sh
+
+      - name: 打 root 模块 zip（打进去的都是本次现编的二进制）
+        run: |
+          python3 build_zip.py
+          ls -la ctn_patch.ko daemon/ctnd daemon/fakepkg daemon/fakethreads ctn_patch.zip
+
+      - name: 汇总产物信息
+        run: |
+          {
+            echo "## ctn_patch 构建结果（debian:13 + NDK r26b）"
+            echo
+            echo '```'
+            echo "vermagic : $(grep -aom1 'vermagic=[ -~]*' ctn_patch.ko | cut -d= -f2)"
+            echo "ko       : $(stat -c%s ctn_patch.ko) 字节  sha256 $(sha256sum ctn_patch.ko | cut -d' ' -f1)"
+            echo "ctnd     : $(stat -c%s daemon/ctnd) 字节  sha256 $(sha256sum daemon/ctnd | cut -d' ' -f1)"
+            echo "zip      : $(stat -c%s ctn_patch.zip) 字节  sha256 $(sha256sum ctn_patch.zip | cut -d' ' -f1)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctn_patch-ko
+          path: |
+            ctn_patch.ko
+            ctn_patch.zip
+          if-no-files-found: error
