@@ -159,8 +159,13 @@ def gitee_release(tok: str):
         print("  Gitee : Release %s 已存在 (id=%s)" % (TAG, rel["id"]))
         want = body_from_changelog()
         if (rel.get("body") or "").strip() != want.strip():
+            # Gitee 的「更新 Release」接口**强制要求 tag_name + name 都带上**
+            # （只给 body 会 400: tag_name is missing），而且这两个字段是必填，
+            # 缺一个都报错 —— 早期版本漏了 tag_name，于是正文更新一直静默失败
+            # （只打印 http=400，不改内容），Release 页面的说明永远停在建的时候。
             body = urllib.parse.urlencode({
-                "access_token": tok, "name": NAME, "body": want,
+                "access_token": tok, "tag_name": TAG, "name": NAME,
+                "body": want,
             }).encode()
             st2, _ = req(api + "/" + str(rel["id"]), data=body,
                          headers={"Content-Type": "application/x-www-form-urlencoded"},
