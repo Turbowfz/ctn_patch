@@ -53,7 +53,7 @@ cat /proc/game_opt/task_boost/critical_task_name
 daemon + 跑一遍完整自检，结果写进 `action.log`。输出是**一项一行**：
 
 ```
-ctn_patch 自检  v1.3
+ctn_patch 自检  v2.1
   机型 PJX110 / pineapple ｜ 内核 6.1.141-... ｜ 页 4096 ｜ SELinux Enforcing
 
 [OK]  模块文件      ko 304392B ｜ ctnd 21616B 0755 ELF
@@ -71,7 +71,7 @@ ctn_patch 自检  v1.3
   --- 恢复运行状态 ---
     模块已重新加载
     daemon 已拉起
-[OK]  daemon        ctnd 1.3 运行中（pid 24937）
+[OK]  daemon        ctnd 2.1 运行中（pid 24937）
 [OK]  daemon 依赖    sqlite=ok cosa库=ok
 [OK]  daemon 日志   近 200 行无失败记录
 ------------------------------------------------

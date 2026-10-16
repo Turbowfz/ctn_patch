@@ -50,7 +50,7 @@
  *   指针；用「上半区指针」一判就拒掉，避免把新内核改坏。
  *
  * 加载顺序：oplus_bsp_game_opt 先加载（开机就在）；卸载顺序相反。
- * v2.2：不再依赖外部保证顺序 —— 本模块先于 game_opt 加载时（比如 insmod
+ * v2.1：不再依赖外部保证顺序 —— 本模块先于 game_opt 加载时（比如 insmod
  * 早了/服务脚本没等够），init 不再失败退出，而是挂一个延迟工作队列
  * （10 秒一次，最多 60 次），目标模块一出现就自动补丁并建节点。
  */
@@ -133,7 +133,7 @@ static rwlock_t *g_rt_lock;
 static DEFINE_MUTEX(patch_lock);
 
 /*
- * v2.2：加载顺序兼容 —— 目标模块还没加载时，每 PROBE_RETRY_MS 重试一次
+ * v2.1：加载顺序兼容 —— 目标模块还没加载时，每 PROBE_RETRY_MS 重试一次
  * try_patch()（最多 PROBE_MAX_TRIES 次），它一出现就自动补丁并建节点。
  * exit 时 cancel_delayed_work_sync，不会留下还在跑的工作。
  */
@@ -530,7 +530,7 @@ static void resolve_pid_source(void)
  * 返回 0 = 成功；-ENOENT = 目标模块/符号/proc 目录还没就绪（值得重试）；
  * 其它 = 真失败（重试也没用）。
  * 从 ctn_patch_init 拆出来的：init 只做符号解析准备，补丁本体在这里，
- * 这样 v2.2 的延迟重试工作队列也能调它。
+ * 这样 v2.1 的延迟重试工作队列也能调它。
  */
 static int try_patch(void)
 {
@@ -718,7 +718,7 @@ static int __init ctn_patch_init(void)
 	ret = try_patch();
 	if (ret == -ENOENT) {
 		/*
-		 * v2.2：目标模块还没加载 —— 不再 init 失败一走了之，
+		 * v2.1：目标模块还没加载 —— 不再 init 失败一走了之，
 		 * 挂起延迟重试，它一出现就自动补上（启动顺序自愈）。
 		 */
 		pr_warn("ctn_patch: %s 未加载，每 %dms 重试一次（最多 %d 次）\n",
@@ -773,5 +773,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("2.2");
+MODULE_VERSION("2.1");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

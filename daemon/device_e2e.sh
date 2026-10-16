@@ -40,7 +40,8 @@ cleanup() {
 	echo -1 > $GAMEPID 2>/dev/null
 	[ -n "$CTND_PID" ] && kill $CTND_PID 2>/dev/null
 	rmmod ctn_patch 2>/dev/null
-	[ -f "$DB.bak" ] && cp "$DB.bak" "$DB" 2>/dev/null
+	# 5f 会把库位置换成目录；中途失败时得先清掉再还原
+	[ -f "$DB.bak" ] && { rm -rf "$DB" 2>/dev/null; cp "$DB.bak" "$DB" 2>/dev/null; }
 }
 trap cleanup EXIT
 
@@ -115,7 +116,7 @@ run aaa.opaque.test
 check "未知形态不写节点" "$BEFORE" "$(cat $NODE)"
 
 echo
-echo "=== 5d. 运行中云控 ctn 变化 → 自动重新应用（v2.2）==="
+echo "=== 5d. 运行中云控 ctn 变化 → 自动重新应用（v2.1）==="
 # 当前"游戏"（fakepkg，pid 没变）还在跑：把云控库换成有效 ctn 的版本，
 # 一个复查周期（-r 5 → 5 秒）内应当被自动应用 —— 这就是
 # 「db 里的 ctn 参数被修改也要应用」的主路径。
@@ -124,7 +125,23 @@ sleep 12
 check "运行中 ctn 变化重新应用" "NewMain:-1,NewRender:-1" "$(cat $NODE)"
 
 echo
-echo "=== 5e. 云控里 ctn 被移除 → 恢复原值（v2.2）==="
+echo "=== 5f. 运行中查库失败 → 保持现状，不许恢复原值（v2.1 修正）==="
+# 把库换成一个**目录**：find_db 的 access(R_OK) 过得去，但 stage_db 拷不动
+# （read 目录报 EISDIR）→ lookup_cfg 返回"查不动"。此时 daemon 必须保持现状：
+# 早期版本会把"查不动"当成"云控删了 ctn"，于是把正在加速的节点恢复成默认名，
+# 30 秒后下个周期又写回来 —— 来回跳。
+mv "$DB" "$DB.save"
+mkdir "$DB"
+sleep 12
+check "查库失败不恢复（节点保持已应用值）" "NewMain:-1,NewRender:-1" "$(cat $NODE)"
+grep -q "复查: 查库失败，保持现状" "$LOG" \
+	&& { echo "  [PASS] 日志明确说「查库失败，保持现状」"; ok=$((ok+1)); } \
+	|| { echo "  [FAIL] 日志里没有「查库失败，保持现状」"; fail=$((fail+1)); }
+rmdir "$DB"
+mv "$DB.save" "$DB"
+
+echo
+echo "=== 5e. 云控里 ctn 被移除 → 恢复原值（v2.1）==="
 # 云控把 ctn 整个下掉了：复查应当撤销本次应用、恢复启动时的原值
 cp /data/local/tmp/synth_removed.db "$DB"
 sleep 12

@@ -1,5 +1,5 @@
 /*
- * ctnd —— critical task name daemon   v2.0
+ * ctnd —— critical task name daemon   v2.1
  * Copyright (c) Turbo
  *
  * 为什么需要它：
@@ -26,7 +26,7 @@
  *   [排查] 关键事件同时写 /dev/kmsg —— dmesg 里能看到 daemon 什么时候写了什么，
  *          和内核日志同一条时间线（排查功耗/行为问题时对着 dmesg 看就够）。
  *
- * v2.2 的改动（用户要求：云控里的 ctn 被改了也要生效 + 性能/占用/体积）：
+ * v2.1 的改动（用户要求：云控里的 ctn 被改了也要生效 + 性能/占用/体积）：
  *   [核心] **游戏运行中检测 ctn 变化并重新下发**。旧版只在 game_pid 变化的瞬间
  *          应用一次，游戏跑着的时候云控改了配置永远不生效（要重启游戏或 daemon）。
  *          现在游戏运行期间每 recheck 秒复查一次云控：值变了就重写节点、
@@ -59,7 +59,7 @@
 
 /* ------------------------------ 常量 ------------------------------ */
 
-#define CTND_VERSION "2.3"
+#define CTND_VERSION "2.1"
 
 #define NODE_PATH    "/proc/game_opt/task_boost/critical_task_name"
 #define CTEN_PATH    "/proc/game_opt/task_boost/ct_enable"
@@ -116,12 +116,27 @@ enum cfg_form {
 	CFG_OPAQUE,		/* 加密 / 未知形态 */
 };
 
+/*
+ * 库文件 stat 指纹：复查时先看这个，没变就不拷库、不开 SQLite（零开销）。
+ * 注意 -wal 在 COSA 手里可能一直在变，指纹变了只是「值得再查一次」，
+ * 不代表配置真的变了 —— 查完没变就把指纹记下来，下次同样的指纹直接跳过。
+ *
+ * 指纹**跟着缓存条目走**（v2.1 修正）：早期版本用一个全局指纹，会出现
+ * 「B 包缓存于 F0 → 库变成 F1 → A 包查询把全局指纹刷成 F1 → B 包再启动时
+ * 指纹又"相同"了 → 拿到改库前的旧缓存」这种串味。存进条目里就没有了。
+ */
+struct db_fp {
+	long long mtime_db, size_db, mtime_wal, size_wal;
+	bool valid;
+};
+
 struct cfg_entry {
 	char pkg[CACHE_PKG];
 	char ctn[CACHE_NAME];
 	int  ctb;
 	enum cfg_form form;
 	time_t ts;			/* 这条缓存的写入时刻（TTL 用） */
+	struct db_fp fp;		/* 查库成功那一刻的库指纹（本条目专用） */
 	bool used;
 };
 
@@ -165,7 +180,7 @@ static void logmsg(const char *fmt, ...)
 	/*
 	 * 同一条消息也写 /dev/kmsg：dmesg 里就能看到 daemon 什么时候写了什么，
 	 * 和内核日志（含 ctn_patch 的 pr_info）在同一条时间线上 —— 排查行为/功耗
-	 * 问题对着 dmesg 看就够，不用来回翻两个日志。fd 常开（v2.2），
+	 * 问题对着 dmesg 看就够，不用来回翻两个日志。fd 常开（v2.1），
 	 * 打不开就算了，不影响正事。
 	 */
 	if (g_kmsg_fd >= 0) {
@@ -272,7 +287,7 @@ static char g_orig_names[NAME_MAX_LEN * 2];
 static bool g_patched;		/* 本次运行有没有动过节点 */
 
 /*
- * 运行中变化检测（v2.2）：记住当前游戏包名、以及本次实际写入节点的内容。
+ * 运行中变化检测（v2.1）：记住当前游戏包名、以及本次实际写入节点的内容。
  * 复查发现云控里的 ctn 变了 → 重新写；配置里 ctn 被移除 → 恢复启动时原值。
  */
 static char g_cur_pkg[256];
@@ -280,17 +295,6 @@ static char g_applied[300];
 static bool g_applied_valid;
 static time_t g_last_recheck;
 static long g_recheck_s = RECHECK_S;
-
-/*
- * 库文件 stat 指纹：复查时先看这个，没变就不拷库、不开 SQLite（零开销）。
- * 注意 -wal 在 COSA 手里可能一直在变，指纹变了只是「值得再查一次」，
- * 不代表配置真的变了 —— 查完没变就把指纹记下来，下次同样的指纹直接跳过。
- */
-struct db_fp {
-	long long mtime_db, size_db, mtime_wal, size_wal;
-	bool valid;
-};
-static struct db_fp g_dbfp;
 
 static void remember_orig_names(void)
 {
@@ -667,8 +671,17 @@ static void parse_cfg(const char *raw, struct cfg_entry *e)
 	json_get_int(src, "ctb", &e->ctb);
 }
 
-/* 取一个包的关键线程名，结果写进 e。缓存带 TTL + 库 stat 指纹两层判定。 */
-static void lookup_cfg(const char *pkg, struct cfg_entry *e)
+/*
+ * 取一个包的关键线程名，结果写进 e。缓存带 TTL + 库 stat 指纹两层判定。
+ *
+ * 返回值 = **这次查询本身成功了吗**（v2.1 起区分）：
+ *   true  —— 查到了：e->form 说明「有 ctn / 没 ctn / 库里没这个游戏」；
+ *   false —— 查不动：找不到库 / 拷库失败 / SQLite 打不开。**e 里不是结论**。
+ * 这个区分很关键：复查路径拿到「库里没这个游戏」要恢复原值，而拿到
+ * 「查不动」必须保持现状 —— 否则一次临时 IO 故障就会把正在加速的游戏
+ * 恢复成默认名（30 秒后下个周期又写回来，来回跳）。
+ */
+static bool lookup_cfg(const char *pkg, struct cfg_entry *e)
 {
 	const char *db = find_db();
 	struct cfg_entry *c;
@@ -686,35 +699,36 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 
 	if (!db) {
 		logmsg("库: 找不到可读的云控库");
-		return;
+		return false;
 	}
 
 	/*
-	 * 两层缓存判定（v2.2）：
+	 * 两层缓存判定（v2.1）：
 	 *   1. TTL（600s）：到期必查一次 —— 兜底，云控改动最迟几分钟生效；
 	 *   2. TTL 内看库文件 stat 指纹（mtime+size）：没变 → 直接用缓存（零拷贝，
 	 *      不拷 600KB、不开 SQLite）；变了 → 立刻重查。这样「云控改了配置」
 	 *      最快一个复查周期内生效，而库没变的复查是零开销的。
 	 * 旧版教训仍在：-wal 在 COSA 手里一直在变，指纹变了不代表配置真变了 ——
 	 * 查完没变就把指纹记下来，同样的指纹不再重复查。
+	 * 指纹比的是**本条目自己记下的那次**（c->fp），不是全局的 —— 见 struct db_fp 说明。
 	 */
 	c = cache_get(pkg);
 	fresh = c->used && c->ts && (time(NULL) - c->ts) < CACHE_TTL_S;
-	if (fresh && db_fingerprint(db, &fp) && db_fp_same(&fp, &g_dbfp)) {
+	if (fresh && db_fingerprint(db, &fp) && db_fp_same(&fp, &c->fp)) {
 		*e = *c;		/* 指纹没变：不拷库、不开 SQLite、不查 */
-		return;
+		return true;
 	}
 
 	if (!load_sqlite())
-		return;
+		return false;
 	if (!stage_db(db, dbpath, sizeof(dbpath)))
-		return;
+		return false;
 
 	rc = p_sqlite3_open_v2(dbpath, &sq, SQLITE_OPEN_READONLY, NULL);
 	if (rc != SQLITE_OK) {
 		logmsg("库: 打开失败 rc=%d", rc);
 		if (sq) p_sqlite3_close(sq);
-		return;
+		return false;
 	}
 	rc = p_sqlite3_prepare_v2(sq,
 		"SELECT game_config FROM PackageConfigBean WHERE package_name = ?1",
@@ -722,7 +736,7 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 	if (rc != SQLITE_OK) {
 		logmsg("库: prepare 失败: %s", p_sqlite3_errmsg(sq));
 		p_sqlite3_close(sq);
-		return;
+		return false;
 	}
 
 	p_sqlite3_bind_text(st, 1, pkg, -1, NULL);
@@ -739,8 +753,6 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 
 	p_sqlite3_finalize(st);
 	p_sqlite3_close(sq);
-	/* 记下查询时刻的库指纹：下次同样的指纹（TTL 内）直接走缓存 */
-	g_dbfp = fp;
 	/*
 	 * 用完就把临时库删掉：一是空闲时不留那 600KB（占用），
 	 * 二是别把用户的云控库副本一直摊在 /data/local/tmp 上（隐私）。
@@ -756,13 +768,15 @@ static void lookup_cfg(const char *pkg, struct cfg_entry *e)
 		unlink(wal);
 	}
 
-	/* 写回缓存（连同这次的库指纹） */
+	/* 写回缓存（连同**这次**查库时刻的指纹，供本条目下次自查） */
 	snprintf(c->pkg, CACHE_PKG, "%s", pkg);
 	snprintf(c->ctn, CACHE_NAME, "%s", e->ctn);
 	c->ctb = e->ctb;
 	c->form = e->form;
+	c->fp = fp;
 	c->ts = time(NULL);
 	c->used = true;
+	return true;
 }
 
 /* --------------------------- 从 /proc 取包名 --------------------------- */
@@ -1026,7 +1040,7 @@ static void handle_game_start(pid_t pid)
 	}
 
 	/*
-	 * 记住当前游戏包名 —— 运行中复查（v2.2）按它查云控。
+	 * 记住当前游戏包名 —— 运行中复查（v2.1）按它查云控。
 	 * 这次没拿到 ctn 也要记：云控可能过一会儿才把配置推下来，
 	 * 复查发现新配置后照常应用。
 	 */
@@ -1034,7 +1048,14 @@ static void handle_game_start(pid_t pid)
 	g_applied_valid = false;
 	g_last_recheck = time(NULL);
 
-	lookup_cfg(pkg, &e);
+	/*
+	 * 查库失败（临时故障：拷库失败/SQLite 打不开）不能当结论用 ——
+	 * 直接跳过本次，什么都不动；包名已记下，下轮复查会重试。
+	 */
+	if (!lookup_cfg(pkg, &e)) {
+		logmsg("游戏启动: %s → 查库失败，本次不写节点（复查会重试）", pkg);
+		return;
+	}
 	g_last_recheck = time(NULL);
 
 	/*
@@ -1087,14 +1108,15 @@ static void handle_game_start(pid_t pid)
 	}
 }
 
-/* --------------------------- 运行中复查（v2.2 核心） --------------------------- */
+/* --------------------------- 运行中复查（v2.1 核心） --------------------------- */
 
 /*
  * 游戏运行中每 g_recheck_s 秒复查一次云控：
  *   - ctn 变了        → 重新写节点（这是「db 里的 ctn 参数被修改也要应用」的主路径）；
  *   - ctn 被移除/变空 → 恢复启动时的原值（配置不再要求加速这个游戏）；
  *   - ctb 变了（-e 模式）→ ct_enable 跟着重写；
- *   - 没变化          → 一行日志都不出。
+ *   - 没变化          → 一行日志都不出；
+ *   - **查库失败**     → 什么都不动（v2.1 修正，见下）。
  * 查询自带 stat 指纹：库没变时是零拷贝的（不拷 600KB、不开 SQLite）。
  * 单实例 + 串行主循环，不存在并发写节点的问题。
  */
@@ -1103,7 +1125,15 @@ static void recheck_running_game(void)
 	struct cfg_entry e;
 	char want[300];
 
-	lookup_cfg(g_cur_pkg, &e);
+	/*
+	 * 查不动库（拷库失败/SQLite 打不开）≠ 云控删了配置。
+	 * 这里必须保持现状：早期版本把两者混为一谈，一次临时 IO 故障就会把
+	 * 正在加速的节点恢复成默认名，30 秒后下个周期又写回来 —— 来回跳。
+	 */
+	if (!lookup_cfg(g_cur_pkg, &e)) {
+		logmsg("复查: 查库失败，保持现状（不动节点，下轮重试）");
+		return;
+	}
 
 	if (e.form == CFG_JSON || e.form == CFG_B64JSON) {
 		if (!normalize_names(e.ctn, want, sizeof(want)))
@@ -1160,13 +1190,21 @@ int main(int argc, char **argv)
 			g_db_override = argv[++i];
 		} else if (!strcmp(argv[i], "-r") ||
 			   !strcmp(argv[i], "--recheck")) {
+			char *end;
 			long v;
 
 			if (i + 1 >= argc) {
 				fprintf(stderr, "!! -r 后面要跟秒数\n");
 				return 2;
 			}
-			v = atol(argv[++i]);
+			v = strtol(argv[++i], &end, 10);
+			/* 非数字必须报错：atol("abc")=0 会**静默关掉复查**，
+			 * 看着像"参数没生效"，实际是功能被关了，很难查。 */
+			if (*end != '\0' || end == argv[i]) {
+				fprintf(stderr, "!! -r 要跟一个整数秒数（收到 \"%s\"）\n",
+					argv[i]);
+				return 2;
+			}
 			/* 0 = 关闭运行中复查；太小会高频拷库，钳到 5 秒 */
 			if (v == 0)
 				g_recheck_s = 0;
@@ -1183,7 +1221,7 @@ int main(int argc, char **argv)
 			       "                     最小 %d，0=关闭；ctn 变了会重新下发）\n"
 			       "  -V, --version      打印版本\n"
 			       "只有云控里真有 ctn 才写节点；没有就完全不碰（v2.0 起）\n"
-			       "游戏运行中每轮复查云控 ctn，被修改会自动重新应用（v2.2 起）\n"
+			       "游戏运行中每轮复查云控 ctn，被修改会自动重新应用（v2.1 起）\n"
 			       "日志走 stderr（service.sh 转到 daemon.log），同时写 /dev/kmsg\n",
 			       CTND_VERSION, g_recheck_s, RECHECK_S_MIN);
 			return 0;
@@ -1195,7 +1233,7 @@ int main(int argc, char **argv)
 	/* 父进程（service.sh）退出时不要把我们带走 */
 	signal(SIGHUP, SIG_IGN);
 
-	/* 日志要写 /dev/kmsg：fd 常开，省掉每条日志一次 open+close（v2.2） */
+	/* 日志要写 /dev/kmsg：fd 常开，省掉每条日志一次 open+close（v2.1） */
 	open_kmsg();
 
 	/* 只允许一个实例；重复启动直接退出，避免两个进程抢写同一个节点 */
@@ -1240,7 +1278,7 @@ int main(int argc, char **argv)
 		p = parse_game_pid(buf);
 		if (p == last) {
 			/*
-			 * 游戏还在跑（pid 没变）：周期性复查云控 ctn（v2.2）。
+			 * 游戏还在跑（pid 没变）：周期性复查云控 ctn（v2.1）。
 			 * 「db 里的 ctn 参数被修改也要应用」就是走这里 ——
 			 * 查询带 stat 指纹，库没变时零拷贝，常驻开销可忽略。
 			 */
