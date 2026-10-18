@@ -277,17 +277,30 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 
 ### 6.1 内核模块
 
-需要一份能用的内核构建产物。本机（Windows）没有工具链，实际是在 **WSL Arch** 里
+需要一份能用的内核构建产物。本机（Windows）没有工具链，实际是在 **WSL Debian 13** 里
 用 **NDK r26b 的 clang 17.0.2** 编的 —— 这个版本和设备内核**同一个 llvm-project
 提交**（`d9f89f4d…`），所以 kCFI 类型号必然一致（实测我们回调的类型号和设备
 模块逐字相等）。
 
 ```bash
-bash wsl_build.sh        # 一键全流程（详见脚本内注释）
+bash build.sh                      # 一键全流程（克隆内核 → 铺配置 → 编译 → 校验）
+bash build.sh --srcdir 已有内核树   # 复用已下载的内核源码
+bash build.sh --moddir modules仓   # 单独下载内核仓时必须给：重指 vendor 断链
 ```
 
-流程：装依赖 → 下载 NDK → 克隆 OnePlusOSS 内核源码 → 铺设备真实 `.config` →
-`modules_prepare` → 编 `.ko` → 校验。
+流程：装依赖 → 取内核源码 → 铺设备真实 `.config` → `modules_prepare` →
+编 `.ko` → 校验（vermagic 逐字比对 + `struct module` 布局硬校验）。
+
+**关于 `--moddir`**：OnePlusOSS 内核仓里 Oplus 私有的目录全是符号链接
+（`kernel/oplus_cpu -> ../../../vendor/...`），而 `vendor/` 的真身在另一个仓
+（`android_kernel_modules_and_devicetree_oneplus_sm8650`）。所以**单独下载内核仓
+必然断链**，`olddefconfig` 会报 `can't open file kernel/oplus_cpu/sched/Kconfig`。
+给 `--moddir` 指到 modules 仓根，脚本会自动重指 41 个断链、补 9 个空 Kconfig。
+
+**云端构建**：`.github/workflows/build.yml` 在 GitHub 的 `debian:13` 容器里现编
+（与本机同发行版 + apt 的 clang-17），内核/modules 两个仓都用 codeload 的 tar 包
+直下（`git clone` 的 checkout 阶段在容器里实测会无声中断）。推代码即触发，
+产物在 Actions 页的 Artifacts 里（`ctn_patch-ko`）。
 
 **两个关键约束**：
 
@@ -304,25 +317,31 @@ bash wsl_build.sh        # 一键全流程（详见脚本内注释）
 ### 6.2 daemon
 
 ```bash
-bash daemon/build.sh     # NDK aarch64 clang，产出约 21KB 单文件
-bash daemon/lint.sh      # 严格警告检查（应零输出）
-bash daemon/test.sh      # PC 上跑解析逻辑单元测试（不需要设备）
+bash daemon/build.sh       # ctnd（NDK aarch64 clang，产出约 20KB 单文件）
+bash daemon/build_tools.sh # fakepkg / fakethreads（e2e 与自检用的测试小工具）
+bash daemon/lint.sh        # 严格警告检查（应零输出）
+bash daemon/test.sh        # PC 上跑解析逻辑单元测试（不需要设备）
 ```
 
 只依赖 `libc.so` / `libdl.so`，无其他运行时依赖。`test.sh` 覆盖 base64
 解码（含无填充残余）、明文/base64 JSON 取值、加密形态识别、名字归一化、
 `game_pid` 解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
 
-真机上还有一套端到端用例（`daemon/device_e2e.sh` + `daemon/fakepkg.c`）：
+真机上还有一套端到端用例（`daemon/device_e2e.sh`，13 项）：
 
 ```bash
-# 需要 root shell。用 --db 指向一份合成的云控库，把 8 种配置形态都走一遍，
+# 需要 root shell。用 --db 指向一份**合成**的云控库，把各种配置形态走一遍；
 # fakepkg 负责伪造「进程名 = 包名」的进程来驱动判断链。
-# 不改动设备上真正的 COSA 库与模块目录。
-adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh /data/local/tmp/
-bash daemon/build.sh && adb push ctn_patch.ko /data/local/tmp/
-adb shell su -c 'chmod 755 /data/local/tmp/{ctnd,fakepkg,device_e2e.sh}; /data/local/tmp/device_e2e.sh'
+# 不改动设备上真正的 COSA 库与模块目录（脚本自己备份/还原测试库）。
+bash daemon/build.sh && bash daemon/build_tools.sh
+adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh \
+         daemon/synth.db daemon/synth2.db daemon/synth_removed.db ctn_patch.ko /data/local/tmp/
+adb shell su -c 'chmod 755 /data/local/tmp/{ctnd,fakepkg}; sh /data/local/tmp/device_e2e.sh'
 ```
+
+覆盖：单名/明文/base64（含无填充）写入、三种「不该写」的形态、
+**运行中改库自动重新应用**、**运行中查库失败保持现状**、运行中删配置恢复原值、
+游戏退出恢复、dmesg 写入次数。
 
 ### 6.3 打包
 

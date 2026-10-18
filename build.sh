@@ -199,7 +199,8 @@ for root, dirs, files in os.walk(src_root):
         fixed += 1
 print("   断链重指 %d 个，原本就好 %d 个，仍缺失 %d 个" % (fixed, kept, still_bad))
 PYRELINK
-	# 裸 source 引用、但两个仓都没有的 Kconfig：补空文件（名单照 arch_relink.sh）
+	# 裸 source 引用、但两个仓都没有的 Kconfig：补空文件
+	# （名单是当年逐条对设备内核整理出来的，见下面 TARGETS）
 	python3 - "$SRC" <<'PYSTUB'
 import os, re, shutil, sys
 
