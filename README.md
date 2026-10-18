@@ -56,7 +56,7 @@ daemon + 跑一遍完整自检，结果写进 `action.log`。输出是**一项�
 ctn_patch 自检  v2.1
   机型 PJX110 / pineapple ｜ 内核 6.1.141-... ｜ 页 4096 ｜ SELinux Enforcing
 
-[OK]  模块文件      ko 304392B ｜ ctnd 21616B 0755 ELF
+[OK]  模块文件      ko 34800B ｜ ctnd 20008B 0755 ELF
 [OK]  厂商模块      sha256 与构建时一致
 [OK]  vermagic      6.1.141-android14-11-o
 [OK]  insmod        成功，oplus_bsp_game_opt refcount 1→2（已钉住）
@@ -256,7 +256,32 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 **不做的优化**：不 `dlclose` libsqlite —— 实测 bionic 的 `dlclose` 不会真卸载
 （Android 已知行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。
 
-### 5.6 手动跑 ctnd（排查用）### 5.6 手动跑 ctnd（排查用）
+### 5.6 游戏运行中复查云控（v2.1 起）
+
+云控推配置是随时发生的，而 daemon 早期只在**游戏启动那一瞬间**查一次库：
+游戏跑着的时候云控把某个游戏的 `ctn` 改了，节点上挂的还是旧值，得杀掉游戏重开
+才生效。现在 daemon 会在游戏运行期间**每 30 秒复查一次**云控：
+
+| 复查发现 | daemon 做什么 |
+|---|---|
+| `ctn` 变了 | 重新写节点（「云控改了配置也要生效」走的就是这条） |
+| `ctn` 被移除/清空 | 恢复成启动时读到的原值 |
+| `ctb` 变了（`-e` 模式） | `ct_enable` 跟着重写 |
+| 没变化 | 一行日志都不出，也一个字节都不写 |
+| **库读不动**（拷库失败 / SQLite 打不开） | **保持现状**，什么都不动，下轮重试 |
+
+最后一行是刻意的：「查不动库」和「云控删了配置」是两回事。一次临时 IO 故障
+如果被当成后者，就会把正在加速的节点恢复成默认名，30 秒后下个周期又写回来 ——
+来回跳。所以 `lookup_cfg()` 的返回值专门区分了「查询成功」与「查不动」。
+
+复查周期可调：`ctnd -r 60`（秒，最小 5，`0` = 关掉复查回到旧行为）。
+**默认 30 秒的复查几乎不花钱**：查询带两层判定 —— 先看 TTL（600 秒）兜底，
+再看库文件的 `stat` 指纹（mtime + size，含 `-wal`）；**指纹没变就是零拷贝**
+（不拷那 600KB 库、也不开 SQLite）。指纹是**按包记的**，不是全局一个，
+否则会出现「B 包缓存于 F0 → 库变成 F1 → A 包查询把全局指纹刷成 F1 →
+B 包再启动时指纹又"相同"了 → 拿到改库前的旧缓存」这种串味。
+
+### 5.7 手动跑 ctnd（排查用）
 
 开机时由 `service.sh` 自动拉起，平时不用管。想手动跑或改行为：
 
@@ -264,6 +289,7 @@ Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 
 /data/adb/modules/ctn_patch/ctnd -h          # 看用法
 /data/adb/modules/ctn_patch/ctnd -e          # 连 ct_enable 一起按 ctb 代管
 /data/adb/modules/ctn_patch/ctnd -d /path/to/db   # 指定云控库（换机型/库不在候选里）
+/data/adb/modules/ctn_patch/ctnd -r 60       # 复查周期改 60 秒（默认 30，0=关）
 /data/adb/modules/ctn_patch/ctnd -V          # 看版本
 ```
 
