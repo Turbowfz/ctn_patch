@@ -50,6 +50,8 @@
  *   指针；用「上半区指针」一判就拒掉，避免把新内核改坏。
  *
  * 加载顺序：oplus_bsp_game_opt 先加载（开机就在）；卸载顺序相反。
+ * v2.2：内核侧无功能改动（仅版本号）；本版的修复和新增都在 daemon 侧
+ *      （游戏直切恢复、ctnd.conf 配置文件），见 daemon/ctnd.c 头注释。
  * v2.1：不再依赖外部保证顺序 —— 本模块先于 game_opt 加载时（比如 insmod
  * 早了/服务脚本没等够），init 不再失败退出，而是挂一个延迟工作队列
  * （10 秒一次，最多 60 次），目标模块一出现就自动补丁并建节点。
@@ -773,5 +775,5 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("2.1");
+MODULE_VERSION("2.2");
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

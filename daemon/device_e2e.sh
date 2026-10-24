@@ -46,7 +46,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 0. 准备 ==="
-for f in "$CTND" "$FAKE" "$DB" "$KO" "$DB.2" "$DB.r"; do
+for f in "$CTND" "$FAKE" "$DB" "$KO" /data/local/tmp/synth2.db /data/local/tmp/synth_removed.db; do
 	[ -f "$f" ] || { echo "  缺 $f，见脚本头部用法"; exit 1; }
 done
 for d in /proc/[0-9]*; do			# 停掉现役 daemon，避免互相干扰
@@ -103,12 +103,14 @@ run aaa.nopad.test
 check "无填充 base64 尾部不丢" "NoPadMain:-1,NoPadRender:-1" "$(cat $NODE)"
 
 echo
-echo "=== 5. 三种「不该写」的情况：节点必须保持前一个值 ==="
-BEFORE=$(cat $NODE)
+echo "=== 5. 三种「不该写」的情况（v2.2 语义）==="
 echo "  --- 5a. 有配置但没 ctn（Unity 游戏）"
+# 用例 4 的游戏（NoPadMain 已应用）直切到无 ctn 游戏：
+# v2.2 起当场恢复原值（这本身就是 5g 直切恢复的最早触发点）
 run aaa.empty.test
-check "无 ctn 不写节点" "$BEFORE" "$(cat $NODE)"
+check "直切到无 ctn 游戏 → 恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
 echo "  --- 5b. 云控库里没有这个游戏"
+BEFORE=$(cat $NODE)
 run aaa.missing.test
 check "库外包不写节点" "$BEFORE" "$(cat $NODE)"
 echo "  --- 5c. 加密/未知形态"
@@ -149,6 +151,19 @@ check "运行中 ctn 移除恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat
 cp "$DB.bak" "$DB"	# 恢复库，下一轮 e2e 才是干净起点
 
 echo
+echo "=== 5g. 游戏直切（无 -1 间隔）→ 新游戏无 ctn 时恢复原值（v2.2）==="
+# HAL 偶尔不写 -1 就把 game_pid 换成下一个游戏：先让有 ctn 的游戏应用上，
+# 然后把 pid 直接换成另一个没有 ctn 的游戏（中间不写 -1）。
+# 旧版会让上一个游戏的名字一直挂在节点上；v2.2 应当场恢复原值。
+run aaa.json.test
+check "直切前：新游戏 ctn 已应用" "JsonMain:-1,JsonRender:-1" "$(cat $NODE)"
+run aaa.empty.test
+check "直切后恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
+grep -q "游戏切换: 新游戏无 ctn" "$LOG" \
+	&& { echo "  [PASS] 日志明确说「游戏切换」恢复"; ok=$((ok+1)); } \
+	|| { echo "  [FAIL] 日志里没有「游戏切换」记录"; fail=$((fail+1)); }
+
+echo
 echo "=== 6. 游戏退出 → 恢复启动时的原值 ==="
 echo -1 > $GAMEPID
 sleep 7
@@ -157,9 +172,10 @@ check "退出后恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
 echo
 echo "=== 7. dmesg：内核侧只该有真写过的那些 ==="
 UPDATES=$(dmesg | grep -c "名单更新")
-# 6 条 = 5 次写入（用例 1-4 + 5d）+ 1 次恢复（5e）；
-# 用例 6 的退出恢复在 5e 已复位 g_patched 后不再重复写 —— 这是设计行为
-check "写入次数（5 次写入 + 1 次恢复）" "6" "$UPDATES"
+# 9 条 = 6 次写入（用例 1、2、3、4、5d 的 NewMain、5g 的 JsonMain）
+#      + 3 次恢复（5a 的直切恢复、5e 的移除恢复、5g 的直切恢复）
+# 用例 6 的退出恢复在 5g 已复位 g_patched 后不再重复写 —— 设计行为
+check "写入次数（6 次写入 + 3 次恢复）" "9" "$UPDATES"
 
 echo
 echo "=== 8. 决策日志 ==="

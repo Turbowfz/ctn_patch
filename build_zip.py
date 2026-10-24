@@ -32,6 +32,8 @@ FILES = {
     "uninstall.sh": (MAGISK, True, True),
     "action.sh": (MAGISK, True, True),
     "verify.sh": (HERE, True, True),
+    # daemon 运行选项的示例配置：想调复查周期/代管 ctb 的用户复制成 ctnd.conf 用
+    "ctnd.conf.example": (MAGISK, False, False),
     "README.md": (MAGISK, False, False),
     "LICENSE": (HERE, False, True),   # GPL 要求：分发二进制须随附许可
     "ctn_patch.ko": (None, False, True),  # 编译产物，单独找

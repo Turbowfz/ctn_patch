@@ -1,5 +1,5 @@
 /*
- * ctnd —— critical task name daemon   v2.1
+ * ctnd —— critical task name daemon   v2.2
  * Copyright (c) Turbo
  *
  * 为什么需要它：
@@ -31,10 +31,21 @@
  *          应用一次，游戏跑着的时候云控改了配置永远不生效（要重启游戏或 daemon）。
  *          现在游戏运行期间每 recheck 秒复查一次云控：值变了就重写节点、
  *          配置里 ctn 被移除就恢复原值、ctb 变了（-e 模式）跟着重写。
+ *          复查把「查库失败」和「云控删了配置」分开：前者保持现状不动节点。
  *   [速度/占用] 复查不是每轮都拷库：先看库文件 stat 指纹（mtime+size），
  *          没变就直接用缓存 —— 大部分复查是零拷贝的；变了才拷 600KB 开 SQLite。
+ *          指纹按包记在缓存条目里（全局指纹会让别的包吃到旧缓存）。
  *   [占用] /dev/kmsg 的 fd 常开（旧版每条日志 open+close 一次，纯浪费）。
- *   [兼容] 新增 -r/--recheck 调复查周期；复查失败不影响已应用状态。
+ *   [兼容] 新增 -r/--recheck 调复查周期；-r 传非数字报错退出（不再静默当 0）。
+ *
+ * v2.2 的改动（代码复查后的修复 + 易用性）：
+ *   [修复] **游戏直切**：HAL 偶尔不写 -1 就把 game_pid 换成下一个游戏，
+ *          旧版会让上一个游戏的线程名一直挂在节点上；现在检测到「新游戏没有
+ *          ctn 且上一个游戏的应用还没撤销」就直接恢复原值，和正常退出同等对待。
+ *   [易用] **ctnd.conf 配置文件**（放二进制同目录）：调复查周期 / 代管 ct_enable /
+ *          指定云控库不用再改 service.sh（改了升级还会被覆盖）。命令行参数优先。
+ *          注意和 v2.0 删掉的 ctn.conf 不是一回事 —— 那个是「游戏线程名覆盖」，
+ *          这个是「daemon 自身的选项」。
  *
  * 构建：见同目录 build.sh（NDK clang，aarch64-linux-android）
  */
@@ -59,7 +70,7 @@
 
 /* ------------------------------ 常量 ------------------------------ */
 
-#define CTND_VERSION "2.1"
+#define CTND_VERSION "2.2"
 
 #define NODE_PATH    "/proc/game_opt/task_boost/critical_task_name"
 #define CTEN_PATH    "/proc/game_opt/task_boost/ct_enable"
@@ -904,6 +915,25 @@ static bool apply_names(const char *names, char *written, size_t wlen)
 	return true;
 }
 
+/*
+ * 把节点恢复成启动时读到的原值，并撤销「本次动过节点」的记账。
+ * 三个地方会走到这：运行中复查发现 ctn 被移除（v2.1）、游戏直切到一个
+ * 没有 ctn 的游戏（v2.2）、游戏正常退出（main 循环里自带，日志带更多信息）。
+ * why 传完整的原因描述，直接进日志。
+ */
+static void restore_orig(const char *why)
+{
+	if (g_orig_names[0] && write_file(NODE_PATH, g_orig_names)) {
+		logmsg("%s，恢复原值 [%s]", why, g_orig_names);
+		g_patched = false;
+	} else {
+		/* 读不到原值（启动时节点不在）或写失败：能做的都做了，如实记下 */
+		logmsg("%s，但恢复不了原值（%s）", why,
+		       g_orig_names[0] ? strerror(errno) : "启动时没读到原值");
+	}
+	g_applied_valid = false;
+}
+
 /* --------------------------- 单实例锁 --------------------------- */
 
 static int g_lock_fd = -1;
@@ -1033,6 +1063,7 @@ static void handle_game_start(pid_t pid)
 {
 	struct cfg_entry e;
 	char pkg[256] = {0};
+	bool prev_applied;
 
 	if (!get_package_name(pid, pkg, sizeof(pkg))) {
 		logmsg("游戏 pid=%d，但取不到包名，跳过", (int)pid);
@@ -1043,10 +1074,11 @@ static void handle_game_start(pid_t pid)
 	 * 记住当前游戏包名 —— 运行中复查（v2.1）按它查云控。
 	 * 这次没拿到 ctn 也要记：云控可能过一会儿才把配置推下来，
 	 * 复查发现新配置后照常应用。
+	 * prev_applied 记下「上一个游戏的应用还没撤销吗」，给直切恢复用（v2.2）。
 	 */
+	prev_applied = g_applied_valid;
 	snprintf(g_cur_pkg, sizeof(g_cur_pkg), "%s", pkg);
 	g_applied_valid = false;
-	g_last_recheck = time(NULL);
 
 	/*
 	 * 查库失败（临时故障：拷库失败/SQLite 打不开）不能当结论用 ——
@@ -1054,6 +1086,8 @@ static void handle_game_start(pid_t pid)
 	 */
 	if (!lookup_cfg(pkg, &e)) {
 		logmsg("游戏启动: %s → 查库失败，本次不写节点（复查会重试）", pkg);
+		g_applied_valid = prev_applied;	/* 上一游戏的应用原样保留，别丢记账 */
+		g_last_recheck = time(NULL);
 		return;
 	}
 	g_last_recheck = time(NULL);
@@ -1106,6 +1140,15 @@ static void handle_game_start(pid_t pid)
 		logmsg("游戏启动: %s → 云控库里没有这个游戏 → **不写节点**", pkg);
 		break;
 	}
+
+	/*
+	 * 直切恢复（v2.2）：HAL 偶尔不写 -1 就把 game_pid 换成下一个游戏，
+	 * 上一个游戏的线程名会一直挂在节点上（匹配不到新游戏的线程，白占着）。
+	 * 检测到「上一个游戏的应用还没撤销 + 新游戏确实没有 ctn」就恢复原值，
+	 * 和正常退出同等对待。查库失败不会走到这儿（前面已 return）。
+	 */
+	if (prev_applied)
+		restore_orig("游戏切换: 新游戏无 ctn，撤销上一个游戏的应用");
 }
 
 /* --------------------------- 运行中复查（v2.1 核心） --------------------------- */
@@ -1160,12 +1203,96 @@ static void recheck_running_game(void)
 	/* 配置里的 ctn 没了（云控下掉了 / 换成加密形态）→ 撤销本次应用。
 	 * 只有我们确实动过节点才恢复；恢复成启动时读到的原值。 */
 	if (g_applied_valid) {
-		logmsg("复查: 云控 ctn 已移除（form=%d），恢复原值 [%s]",
-		       e.form, g_orig_names);
-		if (g_orig_names[0] && write_file(NODE_PATH, g_orig_names))
-			g_patched = false;
-		g_applied_valid = false;
+		char why[96];
+
+		snprintf(why, sizeof(why), "复查: 云控 ctn 已移除（form=%d）", e.form);
+		restore_orig(why);
 	}
+}
+
+/* --------------------------- 配置文件（v2.2） --------------------------- */
+
+/*
+ * ctnd.conf —— 放在二进制同目录（装好后在模块目录里）。
+ *
+ * 为什么需要它：开机是 service.sh **不带参数**拉起 daemon 的，想调复查周期 /
+ * 代管 ct_enable / 换云控库路径，以前只能改 service.sh —— 而模块一升级
+ * service.sh 就被覆盖，改动丢失。放进配置文件就能跟着模块目录活过升级。
+ *
+ * 格式：每行 key=value（# 开头是注释，等号两边空格随意）。支持三个键：
+ *   recheck=<秒>    同 -r（0=关闭复查；<5 钳到 5；非数字忽略并告警）
+ *   manage_ctb=1    同 -e（连 ct_enable 一起按配置的 ctb 管）
+ *   db=<路径>       同 -d（指定云控库）
+ * 命令行参数**优先于**配置文件（同名即覆盖）。
+ * 注意：和 v2.0 删掉的 ctn.conf 不是一回事 —— 那个是「按包覆盖线程名」，
+ * 这个只是 daemon 自己的运行选项。
+ */
+static void load_conf(void)
+{
+	char path[PATH_MAX], line[256];
+	char *k, *v, *end;
+	ssize_t n;
+	FILE *f;
+	int applied = 0;
+
+	n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+	if (n <= 0)
+		return;
+	path[n] = '\0';
+	v = strrchr(path, '/');
+	if (!v)
+		return;
+	v[1] = '\0';
+	strncat(path, "ctnd.conf", sizeof(path) - strlen(path) - 1);
+
+	f = fopen(path, "r");
+	if (!f)
+		return;			/* 没有配置文件 = 全用默认值，最常见的情况 */
+
+	while (fgets(line, sizeof(line), f)) {
+		long val;
+
+		k = line + strspn(line, " \t");
+		if (*k == '#' || *k == '\n' || *k == '\0')
+			continue;
+		v = strchr(k, '=');
+		if (!v) {
+			logmsg("配置: 忽略无等号的行 [%.*s]", (int)strcspn(k, "\n"), k);
+			continue;
+		}
+		*v++ = '\0';
+		end = k + strlen(k);
+		while (end > k && (end[-1] == ' ' || end[-1] == '\t'))
+			*--end = '\0';
+		v += strspn(v, " \t");
+		end = v + strlen(v);
+		while (end > v && (end[-1] == ' ' || end[-1] == '\t' ||
+				   end[-1] == '\n' || end[-1] == '\r'))
+			*--end = '\0';
+
+		if (!strcmp(k, "recheck")) {
+			val = strtol(v, &end, 10);
+			if (*end != '\0' || end == v) {
+				logmsg("配置: recheck 值不是整数 [%s]，忽略", v);
+				continue;
+			}
+			g_recheck_s = val == 0 ? 0 :
+				      (val < RECHECK_S_MIN ? RECHECK_S_MIN : val);
+			applied++;
+		} else if (!strcmp(k, "manage_ctb")) {
+			g_manage_cten = (strcmp(v, "1") == 0);
+			applied++;
+		} else if (!strcmp(k, "db")) {
+			if (*v) {
+				g_db_override = strdup(v);
+				applied++;
+			}
+		} else {
+			logmsg("配置: 忽略未知键 [%s]", k);
+		}
+	}
+	fclose(f);
+	logmsg("配置: 已加载 %s（生效 %d 项）", path, applied);
 }
 
 int main(int argc, char **argv)
@@ -1174,6 +1301,9 @@ int main(int argc, char **argv)
 	pid_t last = -1;
 	int gone = 0;
 	int i;
+
+	/* 配置文件先读，命令行参数后解析 —— 同名时命令行优先 */
+	load_conf();
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version")) {
