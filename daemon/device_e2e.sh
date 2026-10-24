@@ -46,7 +46,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 0. 准备 ==="
-for f in "$CTND" "$FAKE" "$DB" "$KO" /data/local/tmp/synth2.db /data/local/tmp/synth_removed.db; do
+for f in "$CTND" "$FAKE" "$DB" "$KO" /data/local/tmp/synth2.db /data/local/tmp/synth_removed.db /data/local/tmp/synth_emptyctn.db; do
 	[ -f "$f" ] || { echo "  缺 $f，见脚本头部用法"; exit 1; }
 done
 for d in /proc/[0-9]*; do			# 停掉现役 daemon，避免互相干扰
@@ -151,6 +151,19 @@ check "运行中 ctn 移除恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat
 cp "$DB.bak" "$DB"	# 恢复库，下一轮 e2e 才是干净起点
 
 echo
+echo "=== 5h. 云控把 ctn 改成空串 → 视同移除，恢复原值（v2.2）==="
+# 旧代码在复查里注释说"等价于被移除、走恢复"，实际直接 return 了 ——
+# 节点会一直挂着 JsonMain。v2.2 起空串视同移除，应当恢复原值。
+run aaa.json.test
+check "空串前：JsonMain 已应用" "JsonMain:-1,JsonRender:-1" "$(cat $NODE)"
+cp /data/local/tmp/synth_emptyctn.db "$DB"
+sleep 12
+check "ctn 改空 → 恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
+# 注意别用 \| 交替 —— toybox 的 grep 不认（GNU 扩展），拆成两个普通 grep
+tail -20 "$LOG" | grep -q "已移除" && tail -20 "$LOG" | grep -q "恢复原值" 	&& { echo "  [PASS] 日志有对应恢复记录"; ok=$((ok+1)); } 	|| { echo "  [FAIL] 日志里找不到恢复记录"; fail=$((fail+1)); }
+cp "$DB.bak" "$DB"
+
+echo
 echo "=== 5g. 游戏直切（无 -1 间隔）→ 新游戏无 ctn 时恢复原值（v2.2）==="
 # HAL 偶尔不写 -1 就把 game_pid 换成下一个游戏：先让有 ctn 的游戏应用上，
 # 然后把 pid 直接换成另一个没有 ctn 的游戏（中间不写 -1）。
@@ -172,10 +185,10 @@ check "退出后恢复原值" "UnityMain:-1,UnityGfxDevice:-1" "$(cat $NODE)"
 echo
 echo "=== 7. dmesg：内核侧只该有真写过的那些 ==="
 UPDATES=$(dmesg | grep -c "名单更新")
-# 9 条 = 6 次写入（用例 1、2、3、4、5d 的 NewMain、5g 的 JsonMain）
-#      + 3 次恢复（5a 的直切恢复、5e 的移除恢复、5g 的直切恢复）
+# 11 条 = 7 次写入（用例 1、2、3、4、5d 的 NewMain、5h 的 JsonMain、5g 的 JsonMain）
+#       + 4 次恢复（5a 直切、5e 移除、5h 空串、5g 直切）
 # 用例 6 的退出恢复在 5g 已复位 g_patched 后不再重复写 —— 设计行为
-check "写入次数（6 次写入 + 3 次恢复）" "9" "$UPDATES"
+check "写入次数（7 次写入 + 4 次恢复）" "11" "$UPDATES"
 
 echo
 echo "=== 8. 决策日志 ==="

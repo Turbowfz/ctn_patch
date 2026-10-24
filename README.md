@@ -92,10 +92,10 @@ ctn_patch 自检  v2.1
 「卸载」两项就只能跳过。`action.sh` 会先 `rmmod` 再调它，所以走按钮永远是
 完整测试。
 
-压测单独有 `stress_node.sh`（写读几千次，专压双缓冲/RCU 那条路）：
+压测单独有 `tools/stress_node.sh`（写读几千次，专压双缓冲/RCU 那条路）：
 
 ```bash
-adb push stress_node.sh /data/local/tmp/
+adb push tools/stress_node.sh /data/local/tmp/
 adb shell su -c 'sh /data/local/tmp/stress_node.sh 2000'
 ```
 
@@ -300,21 +300,6 @@ B 包再启动时指纹又"相同"了 → 拿到改库前的旧缓存」这种�
 `service.sh` 见到 3 就不再重启它 —— 所以手动调试前先
 `touch /data/adb/modules/ctn_patch/.stop` 把守护循环停掉，调完删掉哨兵。
 
-### 5.8 ctnd.conf —— daemon 运行选项（v2.2 起）
-
-开机是 `service.sh` **不带参数**拉起 daemon 的，想调选项以前只能改 `service.sh`
-（模块一升级就被覆盖）。v2.2 起支持配置文件：把模块目录里的
-`ctnd.conf.example` 复制一份、改名为 **`ctnd.conf`**（和 `ctnd` 同目录），
-重启手机或点「操作」重启 daemon 后生效。没有这个文件 = 全用默认值。
-
-| 键 | 作用 | 默认 |
-|---|---|---|
-| `recheck=<秒>` | 运行中复查云控的周期（同 `-r`；最小 5，`0` = 关闭复查） | 30 |
-| `manage_ctb=1` | 连 `ct_enable` 一起按配置的 `ctb` 管（同 `-e`） | 关 |
-| `db=<路径>` | 指定云控库（同 `-d`，换机型用） | 内置候选 |
-
-`#` 开头是注释；命令行参数优先于配置文件。
-
 ## 六、构建
 
 ### 6.1 内核模块
@@ -352,7 +337,7 @@ bash build.sh --moddir modules仓   # 单独下载内核仓时必须给：重指
   `.gnu.linkonce.this_module` 段大小。
 - **符号 CRC 取自设备**。内核开了 `CONFIG_MODVERSIONS`，整编一遍要几小时；
   这里从设备自带的 432 个 `.ko` 的 `__versions` 段抽出 4168 个符号 CRC
-  （`extract_symvers.py` → `Module.symvers.device`），够用且不必整编。
+  （`tools/extract_symvers.py` → `Module.symvers.device`），够用且不必整编。
   唯一缺的 `copy_from_kernel_nofault`（被 `TRIM_UNUSED_KSYMS` 裁掉）改成运行时
   用 kallsyms 取址。
 
@@ -369,7 +354,7 @@ bash daemon/test.sh        # PC 上跑解析逻辑单元测试（不需要设备
 解码（含无填充残余）、明文/base64 JSON 取值、加密形态识别、名字归一化、
 `game_pid` 解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
 
-真机上还有一套端到端用例（`daemon/device_e2e.sh`，16 项）：
+真机上还有一套端到端用例（`daemon/device_e2e.sh`，19 项）：
 
 ```bash
 # 需要 root shell。用 --db 指向一份**合成**的云控库，把各种配置形态走一遍；
@@ -383,7 +368,7 @@ adb shell su -c 'chmod 755 /data/local/tmp/{ctnd,fakepkg}; sh /data/local/tmp/de
 
 覆盖：单名/明文/base64（含无填充）写入、三种「不该写」的形态、
 **运行中改库自动重新应用**、**运行中查库失败保持现状**、运行中删配置恢复原值、
-**游戏直切恢复**、游戏退出恢复、dmesg 写入次数。
+**云控把 ctn 改成空串 → 视同移除恢复**、**游戏直切恢复**、游戏退出恢复、dmesg 写入次数。
 
 ### 6.3 打包
 
@@ -636,7 +621,7 @@ KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在
 4. **一加会把上一轮 dmesg 存到** `/data/persist_log/backup/SYSTEM_LAST_KMSG.txt`
    —— pstore 是空的也不代表没崩过。
 5. **设备 `/sys/kernel/btf/vmlinux` 含运行内核全部结构体布局**，
-   `btf_struct_dump.py` 可以直接 dump 任意 struct 的成员偏移，比猜配置快得多。
+   `tools/btf_struct_dump.py` 可以直接 dump 任意 struct 的成员偏移，比猜配置快得多。
 6. **`game_pid` 在游戏加载期会在正数和 -1 之间反复抖好几秒**，退出判定必须防抖。
 7. **`game_config` 里 `ctn` 是字符串、`ctb` 是数字**，JSON 取值器要分开。
 8. **无填充的 base64 尾部必须单独处理**。只按 4 字符一组解码的话，

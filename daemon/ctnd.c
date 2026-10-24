@@ -38,14 +38,13 @@
  *   [占用] /dev/kmsg 的 fd 常开（旧版每条日志 open+close 一次，纯浪费）。
  *   [兼容] 新增 -r/--recheck 调复查周期；-r 传非数字报错退出（不再静默当 0）。
  *
- * v2.2 的改动（代码复查后的修复 + 易用性）：
+ * v2.2 的改动（代码复查后的修复）：
  *   [修复] **游戏直切**：HAL 偶尔不写 -1 就把 game_pid 换成下一个游戏，
  *          旧版会让上一个游戏的线程名一直挂在节点上；现在检测到「新游戏没有
  *          ctn 且上一个游戏的应用还没撤销」就直接恢复原值，和正常退出同等对待。
- *   [易用] **ctnd.conf 配置文件**（放二进制同目录）：调复查周期 / 代管 ct_enable /
- *          指定云控库不用再改 service.sh（改了升级还会被覆盖）。命令行参数优先。
- *          注意和 v2.0 删掉的 ctn.conf 不是一回事 —— 那个是「游戏线程名覆盖」，
- *          这个是「daemon 自身的选项」。
+ *   [修复] **ctn 被改成空串**：旧代码在复查里注释说「等价于被移除、走恢复」，
+ *          实际却直接 return 了 —— 节点会一直挂着旧值。现在真的视同移除，
+ *          恢复原值（游戏启动路径同理）。
  *
  * 构建：见同目录 build.sh（NDK clang，aarch64-linux-android）
  */
@@ -1063,7 +1062,9 @@ static void handle_game_start(pid_t pid)
 {
 	struct cfg_entry e;
 	char pkg[256] = {0};
+	char want[300];
 	bool prev_applied;
+	bool want_ok;
 
 	if (!get_package_name(pid, pkg, sizeof(pkg))) {
 		logmsg("游戏 pid=%d，但取不到包名，跳过", (int)pid);
@@ -1098,24 +1099,31 @@ static void handle_game_start(pid_t pid)
 	 * UnityMain UnityGfxDevice，虽然值和内核默认相同，但那等于**每启动一个
 	 * 游戏就去动一次内核**；有反馈刷入后功耗异常，这条被一并去掉：
 	 * 拿不到 ctn 就完全不碰节点，daemon 对内核零影响。
+	 *
+	 * 「拿到 ctn」的判定 = 形态是 JSON 且**归一化后非空**（v2.2）：
+	 * ctn 被云控改成空串/纯空白时视同没有 ctn —— 走下面的说明 +
+	 * 直切恢复，而不是傻乎乎挂着一个空应用。
 	 */
-	if (e.form == CFG_JSON || e.form == CFG_B64JSON) {
+	want_ok = (e.form == CFG_JSON || e.form == CFG_B64JSON) &&
+		  normalize_names(e.ctn, want, sizeof(want));
+
+	if (want_ok) {
 		logmsg("游戏启动: %s → 云控 ctn=\"%s\"（%s, ctb=%d）", pkg, e.ctn,
 		       e.form == CFG_JSON ? "明文 JSON" : "base64 JSON", e.ctb);
 		/* written 写进 g_applied：运行中复查拿它判断「值有没有变」 */
-		if (apply_names(e.ctn, g_applied, sizeof(g_applied))) {
+		if (apply_names(want, g_applied, sizeof(g_applied))) {
 			g_applied_valid = true;
 			g_patched = true;	/* 记住"我们动过节点"，退出时才需要恢复 */
 			if (g_manage_cten && e.ctb >= 0) {
-				const char *want = e.ctb ? "1" : "0";
+				const char *want2 = e.ctb ? "1" : "0";
 
-				if (write_file(CTEN_PATH, want))
-					logmsg("ct_enable 置 %s（按配置 ctb=%d）", want, e.ctb);
+				if (write_file(CTEN_PATH, want2))
+					logmsg("ct_enable 置 %s（按配置 ctb=%d）", want2, e.ctb);
 				else
 					logmsg("写 ct_enable 失败: %s", strerror(errno));
 			}
 		} else {
-			logmsg("ctn 归一化后为空，不写节点");
+			logmsg("写入失败（模块加载了吗？）");
 		}
 		return;
 	}
@@ -1124,8 +1132,7 @@ static void handle_game_start(pid_t pid)
 	switch (e.form) {
 	case CFG_JSON:
 	case CFG_B64JSON:
-		/* 上面 if 里已经处理并 return，走不到这儿 —— 列出来只为消除
-		 * -Wswitch-enum 警告（要求把枚举值都写上） */
+		logmsg("游戏启动: %s → 云控 ctn 是空的 → 视同没有 ctn", pkg);
 		break;
 	case CFG_EMPTY:
 		logmsg("游戏启动: %s → 云控里没有 ctn（Unity 游戏）→ **不写节点**"
@@ -1167,6 +1174,7 @@ static void recheck_running_game(void)
 {
 	struct cfg_entry e;
 	char want[300];
+	bool have;
 
 	/*
 	 * 查不动库（拷库失败/SQLite 打不开）≠ 云控删了配置。
@@ -1178,15 +1186,22 @@ static void recheck_running_game(void)
 		return;
 	}
 
-	if (e.form == CFG_JSON || e.form == CFG_B64JSON) {
-		if (!normalize_names(e.ctn, want, sizeof(want)))
-			return;		/* 归一化后为空：等价于 ctn 被移除，走下面 */
+	/*
+	 * 「有 ctn」的判定和游戏启动一致（v2.2）：形态是 JSON 且归一化非空。
+	 * ctn 被改成空串/纯空白 → 视同移除，落到下面的恢复路径 ——
+	 * 旧代码在这里直接 return 了（注释写着"走下面"，代码却没走），
+	 * 节点会一直挂着改空之前的旧值。
+	 */
+	have = (e.form == CFG_JSON || e.form == CFG_B64JSON) &&
+	       normalize_names(e.ctn, want, sizeof(want));
+
+	if (have) {
 		if (g_applied_valid && strcmp(want, g_applied) == 0)
 			return;		/* 没变化：静默 */
 
 		logmsg("复查: 云控 ctn 变化 [%s] → [%s]，重新应用",
 		       g_applied_valid ? g_applied : "(未应用)", want);
-		if (apply_names(e.ctn, g_applied, sizeof(g_applied))) {
+		if (apply_names(want, g_applied, sizeof(g_applied))) {
 			g_applied_valid = true;
 			g_patched = true;
 			if (g_manage_cten && e.ctb >= 0) {
@@ -1200,7 +1215,7 @@ static void recheck_running_game(void)
 		return;
 	}
 
-	/* 配置里的 ctn 没了（云控下掉了 / 换成加密形态）→ 撤销本次应用。
+	/* 配置里的 ctn 没了（云控下掉 / 改成空串 / 换成加密形态）→ 撤销本次应用。
 	 * 只有我们确实动过节点才恢复；恢复成启动时读到的原值。 */
 	if (g_applied_valid) {
 		char why[96];
@@ -1210,100 +1225,12 @@ static void recheck_running_game(void)
 	}
 }
 
-/* --------------------------- 配置文件（v2.2） --------------------------- */
-
-/*
- * ctnd.conf —— 放在二进制同目录（装好后在模块目录里）。
- *
- * 为什么需要它：开机是 service.sh **不带参数**拉起 daemon 的，想调复查周期 /
- * 代管 ct_enable / 换云控库路径，以前只能改 service.sh —— 而模块一升级
- * service.sh 就被覆盖，改动丢失。放进配置文件就能跟着模块目录活过升级。
- *
- * 格式：每行 key=value（# 开头是注释，等号两边空格随意）。支持三个键：
- *   recheck=<秒>    同 -r（0=关闭复查；<5 钳到 5；非数字忽略并告警）
- *   manage_ctb=1    同 -e（连 ct_enable 一起按配置的 ctb 管）
- *   db=<路径>       同 -d（指定云控库）
- * 命令行参数**优先于**配置文件（同名即覆盖）。
- * 注意：和 v2.0 删掉的 ctn.conf 不是一回事 —— 那个是「按包覆盖线程名」，
- * 这个只是 daemon 自己的运行选项。
- */
-static void load_conf(void)
-{
-	char path[PATH_MAX], line[256];
-	char *k, *v, *end;
-	ssize_t n;
-	FILE *f;
-	int applied = 0;
-
-	n = readlink("/proc/self/exe", path, sizeof(path) - 1);
-	if (n <= 0)
-		return;
-	path[n] = '\0';
-	v = strrchr(path, '/');
-	if (!v)
-		return;
-	v[1] = '\0';
-	strncat(path, "ctnd.conf", sizeof(path) - strlen(path) - 1);
-
-	f = fopen(path, "r");
-	if (!f)
-		return;			/* 没有配置文件 = 全用默认值，最常见的情况 */
-
-	while (fgets(line, sizeof(line), f)) {
-		long val;
-
-		k = line + strspn(line, " \t");
-		if (*k == '#' || *k == '\n' || *k == '\0')
-			continue;
-		v = strchr(k, '=');
-		if (!v) {
-			logmsg("配置: 忽略无等号的行 [%.*s]", (int)strcspn(k, "\n"), k);
-			continue;
-		}
-		*v++ = '\0';
-		end = k + strlen(k);
-		while (end > k && (end[-1] == ' ' || end[-1] == '\t'))
-			*--end = '\0';
-		v += strspn(v, " \t");
-		end = v + strlen(v);
-		while (end > v && (end[-1] == ' ' || end[-1] == '\t' ||
-				   end[-1] == '\n' || end[-1] == '\r'))
-			*--end = '\0';
-
-		if (!strcmp(k, "recheck")) {
-			val = strtol(v, &end, 10);
-			if (*end != '\0' || end == v) {
-				logmsg("配置: recheck 值不是整数 [%s]，忽略", v);
-				continue;
-			}
-			g_recheck_s = val == 0 ? 0 :
-				      (val < RECHECK_S_MIN ? RECHECK_S_MIN : val);
-			applied++;
-		} else if (!strcmp(k, "manage_ctb")) {
-			g_manage_cten = (strcmp(v, "1") == 0);
-			applied++;
-		} else if (!strcmp(k, "db")) {
-			if (*v) {
-				g_db_override = strdup(v);
-				applied++;
-			}
-		} else {
-			logmsg("配置: 忽略未知键 [%s]", k);
-		}
-	}
-	fclose(f);
-	logmsg("配置: 已加载 %s（生效 %d 项）", path, applied);
-}
-
 int main(int argc, char **argv)
 {
 	char buf[256];
 	pid_t last = -1;
 	int gone = 0;
 	int i;
-
-	/* 配置文件先读，命令行参数后解析 —— 同名时命令行优先 */
-	load_conf();
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version")) {
