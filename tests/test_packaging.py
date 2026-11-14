@@ -241,8 +241,12 @@ class PackagingTests(unittest.TestCase):
 
     def test_module_prop_only_version_bump_refuses_untouched_ko(self):
         path = self.root / "magisk/module.prop"
+        changelog = self.root / "magisk/changelog.txt"
         put(path, path.read_bytes().replace(b"version=v3.0\n", b"version=v3.1\n")
             .replace(b"versionCode=30\n", b"versionCode=31\n"))
+        # Isolate the embedded-KO gate: the display changelog follows the bump.
+        put(changelog, changelog.read_bytes()
+            .replace("v3.0（versionCode 30）".encode("utf-8"), "v3.1（versionCode 31）".encode("utf-8")))
         untouched = {version: (self.root / f"out/{version}/ctn_patch.ko").read_bytes()
                      for version in PACK.PROFILES}
         output = self.root / "keep.zip"
@@ -373,6 +377,27 @@ class PackagingTests(unittest.TestCase):
         put(path, path.read_bytes() + b"\n")
         with self.assertRaisesRegex(PACK.PackageError, "profile hash mismatch"):
             self.fixture.collect()
+
+    def test_in_module_changelog_is_concise_and_version_bound(self):
+        entries = self.fixture.collect()
+        self.assertIn("changelog.txt", entries)
+        data, mode = entries["changelog.txt"]
+        self.assertEqual(mode, 0o644)
+        self.assertLessEqual(len(data), 2048)
+        text = data.decode("utf-8")
+        self.assertIn("v3.0", text)
+        self.assertIn("versionCode 30", text)
+        path = self.root / "magisk/changelog.txt"
+        raw = path.read_bytes()
+        for label, content in (("stale version", text.replace("v3.0", "v9.9").encode("utf-8")),
+                               ("stale code", text.replace("versionCode 30", "versionCode 31").encode("utf-8")),
+                               ("oversized", ("v3.0（versionCode 30）\n" + "x" * 2100).encode("utf-8"))):
+            with self.subTest(label=label):
+                put(path, content)
+                with self.assertRaisesRegex(PACK.PackageError, "changelog"):
+                    self.fixture.collect()
+        put(path, raw)
+        self.fixture.collect()
 
     def test_status_without_all_six_checks_is_rejected(self):
         self.fixture.record(checks=[])
@@ -849,6 +874,21 @@ class RuntimeShellTests(unittest.TestCase):
         result = self.common("ctn_select")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manifest hash mismatch", result.stderr)
+
+    def test_install_displays_changelog_and_packaged_kernels(self):
+        result = self.run_script("customize.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("更新日志", result.stdout)
+        self.assertIn("支持 6.1.141 / 6.1.157", result.stdout)
+        self.assertIn("本包支持内核: 6.1.141 6.1.157", result.stdout)
+        changelog = self.package / "changelog.txt"
+        raw = changelog.read_bytes()
+        put(changelog, raw.replace(b"v3.0", b"v9.9", 1))  # Display file, not a trust anchor.
+        result = self.run_script("customize.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("已跳过显示", result.stdout)
+        self.assertNotIn("v9.9", result.stdout)
+        put(changelog, raw)
 
     def test_install_never_uses_loaded_old_module_as_compatibility_evidence(self):
         self.loaded(legacy=True)

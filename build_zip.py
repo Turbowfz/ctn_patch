@@ -43,6 +43,7 @@ SOURCES = {
     "uninstall.sh": ("magisk/uninstall.sh", 0o755),
     "verify.sh": ("verify.sh", 0o755),
     "lib/common.sh": ("magisk/common.sh", 0o755),
+    "changelog.txt": ("magisk/changelog.txt", 0o644),
     "README.md": ("magisk/README.md", 0o644),
 }
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -231,6 +232,14 @@ def collect_entries(root: Path, profile: str | None = None,
     entries = {name: (text_bytes(read_required(root, path), path), perms)
                for name, (path, perms) in SOURCES.items()}
     props = module_properties(entries["module.prop"][0])
+    # The in-module changelog is a display file, but it must never go stale:
+    # bind its header to the packaged version and keep it concise.
+    changelog = entries["changelog.txt"][0]
+    require(len(changelog) <= 2048, "in-module changelog must stay concise (<=2048 bytes)")
+    changelog_text = changelog.decode("utf-8")
+    require(props["version"] in changelog_text and
+            f"versionCode {props['versionCode']}" in changelog_text,
+            "in-module changelog does not match the packaged version")
     daemon = read_required(artifact_root, "user/ctnd")
     elf_check(daemon, "user/ctnd", executable=True)
     entries["bin/ctnd"] = (daemon, 0o755)

@@ -4,7 +4,7 @@
 
 ## 包布局与兼容性
 
-- 根目录：`module.prop`、`customize.sh`、`service.sh`、`action.sh`、`uninstall.sh`、`verify.sh`、本说明。
+- 根目录：`module.prop`、`customize.sh`、`service.sh`、`action.sh`、`uninstall.sh`、`verify.sh`、`changelog.txt`、本说明。
 - `lib/common.sh`：所有入口共用的选择器、进程身份及启停逻辑。
 - `bin/ctnd`：守护进程。
 - `kernels/6.1.141/` 与 `kernels/6.1.157/`：各自的 `ctn_patch.ko`、`manifest.json`、`metadata.prop`。安装后保留包内所有 KO，下次启动重新选择，不能在 OTA 后沿用上次选择。

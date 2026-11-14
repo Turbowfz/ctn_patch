@@ -43,5 +43,24 @@ for CTN_VERSION in 6.1.141 6.1.157; do
     done
 done
 ui_print '- All packaged KOs are retained; the next enabled boot reselects for the exact kernel/vendor.'
+CTN_CHANGELOG="$MODDIR/changelog.txt"
+# Display-only file: never trust it, and never print another version's notes.
+if ctn_safe_file "$CTN_CHANGELOG" && [ -r "$CTN_CHANGELOG" ] &&
+   grep -qF -- "$CTN_PACKAGE_VERSION" "$CTN_CHANGELOG"; then
+    ui_print '- 更新日志：'
+    while IFS= read -r CTN_LINE || [ -n "$CTN_LINE" ]; do
+        [ -n "$CTN_LINE" ] || continue
+        ui_print "  $CTN_LINE"
+    done < "$CTN_CHANGELOG"
+else
+    ui_print '- 更新日志缺失或与本版不符；已跳过显示（不影响安装）'
+fi
+CTN_KERNELS=
+for CTN_KERNEL in 6.1.141 6.1.157; do
+    [ -d "$MODDIR/kernels/$CTN_KERNEL" ] || continue
+    CTN_KERNELS="$CTN_KERNELS $CTN_KERNEL"
+done
+[ -n "$CTN_KERNELS" ] &&
+    ui_print "- 本包支持内核:$CTN_KERNELS（安装与开机按厂商文件身份精确选择）"
 ui_print '- Default verify is read-only; Action exercises only when enabled and idle (otherwise read-only).'
 ui_print '- Action log: /data/adb/ctn_patch/action.log'
