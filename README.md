@@ -6,14 +6,14 @@
 
 模块 ID 保持 `ctn_patch`，当前版本 `v3.0 / versionCode 30`。v3.0 适配
 Android 17 的 6.1.157 内核，保留 6.1.141 兼容；旧版 `v2.2 / versionCode 22`
-仅面向 6.1.141，已停更但 Release 继续保留可下载。
+仅按 6.1.141 基线发布，保留为旧版下载；其在其他内核上偶然能加载不代表完成对应适配。
 
 ## 当前验证范围
 
 | 基线 | 设备/固件来源 | 静态验证 | 本轮真机验证 |
 |---|---|---|---|
 | 6.1.141 | PJX110，保存的 16.0.5.701 手机提取物 | 构建、vermagic、CRC、KCFI、布局通过 | 未测试；旧版本测试不能替代本次 KO 测试 |
-| 6.1.157 | PJX110，17.0.1.201 手机提取物 | 构建、vermagic、CRC、KCFI、布局通过 | 临时 KO 加载、名字写读、输入拒绝、恢复和卸载通过；无游戏时真实 PID 样本跳过 |
+| 6.1.157 | PJX110，17.0.1.201 手机提取物 | 构建、vermagic、CRC、KCFI、布局通过 | 本轮修复版已安装、重启加载；和平精英 CTN 自动下发和退到桌面恢复通过；Action 成功验收仍未完成 |
 
 “兼容 141/157”不代表所有机型和所有同版本固件都自动兼容。安装与开机选择器还会
 核对完整内核 release、厂商模块文件身份和包内文件哈希。未知基线拒绝加载，不轮流
@@ -110,6 +110,8 @@ NDK r26b（Clang 17.0.2），最终以产物 ABI 核验为准。构建目录每�
 bash daemon/test.sh
 python3 -I -B tests/test_packaging.py
 python3 -I -B tests/test_profile_tools.py
+python3 -I -B tests/test_service_lifecycle.py
+CTN_TEST_SHELL=mksh python3 -I -B tests/test_service_lifecycle.py
 
 # 已准备好固定源码时，明确选 profile。
 bash build.sh --profile 6.1.157 --srcdir /path/to/pinned/kernel \
@@ -135,7 +137,8 @@ bash daemon/build_tools.sh
 段。动态函数在第一次间接调用前再核对现机 KCFI，失败直接拒绝。
 
 CI 的 Debian 容器从源码构建两套 KO 和用户态程序，先跑回归测试，只输出标明
-未实机测试的开发候选。更新后的 CI 本轮未推送、未云端运行，不能称云端通过。
+未实机测试的开发候选。已发布的 `74f66ad` 两条流水线通过；本轮新增恢复及真实
+服务生命周期测试仍在本地工作分支，尚未推送，不把历史 CI 成功作为本轮云端通过。
 
 ## 打包与设备测试
 

@@ -36,6 +36,7 @@ case "$CTN_LOCK_RC" in
 esac
 [ ! -e "$MODDIR/.uninstalling" ] || exit 1
 ctn_disabled && exit 0
+ctn_exercise_guard || exit 1
 rm -f "$CTN_RUNTIME/.service.stop" || exit 1
 CTN_START=$(ctn_process_start "$$") || { ctn_error 'cannot identify service process'; exit 1; }
 printf '%s %s\n' "$$" "$CTN_START" > "$CTN_RUNTIME/service.pid" || exit 1
@@ -71,6 +72,9 @@ while ! ctn_dependency_ready; do
 done
 ctn_service_stopping && exit 0
 ctn_select || exit 1
+if ctn_loaded; then
+    ctn_running_identity || exit 1
+fi
 ctn_stop_legacy || exit 1
 CTN_SERVICE_CLEANUP=1
 ctn_service_stopping && exit 0

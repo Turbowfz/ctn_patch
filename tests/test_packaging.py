@@ -41,10 +41,36 @@ def put(path: Path, data: str | bytes) -> None:
     path.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
 
 
-def elf(executable: bool = False, marker: bytes = b"fixture") -> bytes:
-    data = bytearray(128)
-    data[:7] = b"\x7fELF\x02\x01\x01"
-    struct.pack_into("<HH", data, 16, 3 if executable else 1, 183)
+def elf(executable: bool = False, marker: bytes = b"fixture", *,
+        modinfo: bytes | None = None, duplicate_modinfo: bool = False) -> bytes:
+    if executable:
+        # Keep the daemon image used by the runtime fixtures byte-for-byte unchanged.
+        data = bytearray(128)
+        data[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HH", data, 16, 3, 183)
+        return bytes(data) + marker
+    data = bytearray(64)
+    names = b"\0.shstrtab\0.modinfo\0"
+    names_offset = len(data)
+    data.extend(names)
+    modinfo_offset = len(data)
+    if modinfo is not None:
+        data.extend(modinfo)
+    data.extend(bytes(-len(data) % 8))
+    section_offset = len(data)
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (1, 3, 0, 0, names_offset, len(names), 0, 0, 1, 0),
+    ]
+    if modinfo is not None:
+        sections.append((11, 1, 0, 0, modinfo_offset, len(modinfo), 0, 0, 1, 0))
+        if duplicate_modinfo:
+            sections.append(sections[-1])
+    for section in sections:
+        data.extend(struct.pack("<IIQQQQIIQQ", *section))
+    struct.pack_into("<16sHHIQQQIHHHHHH", data, 0,
+                     b"\x7fELF\x02\x01\x01" + bytes(9), 1, 183, 1, 0, 0,
+                     section_offset, 0, 64, 0, 0, 64, len(sections), 1)
     return bytes(data) + marker
 
 
@@ -80,8 +106,8 @@ class Fixture:
                 "abi": {"test_fixture": True}, "source": {"status": "synthetic-host-test"},
             }
             raw = PACK.json_bytes(profile)
-            ko = elf(marker=version.encode())
             put(root / f"profiles/{version}/profile.json", raw)
+            ko = elf(marker=version.encode(), modinfo=self.modinfo(version))
             put(root / f"out/{version}/ctn_patch.ko", ko)
             record = {
                 "schema": 1, "profile_id": version, "profile_sha256": sha(raw),
@@ -90,6 +116,24 @@ class Fixture:
                 "checks": [{"name": name, "passed": True} for name in sorted(PACK.REQUIRED_CHECKS)],
             }
             put(root / f"out/{version}/verification.json", PACK.json_bytes(record))
+
+    def modinfo(self, profile_id: str = "6.1.157", **changes: str) -> bytes:
+        profile = json.loads((self.root / f"profiles/{profile_id}/profile.json").read_bytes())
+        values = {
+            "version": "3.0", "ctn_profile": profile_id,
+            "ctn_build_id": sha(b"build " + profile_id.encode()),
+            "vermagic": profile["vendor"]["vermagic"],
+        }
+        values.update(changes)
+        return b"".join(f"{key}={value}\0".encode() for key, value in values.items())
+
+    def module(self, modinfo: bytes | None, version: str = "6.1.157", *,
+               duplicate_modinfo: bool = False, marker: bytes | None = None) -> bytes:
+        ko = elf(marker=version.encode() if marker is None else marker,
+                 modinfo=modinfo, duplicate_modinfo=duplicate_modinfo)
+        put(self.root / f"out/{version}/ctn_patch.ko", ko)
+        self.record(version, module_sha256=sha(ko))
+        return ko
 
     def record(self, version: str = "6.1.157", **changes: object) -> None:
         path = self.root / f"out/{version}/verification.json"
@@ -194,6 +238,128 @@ class PackagingTests(unittest.TestCase):
         self.fixture.record(runtime="failed")
         with self.assertRaises(PACK.PackageError):
             self.fixture.collect(profile="6.1.157")
+
+    def test_module_prop_only_version_bump_refuses_untouched_ko(self):
+        path = self.root / "magisk/module.prop"
+        put(path, path.read_bytes().replace(b"version=v3.0\n", b"version=v3.1\n")
+            .replace(b"versionCode=30\n", b"versionCode=31\n"))
+        untouched = {version: (self.root / f"out/{version}/ctn_patch.ko").read_bytes()
+                     for version in PACK.PROFILES}
+        output = self.root / "keep.zip"
+        for options in ({}, {"development": True}, {"profile": "6.1.157"}):
+            with self.subTest(options=options):
+                put(output, b"keep existing package on identity refusal")
+                with self.assertRaisesRegex(PACK.PackageError, "modinfo version mismatch"):
+                    self.build(output=output, **options)
+                self.assertEqual(output.read_bytes(), b"keep existing package on identity refusal")
+                for version, ko in untouched.items():
+                    self.assertEqual((self.root / f"out/{version}/ctn_patch.ko").read_bytes(), ko)
+
+    def test_module_prop_version_without_v_prefix_matches_ko(self):
+        path = self.root / "magisk/module.prop"
+        put(path, path.read_bytes().replace(b"version=v3.0\n", b"version=3.0\n"))
+        entries = self.fixture.collect()
+        for version in PACK.PROFILES:
+            self.assertIn(b"module_version=3.0\n", entries[f"kernels/{version}/metadata.prop"][0])
+
+    def test_valid_hex_record_build_id_must_match_embedded_ko(self):
+        original = (self.root / "out/6.1.157/ctn_patch.ko").read_bytes()
+        wrong = sha(b"different recorded build identity")
+        self.assertRegex(wrong, PACK.SHA256)
+        self.fixture.record(build_id=wrong)
+        for options in ({}, {"development": True}, {"profile": "6.1.157"}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(PACK.PackageError, "modinfo ctn_build_id mismatch"):
+                    self.fixture.collect(**options)
+        self.assertEqual((self.root / "out/6.1.157/ctn_patch.ko").read_bytes(), original)
+
+    def test_wrong_embedded_identity_refused_even_with_matching_hash(self):
+        for version in PACK.PROFILES:
+            profile = json.loads((self.root / f"profiles/{version}/profile.json").read_bytes())
+            wrong_profile = next(item for item in PACK.PROFILES if item != version)
+            wrong = (
+                ("version", "2.9"), ("version", "v3.0"), ("ctn_profile", wrong_profile),
+                ("ctn_build_id", sha(b"different embedded build identity")),
+                ("vermagic", profile["vendor"]["vermagic"].replace("-o-vendor", "-o-other")),
+                ("vermagic", profile["runtime_releases"][0] +
+                 " SMP preempt mod_unload modversions aarch64"),
+                ("vermagic", profile["vendor"]["vermagic"].replace(" preempt", "")),
+            )
+            for key, value in wrong:
+                with self.subTest(version=version, key=key, value=value):
+                    self.fixture.module(self.fixture.modinfo(version, **{key: value}), version)
+                    with self.assertRaisesRegex(PACK.PackageError, f"modinfo {key} mismatch"):
+                        self.fixture.collect(profile=version)
+                self.fixture.module(self.fixture.modinfo(version), version)
+
+    def test_missing_or_duplicate_modinfo_identity_fields_refused(self):
+        raw = self.fixture.modinfo()
+        items = [item for item in raw.split(b"\0") if item]
+        for item in items:
+            key = item.split(b"=", 1)[0].decode()
+            missing = b"".join(other + b"\0" for other in items if other != item)
+            for label, value in (("missing", missing), ("duplicate", raw + item + b"\0")):
+                with self.subTest(key=key, label=label):
+                    # Correct identity outside .modinfo must not substitute for section data.
+                    self.fixture.module(value, marker=raw)
+                    with self.assertRaisesRegex(PACK.PackageError, "modinfo"):
+                        self.fixture.collect(profile="6.1.157")
+
+    def test_missing_empty_or_duplicate_modinfo_section_refused(self):
+        raw = self.fixture.modinfo()
+        for label, value, duplicate in (("missing", None, False), ("empty", b"", False),
+                                        ("duplicate", raw, True)):
+            with self.subTest(label=label):
+                self.fixture.module(value, duplicate_modinfo=duplicate, marker=raw)
+                with self.assertRaisesRegex(PACK.PackageError, "modinfo"):
+                    self.fixture.collect(profile="6.1.157")
+
+    def test_malformed_modinfo_records_refused(self):
+        raw = self.fixture.modinfo()
+        for value in (raw[:-1], raw + b"no-equals\0", raw + b"=empty-key\0",
+                      raw + b"bad\nkey=value\0", raw + b"description=\xff\0"):
+            with self.subTest(value=value):
+                self.fixture.module(value)
+                with self.assertRaisesRegex(PACK.PackageError, "modinfo"):
+                    self.fixture.collect(profile="6.1.157")
+
+    def test_modinfo_elf_section_headers_are_bounded(self):
+        path = self.root / "out/6.1.157/ctn_patch.ko"
+        raw = path.read_bytes()
+        section_offset = struct.unpack_from("<Q", raw, 40)[0]
+        for label, offset, format_, value in (
+                ("table outside file", 40, "<Q", len(raw) + 64),
+                ("wrong entry size", 58, "<H", 63),
+                ("no section headers", 60, "<H", 0),
+                ("bad section name", section_offset + 128, "<I", 1024),
+                ("NOBITS modinfo", section_offset + 132, "<I", 8),
+                ("not PROGBITS", section_offset + 132, "<I", 3),
+                ("modinfo outside file", section_offset + 152, "<Q", len(raw) + 64)):
+            with self.subTest(label=label):
+                bad = bytearray(raw)
+                struct.pack_into(format_, bad, offset, value)
+                put(path, bytes(bad))
+                self.fixture.record(module_sha256=sha(bad))
+                with self.assertRaisesRegex(PACK.PackageError, "ELF|modinfo"):
+                    self.fixture.collect(profile="6.1.157")
+
+    def test_profile_vermagic_requires_full_runtime_flags_in_order(self):
+        path = self.root / "profiles/6.1.157/profile.json"
+        vendor = json.loads(path.read_bytes())["vendor"]
+        full = vendor["vermagic"]
+        invalid = [full.replace(" " + flag, "")
+                   for flag in ("SMP", "preempt", "mod_unload", "modversions")]
+        invalid += [full.replace("SMP preempt", "preempt SMP"), full + " extra",
+                    full.replace(" SMP", "  SMP"), full.replace(" aarch64", " arm64")]
+        for value in invalid:
+            with self.subTest(vermagic=value):
+                self.fixture.profile(vendor=dict(vendor, vermagic=value))
+                self.fixture.module(self.fixture.modinfo())
+                with self.assertRaisesRegex(PACK.PackageError, "full vermagic mismatch"):
+                    self.fixture.collect(profile="6.1.157")
+        self.fixture.profile(vendor=vendor)
+        self.fixture.module(self.fixture.modinfo())
+        self.fixture.collect()
 
     def test_same_size_ko_tamper_is_rejected_by_hash(self):
         path = self.root / "out/6.1.157/ctn_patch.ko"
@@ -327,6 +493,15 @@ flock() {
         return $?
     fi
     case "$1:$2:${MOCK_LOCK_HELD:-}" in -n:7:daemon|-n:6:service|-n:9:service|-n:8:maintenance) return 1 ;; esac
+    if [ "$1:$2" = -n:6 ] && [ "${MOCK_LEGACY_LOCK_HELD:-0}" = 1 ] &&
+       [ "$(command readlink /proc/self/fd/6 6>&6)" = "$MOCK_PACKAGE/.ctnd.lock" ]; then
+        return 1
+    fi
+    if [ "$1:$2" = -n:6 ] || [ "$1:$2" = -n:9 ]; then
+        local service_pid
+        service_pid=$(command cut -d' ' -f1 "$MOCK_ROOT/data/adb/ctn_patch/service.pid" 2>/dev/null) || service_pid=
+        [ ! -f "$MOCK_ROOT/proc/$service_pid/alive" ] || return 1
+    fi
     if [ "$1:$2" = -n:7 ] && [ "${MOCK_DAEMON_UNLOCKED:-0}" != 1 ]; then
         local pid
         pid=$(command cat "$MOCK_ROOT/data/adb/ctn_patch/daemon.pid" 2>/dev/null) || pid=
@@ -339,6 +514,14 @@ flock() {
     return 0
 }
 sleep() {
+    if [ "${MOCK_STOP_MANAGED:-0}" = 1 ] && [ -e "$MOCK_ROOT/data/adb/ctn_patch/.service.stop" ]; then
+        local service_pid
+        service_pid=$(command cut -d' ' -f1 "$MOCK_ROOT/data/adb/ctn_patch/service.pid" 2>/dev/null) || service_pid=
+        command rm -f "$MOCK_ROOT/proc/$service_pid/alive" "$MOCK_ROOT/data/adb/ctn_patch/service.pid"
+    fi
+    if [ "${MOCK_GAME_START_AFTER_PAUSE:-0}" = 1 ] && [ -e "$MOCK_ROOT/data/adb/ctn_patch/.service.stop" ]; then
+        printf 'game_pid=222 child_num=0\n' > "$MOCK_ROOT/proc/game_opt/game_pid"
+    fi
     if [ "${MOCK_STOP_ON_SLEEP:-0}" = 1 ]; then
         : > "$MOCK_ROOT/data/adb/ctn_patch/.service.stop"
     fi
@@ -417,6 +600,7 @@ class RuntimeShellTests(unittest.TestCase):
         put(self.device / "proc/modules", "oplus_bsp_game_opt 123 0 - Live 0\n")
         put(self.enable, "0\n")
         put(self.device / "proc/game_opt/game_pid", "game_pid=-1 child_num=0\n")
+        put(self.device / "proc/sys/kernel/random/boot_id", "01234567-89ab-cdef-0123-456789abcdef\n")
 
     def run_script(self, name: str, *args: str, **env: str) -> subprocess.CompletedProcess:
         settings = dict(os.environ, **env)
@@ -463,9 +647,149 @@ class RuntimeShellTests(unittest.TestCase):
         if legacy:
             put(self.package / "ctnd", image)
             put(self.package / "ctnd.pid", str(pid) + "\n")
+            put(self.package / ".ctnd.lock", "")
         else:
             put(self.runtime / ".daemon.lock", "")
             put(self.runtime / "daemon.pid", str(pid) + "\n")
+
+    def service(self, pid: int = 765433) -> None:
+        proc = self.device / f"proc/{pid}"
+        shell = shutil.which("sh")
+        self.assertIsNotNone(shell)
+        put(proc / "exe-path", shell_path(Path(shell).resolve()) + "\n")
+        put(proc / "alive", "")
+        put(proc / "stat", f"{pid} (sh) S " + "0 " * 18 + "45678 0\n")
+        put(proc / "cmdline", (shell + "\0" + shell_path(self.package / "service.sh") + "\0--run\0").encode())
+        put(self.runtime / ".service.lock", "")
+        put(self.runtime / "service.pid", f"{pid} 45678\n")
+
+    def test_legacy_stop_requires_idle_lock_with_missing_or_unrelated_pid(self):
+        for unrelated in (False, True):
+            with self.subTest(unrelated=unrelated):
+                self.daemon(legacy=True, unrelated=unrelated)
+                if not unrelated:
+                    (self.package / "ctnd.pid").unlink()
+                put(self.package / ".ctnd.lock", "")
+                self.log.unlink(missing_ok=True)
+                result = self.common("ctn_stop_legacy", MOCK_LEGACY_LOCK_HELD="1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("kill -TERM", self.events())
+
+    def test_service_rejects_old_loaded_identity_before_stopping_legacy(self):
+        self.loaded(legacy=True)
+        self.daemon(legacy=True)
+        result = self.run_script("service.sh", "--run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("kill -TERM", self.events())
+        self.assertFalse((self.package / ".stop").exists())
+        self.assertTrue((self.device / "proc/765432/alive").exists())
+
+    def test_exercise_checks_idle_and_rechecks_after_service_pause(self):
+        for starts_during_pause in (False, True):
+            with self.subTest(starts_during_pause=starts_during_pause):
+                self.loaded()
+                self.log.unlink(missing_ok=True)
+                put(self.device / "proc/game_opt/game_pid",
+                    "game_pid=-1 child_num=0\n" if starts_during_pause else "game_pid=222 child_num=0\n")
+                env = {}
+                if starts_during_pause:
+                    self.service()
+                    put(self.runtime / ".service.stop", "pending stop\n")
+                    env = {"MOCK_STOP_MANAGED": "1", "MOCK_GAME_START_AFTER_PAUSE": "1"}
+                result = self.run_script("verify.sh", "--exercise", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("write_names", self.events())
+                self.assertEqual(self.node.read_text(), "SavedA:-1,SavedB:-1\n")
+
+    def test_exercise_does_not_resume_existing_stop_request(self):
+        self.loaded()
+        self.service()
+        put(self.runtime / ".service.stop", "keep stopped\n")
+        result = self.run_script("verify.sh", "--exercise", MOCK_STOP_MANAGED="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.runtime / ".service.stop").read_text(), "keep stopped\n")
+        self.assertNotIn("service did not resume", result.stderr)
+        self.assertFalse((self.runtime / "service.pid").exists())
+
+    def test_failed_exercise_recovery_blocks_same_boot_restart(self):
+        self.loaded()
+        result = self.run_script("verify.sh", "--exercise", MOCK_FAIL_RESTORE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.runtime / "exercise.state").is_file())
+        self.log.unlink(missing_ok=True)
+        result = self.run_script("service.sh", "--run", MOCK_STOP_ON_SLEEP="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.runtime / ".service.stop").exists())
+        self.assertTrue((self.runtime / "exercise.state").exists())
+        self.assertNotIn("insmod", self.events())
+        self.assertNotIn("daemon started", result.stdout)
+
+    def test_successful_exercise_removes_own_recovery_record(self):
+        self.loaded()
+        result = self.run_script("verify.sh", "--exercise")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "exercise.state").exists())
+
+    def test_exercise_refuses_unresolved_recovery_and_symlink(self):
+        self.loaded()
+        put(self.runtime / "exercise.state", "boot=unknown\nnames=SavedA SavedB\nenable=0\n")
+        result = self.run_script("verify.sh", "--exercise")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("write_names", self.events())
+        (self.runtime / "exercise.state").unlink()
+        outside = self.base / "recovery-keep"
+        put(outside, "untouched")
+        (self.runtime / "exercise.state").symlink_to(outside)
+        result = self.run_script("verify.sh", "--exercise")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside.read_text(), "untouched")
+
+    def test_previous_boot_exercise_record_is_discarded_without_node_writes(self):
+        self.loaded()
+        put(self.runtime / "exercise.state",
+            "boot_id=fedcba98-7654-3210-fedc-ba9876543210\nnames=OldA OldB\nenable=1\n")
+        result = self.common("ctn_runtime_prepare && ctn_exercise_guard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "exercise.state").exists())
+        self.assertEqual(self.node.read_text(), "SavedA:-1,SavedB:-1\n")
+        self.assertEqual(self.events(), "")
+
+    def test_existing_boot_exercise_record_refuses_service_before_stop_clear(self):
+        self.loaded()
+        put(self.runtime / "exercise.state",
+            "boot_id=01234567-89ab-cdef-0123-456789abcdef\nnames=SavedA SavedB\nenable=0\n")
+        put(self.runtime / ".service.stop", "keep stopped\n")
+        result = self.run_script("service.sh", "--run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved self-check restoration", result.stderr)
+        self.assertEqual((self.runtime / ".service.stop").read_text(), "keep stopped\n")
+        self.assertTrue((self.runtime / "exercise.state").exists())
+        self.assertNotIn("insmod", self.events())
+
+    def test_standalone_shell_lookup_uses_absolute_system_interpreter(self):
+        common = self.package / "lib/common.sh"
+        raw = common.read_bytes()
+        put(common, raw.replace(b"    CTN_SHELL=$(command -v sh) || return 1\n",
+                                b"    CTN_SHELL=sh\n", 1))
+        system_shell = self.device / "system/bin/sh"
+        system_shell.parent.mkdir(parents=True)
+        system_shell.symlink_to(Path(shutil.which("sh")).resolve())
+        result = self.common('printf "SHELL=%s\\nEXE=%s\\n" "$CTN_SHELL" "$CTN_SHELL_EXE"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SHELL=" + shell_path(system_shell.parent) + "/sh", result.stdout)
+        self.assertIn("EXE=" + shell_path(Path(shutil.which("sh")).resolve()), result.stdout)
+
+    def test_bare_shell_lookup_never_uses_working_directory_executable(self):
+        common = self.package / "lib/common.sh"
+        raw = common.read_bytes()
+        put(common, raw.replace(b"    CTN_SHELL=$(command -v sh) || return 1\n",
+                                b"    CTN_SHELL=sh\n", 1))
+        decoy = self.base / "sh"
+        put(decoy, "#!/bin/sh\nexit 0\n")
+        decoy.chmod(0o755)
+        result = self.common('printf "SHELL=%s\\n" "$CTN_SHELL"')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("SHELL=sh", result.stdout)
 
     def test_selector_accepts_exactly_both_profiles(self):
         for version in PACK.PROFILES:
@@ -728,6 +1052,7 @@ ctn_daemon_idle''', MOCK_REAL_FLOCK="1")
         self.loaded()
         self.daemon()
         put(self.runtime / "restore.state", "opaque daemon-only debt")
+        put(self.runtime / "action.log", "SELF_CHECK_EXIT=0\n")
         put(self.package / "disable", "")
         outside = self.device / "data/adb/other-module/keep"
         put(outside, "untouched")
@@ -752,6 +1077,16 @@ ctn_daemon_idle''', MOCK_REAL_FLOCK="1")
                 self.assertTrue(self.runtime.exists())
                 if env != {"MOCK_LOCK_HELD": "daemon"}:
                     self.assertTrue((self.runtime / "restore.state").exists())
+
+    def test_uninstall_does_not_unload_with_selfcheck_recovery_debt(self):
+        self.loaded()
+        put(self.runtime / "exercise.state",
+            "boot_id=01234567-89ab-cdef-0123-456789abcdef\nnames=SavedA SavedB\nenable=0\n")
+        result = self.run_script("uninstall.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("rmmod", self.events())
+        self.assertTrue((self.runtime / "exercise.state").exists())
+        self.assertTrue((self.device / "sys/module/ctn_patch").exists())
 
     def test_uninstall_rmmod_failure_is_not_masked(self):
         self.loaded()

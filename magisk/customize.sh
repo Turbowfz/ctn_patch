@@ -43,4 +43,5 @@ for CTN_VERSION in 6.1.141 6.1.157; do
     done
 done
 ui_print '- All packaged KOs are retained; the next enabled boot reselects for the exact kernel/vendor.'
-ui_print '- Action/default verify are read-only. Runtime logs: /data/adb/ctn_patch/'
+ui_print '- Default verify is read-only; Action exercises only when enabled and idle (otherwise read-only).'
+ui_print '- Action log: /data/adb/ctn_patch/action.log'

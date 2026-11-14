@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,11 @@ import tempfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
+# Load the bounded reader from this repository, also under isolated Python (-I).
+_ABI_SPEC = importlib.util.spec_from_file_location("ctn_package_abi", HERE / "tools/abi.py")
+assert _ABI_SPEC and _ABI_SPEC.loader
+_ABI = importlib.util.module_from_spec(_ABI_SPEC)
+_ABI_SPEC.loader.exec_module(_ABI)
 PROFILES = ("6.1.141", "6.1.157")
 REQUIRED_CHECKS = frozenset(
     ("vermagic", "symbol_crcs", "kcfi", "module_layout", "undefined_symbols", "elf_sections")
@@ -151,9 +157,10 @@ def validate_profile(profile: dict, version: str) -> None:
     for value in string_list(vendor.get("sha256"), f"{version}.vendor.sha256"):
         hash_field(value, f"{version}.vendor.sha256")
     vermagic = vendor.get("vermagic")
-    require(isinstance(vermagic, str) and bool(vermagic) and
-            all(32 <= ord(c) <= 126 for c in vermagic) and
-            vermagic.startswith(version + "-") and vermagic.endswith(" aarch64"),
+    require(isinstance(vermagic, str) and
+            re.fullmatch(re.escape(version) +
+                         r"-[A-Za-z0-9_.+-]+ SMP preempt mod_unload modversions aarch64",
+                         vermagic) is not None,
             f"missing/full vermagic mismatch: {version}")
     for key in ("abi", "source"):
         require(isinstance(profile.get(key), dict) and bool(profile[key]),
@@ -161,7 +168,8 @@ def validate_profile(profile: dict, version: str) -> None:
 
 
 def validate_verification(record: dict, version: str, profile_bytes: bytes,
-                          module_bytes: bytes, development: bool) -> None:
+                          module_bytes: bytes, development: bool, *,
+                          module_version: str, vermagic: str) -> None:
     require(type(record.get("schema")) is int and record["schema"] == 1,
             f"unsupported verification schema: {version}")
     require(record.get("profile_id") == version, f"verification profile mismatch: {version}")
@@ -169,7 +177,26 @@ def validate_verification(record: dict, version: str, profile_bytes: bytes,
             f"profile hash mismatch: {version}")
     require(hash_field(record.get("module_sha256"), "module_sha256") == digest(module_bytes),
             f"module hash mismatch: {version}")
-    hash_field(record.get("build_id"), f"{version}.build_id")
+    build_id = hash_field(record.get("build_id"), f"{version}.build_id")
+    # Hashes bind files, but cannot make stale embedded identity match new metadata.
+    # Parse only section-backed .modinfo from the exact bytes being packaged.
+    try:
+        ko = _ABI.Elf(f"{version}/ctn_patch.ko", data=module_bytes)
+        section = ko.by_name.get(".modinfo")
+        require(section is not None and section["type"] == 1,
+                f"missing/invalid ELF .modinfo section: {version}")
+        raw_info = ko.blob(section)
+        require(raw_info.endswith(b"\0"), f"unterminated/empty .modinfo: {version}")
+        info = ko.info()
+    except (_ABI.FormatError, UnicodeDecodeError, struct.error) as exc:
+        raise PackageError(f"invalid ELF/.modinfo: {version}: {exc}") from exc
+    require(all(re.fullmatch(r"[A-Za-z0-9_]+", key) for key in info),
+            f"malformed .modinfo key: {version}")
+    for key, expected in (("version", module_version), ("ctn_profile", version),
+                          ("ctn_build_id", build_id), ("vermagic", vermagic)):
+        values = info.get(key, [])
+        require(len(values) == 1, f"missing/duplicate modinfo {key}: {version}")
+        require(values[0] == expected, f"modinfo {key} mismatch: {version}")
     require(record.get("static") == "passed", f"static verification not passed: {version}")
     require(record.get("runtime") in ("passed", "not_tested"),
             f"failed/invalid runtime verification: {version}")
@@ -215,7 +242,9 @@ def collect_entries(root: Path, profile: str | None = None,
         elf_check(ko, f"{version}/ctn_patch.ko")
         record = json_object(read_required(artifact_root, f"{version}/verification.json"),
                              f"{version}/verification.json")
-        validate_verification(record, version, profile_bytes, ko, development)
+        validate_verification(record, version, profile_bytes, ko, development,
+                              module_version=props["version"].removeprefix("v"),
+                              vermagic=spec["vendor"]["vermagic"])
         metadata = {
             "schema": "1",
             "profile_id": version,

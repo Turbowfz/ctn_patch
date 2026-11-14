@@ -15,7 +15,15 @@ ctn_init() {
     CTN_NODE="$CTN_PROC/game_opt/task_boost/critical_task_name"
     CTN_ENABLE="$CTN_PROC/game_opt/task_boost/ct_enable"
     CTN_SHELL=$(command -v sh) || return 1
+    # BusyBox standalone ash reports its applet as bare "sh", not an executable path.
+    case "$CTN_SHELL" in
+        /*) ;;
+        *) CTN_SHELL="$CTN_ROOT/system/bin/sh" ;;
+    esac
+    [ -x "$CTN_SHELL" ] || { ctn_error 'no executable absolute shell path'; return 1; }
     CTN_SHELL_EXE=$(readlink -f "$CTN_SHELL") || return 1
+    case "$CTN_SHELL_EXE" in /*) ;; *) ctn_error 'cannot resolve shell executable'; return 1 ;; esac
+    [ -x "$CTN_SHELL_EXE" ] || return 1
     CTN_PACKAGE_VERSION=$(ctn_property "$MODDIR/module.prop" version) || return 1
     [ "$(ctn_property "$MODDIR/module.prop" id)" = ctn_patch ] || {
         ctn_error 'module.prop identity is not ctn_patch'; return 1;
@@ -254,9 +262,64 @@ ctn_runtime_prepare() {
     [ -d "$CTN_RUNTIME" ] || mkdir -m 700 "$CTN_RUNTIME" || return 1
     chmod 700 "$CTN_RUNTIME" || return 1
     local name
-    for name in .service.lock .maintenance.lock .daemon.lock daemon.pid service.pid .service.stop restore.state boot.log daemon.log action.log; do
+    for name in .service.lock .maintenance.lock .daemon.lock daemon.pid service.pid .service.stop restore.state exercise.state boot.log daemon.log action.log; do
         ctn_safe_file "$CTN_RUNTIME/$name" || return 1
     done
+}
+
+ctn_boot_valid() {
+    [ "${#1}" = 36 ] || return 1
+    case "$1" in *[!0-9a-f-]*) return 1 ;; esac
+    case "$1" in ????????-????-????-????-????????????) return 0 ;; *) return 1 ;; esac
+}
+
+ctn_boot_identity() {
+    CTN_BOOT_ID=$(ctn_scalar "$CTN_PROC/sys/kernel/random/boot_id") || return 1
+    ctn_boot_valid "$CTN_BOOT_ID"
+}
+
+ctn_exercise_guard() {
+    local file="$CTN_RUNTIME/exercise.state" line key value boot= names= enable= count=0 left right
+    ctn_safe_file "$file" || return 1
+    [ -e "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        count=$((count + 1))
+        [ "$count" -le 3 ] && [ "${#line}" -le 220 ] || return 1
+        key=${line%%=*}; value=${line#*=}
+        [ "$line" != "$key" ] || return 1
+        case "$key" in
+            boot_id) [ -z "$boot" ] || return 1; boot=$value ;;
+            names) [ -z "$names" ] || return 1; names=$value ;;
+            enable) [ -z "$enable" ] || return 1; enable=$value ;;
+            *) ctn_error 'unknown exercise recovery record; retained'; return 1 ;;
+        esac
+    done < "$file"
+    [ "$count" = 3 ] && ctn_boot_valid "$boot" || return 1
+    left=${names%% *}; right=${names#* }
+    [ "$names" = "$left $right" ] && [ -n "$left" ] && [ -n "$right" ] &&
+        [ "${#left}" -le 99 ] && [ "${#right}" -le 99 ] || return 1
+    case "$left$right" in *[!A-Za-z0-9_.+-]*) return 1 ;; esac
+    case "$enable" in 0|1) ;; *) return 1 ;; esac
+    ctn_boot_identity || { ctn_error 'cannot identify boot for exercise recovery'; return 1; }
+    [ "$boot" != "$CTN_BOOT_ID" ] || {
+        ctn_error 'unresolved self-check restoration; exercise.state retained; service restart refused'; return 1;
+    }
+    # Kernel nodes reset on boot. Never replay a previous boot's names.
+    rm -f "$file" || return 1
+    ctn_note 'previous-boot exercise record removed; no kernel values replayed'
+}
+
+ctn_exercise_record() {
+    local file="$CTN_RUNTIME/exercise.state" temp
+    ctn_boot_identity || { ctn_error 'cannot bind self-check recovery to this boot'; return 1; }
+    ctn_safe_file "$file" && [ ! -e "$file" ] || return 1
+    temp=$(mktemp "$CTN_RUNTIME/.exercise.XXXXXX") || return 1
+    if ! printf 'boot_id=%s\nnames=%s\nenable=%s\n' "$CTN_BOOT_ID" "$1" "$2" > "$temp" ||
+       ! mv -f "$temp" "$file"; then
+        rm -f "$temp"
+        return 1
+    fi
+    CTN_EXERCISE_RECORD_HASH=$(ctn_sha256 "$file") || return 1
 }
 
 ctn_flock() {
@@ -376,16 +439,37 @@ ctn_stop_daemon() {
     [ ! -e "$CTN_RUNTIME/restore.state" ] || { ctn_error 'daemon restoration is incomplete; preserving restore.state'; return 1; }
 }
 
+ctn_legacy_idle() (
+    [ -f "$MODDIR/.ctnd.lock" ] && [ ! -L "$MODDIR/.ctnd.lock" ] || {
+        ctn_error 'legacy daemon lock is missing/unsafe; cannot prove it stopped'; exit 2;
+    }
+    exec 6<"$MODDIR/.ctnd.lock" || exit $?
+    ctn_flock -n 6
+)
+
 ctn_stop_legacy() {
-    local pid
+    local pid tries=0 rc
     # Only this module's old path and PID hint; never comm, pgrep or /proc/*/fd.
     if [ -e "$MODDIR/ctnd" ] || [ -e "$MODDIR/ctnd.pid" ]; then
         ctn_safe_file "$MODDIR/.stop" || return 1
-        : > "$MODDIR/.stop" || return 1
+        [ -e "$MODDIR/.stop" ] || : > "$MODDIR/.stop" || return 1
         pid=$(ctn_scalar "$MODDIR/ctnd.pid") || pid=
         if [ -n "$pid" ] && ctn_process_matches "$pid" "$MODDIR/ctnd"; then
             ctn_stop_pid "$pid" "$MODDIR/ctnd" || return 1
         fi
+        while :; do
+            ctn_legacy_idle
+            rc=$?
+            case "$rc" in
+                0) break ;;
+                1) ;;
+                *) ctn_error "legacy daemon lock check failed rc=$rc"; return "$rc" ;;
+            esac
+            [ "$tries" -lt 20 ] || {
+                ctn_error 'legacy daemon lock remains held; refusing teardown'; return 1;
+            }
+            sleep 1; tries=$((tries + 1))
+        done
     fi
 }
 
@@ -413,7 +497,7 @@ ctn_service_idle() (
 ctn_stop_service() {
     local tries=0
     ctn_safe_file "$CTN_RUNTIME/.service.stop" || return 1
-    : > "$CTN_RUNTIME/.service.stop" || return 1
+    [ -e "$CTN_RUNTIME/.service.stop" ] || : > "$CTN_RUNTIME/.service.stop" || return 1
     while ! ctn_service_idle; do
         [ "$tries" -lt 30 ] || { ctn_error 'service did not release its lock; refusing teardown'; return 1; }
         sleep 1; tries=$((tries + 1))

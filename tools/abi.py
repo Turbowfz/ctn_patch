@@ -35,9 +35,10 @@ def slice_bytes(data, offset, size):
 
 
 class Elf:
-    def __init__(self, path):
+    def __init__(self, path, *, data=None):
         self.path = Path(path)
-        self.data = d = self.path.read_bytes()
+        # Bind parsing to a caller's already-read/hash-checked snapshot when supplied.
+        self.data = d = self.path.read_bytes() if data is None else data
         if len(d) < 64 or d[:6] != b'\x7fELF\x02\x01':
             raise FormatError('expected ELF64 little-endian')
         self.machine = struct.unpack_from('<H', d, 18)[0]

@@ -79,12 +79,15 @@ fi
 ctn_disabled && { ctn_error 'disabled/removing: --exercise refused; flags unchanged'; exit 1; }
 [ "$CTN_IDENTITY_RC" = 0 ] || { ctn_error 'cannot exercise an old/unknown loaded instance'; exit 1; }
 ctn_dependency_ready || { ctn_error 'vendor dependency is not ready'; exit 1; }
+ctn_game_idle || { ctn_error 'game running or idle state unknown; no exercise writes'; exit 1; }
 ctn_maintenance_lock || exit $?
+ctn_exercise_guard || exit 1
 CTN_RESUME_SERVICE=0
 CTN_PAUSED=0
 CTN_SAVED_NAMES=
 CTN_SAVED_ENABLE=
 CTN_NAMES_TOUCHED=0
+CTN_EXERCISE_RECORD_HASH=
 CTN_KEEP_STOP=0
 [ ! -e "$CTN_RUNTIME/.service.stop" ] || CTN_KEEP_STOP=1
 if ctn_service_pid >/dev/null; then
@@ -121,6 +124,15 @@ ctn_exercise_cleanup() {
             }
         fi
     fi
+    if [ -n "$CTN_EXERCISE_RECORD_HASH" ] && [ "$restore_rc" = 0 ]; then
+        if ctn_safe_file "$CTN_RUNTIME/exercise.state" &&
+           [ "$(ctn_sha256 "$CTN_RUNTIME/exercise.state")" = "$CTN_EXERCISE_RECORD_HASH" ]; then
+            rm -f "$CTN_RUNTIME/exercise.state" || restore_rc=1
+        else
+            ctn_error 'self-check recovery record changed; retained'
+            restore_rc=1
+        fi
+    fi
     if [ "$CTN_LOADED_BY_US" = 1 ]; then
         if [ "$restore_rc" = 0 ] && [ ! -e "$CTN_RUNTIME/restore.state" ]; then
             rmmod ctn_patch || { restore_rc=$?; ctn_error "cannot unload the test-owned KO rc=$restore_rc"; }
@@ -131,7 +143,8 @@ ctn_exercise_cleanup() {
         rm -f "$CTN_RUNTIME/.service.stop" || restore_rc=1
     fi
     ctn_maintenance_unlock || restore_rc=1
-    if [ "$CTN_RESUME_SERVICE" = 1 ] && [ "$CTN_PAUSED" = 1 ] && [ "$restore_rc" = 0 ]; then
+    if [ "$CTN_RESUME_SERVICE" = 1 ] && [ "$CTN_PAUSED" = 1 ] &&
+       [ "$CTN_KEEP_STOP" = 0 ] && [ "$restore_rc" = 0 ]; then
         if ctn_disabled; then
             ctn_note 'disable/remove appeared during exercise; service deliberately not resumed'
         else
@@ -156,12 +169,17 @@ trap 'exit 143' TERM HUP
 ctn_stop_service || exit 1
 CTN_PAUSED=1
 ctn_disabled && { ctn_error 'disabled/removing while waiting'; exit 1; }
+ctn_game_idle || { ctn_error 'game started while pausing service; no exercise writes'; exit 1; }
 ctn_ensure_module || exit $?
 ctn_read_names || { ctn_error 'original names cannot be restored unambiguously; no writes performed'; exit 1; }
 CTN_SAVED_NAMES=$CTN_NAMES
 CTN_SAVED_ENABLE=$(ctn_scalar "$CTN_ENABLE") || exit 1
 case "$CTN_SAVED_ENABLE" in 0|1) ;; *) ctn_error 'unknown ct_enable original; no writes performed'; exit 1 ;; esac
 [ -w "$CTN_NODE" ] || exit 1
+ctn_game_idle || { ctn_error 'game started before node tests; no exercise writes'; exit 1; }
+ctn_exercise_record "$CTN_SAVED_NAMES" "$CTN_SAVED_ENABLE" || {
+    ctn_error 'cannot save self-check recovery record; no writes performed'; exit 1;
+}
 CTN_NAMES_TOUCHED=1
 ctn_expect_names 'CTNTestMain CTNTestGfx' 'CTNTestMain CTNTestGfx' || {
     CTN_WRITE_RC=$?; ctn_error "dual-name write/readback failed rc=$CTN_WRITE_RC"; exit "$CTN_WRITE_RC";

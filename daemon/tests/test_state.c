@@ -8,7 +8,8 @@ struct fake {
 	bool missing[CTND_NODE_COUNT];
 	unsigned int writes[CTND_NODE_COUNT], attempts[CTND_NODE_COUNT];
 	unsigned int write_fail[CTND_NODE_COUNT];
-	unsigned int saves, save_fail_at, lookups, package_fail;
+	unsigned int saves, save_fail_at, save_publish_fail_at;
+	unsigned int lookups, package_fail;
 	struct ctnd_cfg cfg;
 	struct ctnd_journal disk;
 };
@@ -40,7 +41,8 @@ static bool save(void *ctx, const struct ctnd_journal *journal)
 
 	if (++f->saves == f->save_fail_at) return false;
 	f->disk = *journal;
-	return true;
+	/* Model rename succeeding before directory fsync fails. */
+	return f->saves != f->save_publish_fail_at;
 }
 
 static bool package(void *ctx, int pid, char *out, size_t cap)
@@ -244,6 +246,103 @@ static void ctb_and_ownership(void)
 	CHECK(f.writes[0] == 0 && f.writes[1] == 2 && !strcmp(f.node[1], "0"));
 }
 
+static void staged_save_shutdown(bool fail_shutdown)
+{
+	struct fake f;
+	struct ctnd_state s;
+	struct ctnd_ops ops;
+	struct ctnd_journal authoritative;
+
+	setup(&f, &s, &ops, false);
+	authoritative = s.journal;
+	f.save_publish_fail_at = 1;
+	ctnd_state_tick(&s, &ops, true, 1, 0);
+	CHECK(f.disk.nodes[0].owed && f.disk.nodes[0].pending_valid && !f.disk.nodes[0].applied_valid);
+	CHECK(!strcmp(f.disk.nodes[0].original, "CustomOne CustomTwo"));
+	CHECK(!strcmp(f.disk.nodes[0].pending, "Game Render") && !f.disk.nodes[1].owed);
+	CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+	CHECK(f.attempts[0] == 0 && f.attempts[1] == 0 && f.writes[0] == 0 && f.writes[1] == 0);
+	if (fail_shutdown) f.save_fail_at = 2;
+	CHECK(ctnd_state_shutdown(&s, &ops) == !fail_shutdown);
+	if (fail_shutdown) {
+		CHECK(s.journal_dirty && ctnd_state_has_debt(&s));
+		CHECK(f.saves == 2 && f.disk.nodes[0].owed && f.disk.nodes[0].pending_valid);
+		CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+		CHECK(f.attempts[0] == 0 && f.attempts[1] == 0);
+		CHECK(ctnd_state_shutdown(&s, &ops));
+	}
+	CHECK(!f.disk.nodes[0].owed && !f.disk.nodes[1].owed);
+	CHECK(f.saves == (fail_shutdown ? 3U : 2U));
+	CHECK(!s.journal_dirty && !ctnd_state_has_debt(&s));
+	CHECK(f.attempts[0] == 0 && f.attempts[1] == 0 && f.writes[0] == 0 && f.writes[1] == 0);
+	CHECK(!strcmp(f.node[0], "CustomOne CustomTwo") && !strcmp(f.node[1], "0"));
+}
+
+static void staged_save_retry(void)
+{
+	struct fake f;
+	struct ctnd_state s;
+	struct ctnd_ops ops;
+	struct ctnd_journal authoritative;
+
+	setup(&f, &s, &ops, true);
+	authoritative = s.journal;
+	f.save_publish_fail_at = 1;
+	ctnd_state_tick(&s, &ops, true, 1, 0);
+	CHECK(f.attempts[0] == 0 && f.attempts[1] == 0);
+	CHECK(f.disk.nodes[0].pending_valid);
+	CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+	CHECK(s.journal_dirty && ctnd_state_has_debt(&s));
+	f.save_fail_at = 2; /* Rollback must succeed before either node can be applied. */
+	ctnd_state_tick(&s, &ops, true, 1, 5000);
+	CHECK(f.saves == 2 && s.journal_dirty && f.disk.nodes[0].pending_valid);
+	CHECK(f.attempts[0] == 0 && f.attempts[1] == 0);
+	f.save_fail_at = 4; /* Save 3 rolls back; reject the next staged intent. */
+	ctnd_state_tick(&s, &ops, true, 1, 10000);
+	CHECK(!f.disk.nodes[0].owed && !f.disk.nodes[1].owed);
+	CHECK(f.saves == 4 && s.journal_dirty && ctnd_state_has_debt(&s));
+	CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+	CHECK(f.attempts[0] == 0 && f.attempts[1] == 0);
+	ctnd_state_tick(&s, &ops, true, 1, 15000);
+	CHECK(f.saves == 9 && !s.journal_dirty);
+	CHECK(f.attempts[0] == 1 && f.attempts[1] == 1 && f.writes[0] == 1 && f.writes[1] == 1);
+	CHECK(s.journal.nodes[0].applied_valid && !s.journal.nodes[0].pending_valid);
+	CHECK(s.journal.nodes[1].applied_valid && !s.journal.nodes[1].pending_valid);
+	CHECK(!strcmp(s.journal.nodes[0].original, "CustomOne CustomTwo"));
+	CHECK(!strcmp(s.journal.nodes[1].original, "0"));
+	CHECK(ctnd_state_shutdown(&s, &ops));
+	CHECK(!ctnd_state_has_debt(&s) && !f.disk.nodes[0].owed && !f.disk.nodes[1].owed);
+}
+
+static void staged_save_applied(void)
+{
+	struct fake f;
+	struct ctnd_state s;
+	struct ctnd_ops ops;
+	struct ctnd_journal authoritative;
+
+	setup(&f, &s, &ops, false);
+	ctnd_state_tick(&s, &ops, true, 1, 0);
+	authoritative = s.journal;
+	config(&f, "{\"ctn\":\"Changed Render\"}");
+	f.save_publish_fail_at = 3;
+	ctnd_state_tick(&s, &ops, true, 1, 5000);
+	CHECK(f.disk.nodes[0].applied_valid && f.disk.nodes[0].pending_valid);
+	CHECK(!strcmp(f.disk.nodes[0].applied, "Game Render"));
+	CHECK(!strcmp(f.disk.nodes[0].pending, "Changed Render"));
+	CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+	CHECK(f.attempts[0] == 1 && f.writes[0] == 1 && !strcmp(f.node[0], "Game Render"));
+	CHECK(s.journal_dirty && ctnd_state_has_debt(&s));
+	f.save_fail_at = 4;
+	CHECK(!ctnd_state_shutdown(&s, &ops));
+	CHECK(f.attempts[0] == 1 && f.disk.nodes[0].pending_valid && s.journal_dirty);
+	CHECK(!memcmp(&s.journal, &authoritative, sizeof(authoritative)));
+	CHECK(ctnd_state_shutdown(&s, &ops));
+	CHECK(f.saves == 6 && f.attempts[0] == 2 && f.writes[0] == 2);
+	CHECK(!strcmp(f.node[0], "CustomOne CustomTwo"));
+	CHECK(!ctnd_state_has_debt(&s) && !f.disk.nodes[0].owed);
+}
+
 static void durable_and_restart(void)
 {
 	struct fake f;
@@ -254,7 +353,8 @@ static void durable_and_restart(void)
 	setup(&f, &s, &ops, false);
 	f.save_fail_at = 1;
 	ctnd_state_tick(&s, &ops, true, 1, 0);
-	CHECK(f.writes[0] == 0 && !ctnd_state_has_debt(&s));
+	CHECK(f.writes[0] == 0 && s.journal_dirty && ctnd_state_has_debt(&s));
+	CHECK(!s.journal.nodes[0].owed && !f.disk.nodes[0].owed);
 	ctnd_state_tick(&s, &ops, true, 1, 5000);
 	CHECK(f.writes[0] == 1 && ctnd_state_has_debt(&s));
 	f.write_fail[0] = 1;
@@ -336,6 +436,78 @@ static void recovery_yield(void)
 	CHECK(ctnd_state_shutdown(&restart, &ops));
 }
 
+static void recovery_original(enum ctnd_node node, bool pending)
+{
+	struct fake f;
+	struct ctnd_state s, restart;
+	struct ctnd_ops ops;
+	struct ctnd_journal crash;
+	unsigned int attempts, writes;
+
+	setup(&f, &s, &ops, node == CTND_NODE_ENABLE);
+	if (node == CTND_NODE_ENABLE) config(&f, "{\"ctb\":1}");
+	ctnd_state_tick(&s, &ops, true, 1, 0);
+	if (pending) {
+		config(&f, "{\"ctn\":\"Changed Render\"}");
+		f.write_fail[node] = 1;
+		ctnd_state_tick(&s, &ops, true, 1, 5000);
+	}
+	crash = f.disk;
+	CHECK(crash.nodes[node].owed && crash.nodes[node].applied_valid);
+	CHECK(crash.nodes[node].pending_valid == pending);
+	attempts = f.attempts[node];
+	writes = f.writes[node];
+	/* HAL restored the original after the daemon's applied journal survived a crash. */
+	memcpy(f.node[node], crash.nodes[node].original, strlen(crash.nodes[node].original) + 1);
+	ctnd_state_init(&restart, node == CTND_NODE_ENABLE, 5000, &crash);
+	ctnd_state_tick(&restart, &ops, true, 1, 10000);
+	CHECK(f.attempts[node] == attempts && f.writes[node] == writes);
+	CHECK(!restart.recovering && restart.yielded[node] && !ctnd_state_has_debt(&restart));
+	CHECK(restart.pid == 1 && !restart.initial_session && !f.disk.nodes[node].owed);
+	CHECK(!strcmp(f.node[node], crash.nodes[node].original));
+	ctnd_state_tick(&restart, &ops, true, 1, 15000);
+	CHECK(restart.yielded[node] && f.attempts[node] == attempts && f.writes[node] == writes);
+	ctnd_state_tick(&restart, &ops, true, -1, 16000);
+	ctnd_state_tick(&restart, &ops, true, 1, 20000);
+	CHECK(restart.yielded[node] && f.attempts[node] == attempts && f.writes[node] == writes);
+	ctnd_state_tick(&restart, &ops, true, 2, 21000);
+	CHECK(!restart.yielded[node] && f.attempts[node] == attempts + 1 && f.writes[node] == writes + 1);
+	CHECK(restart.journal.nodes[node].applied_valid && !restart.journal.nodes[node].pending_valid);
+	CHECK(!strcmp(restart.journal.nodes[node].original, crash.nodes[node].original));
+	CHECK(!strcmp(f.node[node], node == CTND_NODE_ENABLE ? "1" : pending ? "Changed Render" : "Game Render"));
+	CHECK(ctnd_state_shutdown(&restart, &ops));
+	CHECK(!ctnd_state_has_debt(&restart) && !f.disk.nodes[node].owed);
+	CHECK(!strcmp(f.node[node], crash.nodes[node].original));
+}
+
+static void recovery_pending_original(enum ctnd_node node)
+{
+	struct fake f;
+	struct ctnd_state s, restart;
+	struct ctnd_ops ops;
+	struct ctnd_journal crash;
+
+	setup(&f, &s, &ops, node == CTND_NODE_ENABLE);
+	if (node == CTND_NODE_ENABLE) config(&f, "{\"ctb\":1}");
+	f.write_fail[node] = 1;
+	ctnd_state_tick(&s, &ops, true, 1, 0);
+	crash = f.disk;
+	CHECK(crash.nodes[node].owed && crash.nodes[node].pending_valid && !crash.nodes[node].applied_valid);
+	CHECK(!strcmp(f.node[node], crash.nodes[node].original) && f.writes[node] == 0);
+	ctnd_state_init(&restart, node == CTND_NODE_ENABLE, 5000, &crash);
+	ctnd_state_tick(&restart, &ops, true, 1, 10000);
+	CHECK(!restart.recovering && !restart.yielded[node] && restart.pid == 1);
+	CHECK(f.attempts[node] == 2 && f.writes[node] == 1);
+	CHECK(restart.journal.nodes[node].applied_valid && !restart.journal.nodes[node].pending_valid);
+	CHECK(!strcmp(restart.journal.nodes[node].original, crash.nodes[node].original));
+	CHECK(!strcmp(f.node[node], node == CTND_NODE_ENABLE ? "1" : "Game Render"));
+	ctnd_state_tick(&restart, &ops, true, 1, 15000);
+	CHECK(!restart.yielded[node] && f.attempts[node] == 2 && f.writes[node] == 1);
+	CHECK(ctnd_state_shutdown(&restart, &ops));
+	CHECK(!ctnd_state_has_debt(&restart) && !f.disk.nodes[node].owed);
+	CHECK(!strcmp(f.node[node], crash.nodes[node].original));
+}
+
 static void game_observations(void)
 {
 	struct fake f;
@@ -392,6 +564,15 @@ static void game_observations(void)
 
 int main(void)
 {
+	staged_save_shutdown(false);
+	staged_save_shutdown(true);
+	staged_save_retry();
+	staged_save_applied();
+	recovery_original(CTND_NODE_NAMES, false);
+	recovery_original(CTND_NODE_NAMES, true);
+	recovery_original(CTND_NODE_ENABLE, false);
+	recovery_pending_original(CTND_NODE_NAMES);
+	recovery_pending_original(CTND_NODE_ENABLE);
 	applied_and_retried();
 	restore_debt();
 	pid_debounce();

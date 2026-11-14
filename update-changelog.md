@@ -39,3 +39,22 @@
   `/data/adb/ctn_patch/action.log`；模块启用且无游戏运行时执行受控写读/恢复，
   禁用或游戏运行时自动降为只读。
 - 安装、开机、自检共用同一选择器与身份校验；zip 不再打包 LICENSE（源码仓库保留）。
+
+### 5. 发布后同版本修复（versionCode 仍为 30，附件已替换）
+
+v3.0 发布后在真机验收中发现的问题，同一版本内修复并替换 Release 附件；KO 字节不变。
+
+- **KernelSU 安装报「invalid module identity」**：BusyBox standalone ash 的
+  `command -v sh` 返回裸 `sh`，按相对名解析失败。现在要求解释器必须是可执行的
+  绝对路径，裸 applet 名称回退 `/system/bin/sh`；不放宽身份校验。
+- **daemon 恢复两处边界**：恢复日志落盘后报失败不再留虚假债务；崩溃恢复时 HAL
+  已把节点还原到原值也不再次覆盖，让权到下一游戏（pending-only 原值例外保留）。
+- **脚本安全边界**：旧版 daemon 停止必须证明旧 `.ctnd.lock` 空闲；新服务先核对
+  已加载 KO 身份再停旧 daemon；Action 保留已有停止请求、暂停后及写前复查游戏
+  空闲；失败自检的恢复记录阻止同 boot 重启；卸载清理补 `action.log`。
+- **打包身份**：打包前核对 KO 内嵌 version/profile/build_id/vermagic 与包一致，
+  拒绝带着旧 KO 的版本号改动。
+- **真机实测（157）**：和平精英按真实 COSA 配置自动下发 CTN、退到桌面自动恢复
+  原名单；内核日志窗口无 BUG／Oops／KCFI 异常。141 仍无本轮实机，包保持
+  DEVELOPMENT 标记。
+（初发布附件为 74,309 字节 `5dee8541…7a82b`，daemon `426af1b9…`；已被上表修复包替换。）

@@ -56,13 +56,13 @@ static bool restore(struct ctnd_state *s, const struct ctnd_ops *ops, enum ctnd_
 
 	if (!d->owed) return true;
 	if (!ops->read_node(ops->ctx, node, current, sizeof(current))) return false;
-	if (!strcmp(current, d->original)) return clear_debt(s, ops, node);
-	if (!is_ours(d, current)) {
-		/* HAL/user ownership wins; restoring over it would be a competing write. */
+	if (!is_ours(d, current) && (d->applied_valid || strcmp(current, d->original))) {
+		/* HAL/user ownership wins, even at original after a previous apply. */
 		s->yielded[node] = true;
 		event(ops, "node changed externally; relinquishing ownership without a write");
 		return clear_debt(s, ops, node);
 	}
+	if (!strcmp(current, d->original)) return clear_debt(s, ops, node);
 	if (!ops->write_node(ops->ctx, node, d->original)) {
 		event(ops, "node restore failed; debt will be retried");
 		return false;
@@ -130,6 +130,8 @@ static bool apply(struct ctnd_state *s, const struct ctnd_ops *ops,
 	next->pending_valid = true;
 	/* Write-ahead intent covers a crash between the syscall and the commit. */
 	if (!ops->save(ops->ctx, &staged)) {
+		/* A failed save may have published staged; re-persist our unchanged journal. */
+		s->journal_dirty = true;
 		event(ops, "cannot persist original node value; refusing to write");
 		return false;
 	}
