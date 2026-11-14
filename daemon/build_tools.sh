@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# 用 NDK 编 daemon 目录里的两个测试工具（fakepkg / fakethreads）
-#
-# 为什么单独一个脚本：这两个工具的编译参数以前只存在于历史会话里，
-# 没有落盘 —— 本机重编和 GitHub Actions（debian:13 容器）都要用同一套参数，
-# 产物才能对得上。ctnd 的编译在 daemon/build.sh，互不依赖。
-#
-# 用法：
-#   bash daemon/build_tools.sh              # 默认 NDK r26b（/opt/ndkroot）
-#   NDK=/path/to/ndk bash daemon/build_tools.sh
-set -uo pipefail
-
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+OUT="${CTN_OUT_DIR:-$HERE/../out/user}"
+while (($#)); do
+	case "$1" in
+		--out) [[ $# -ge 2 && -n "$2" ]] || { printf 'missing --out directory\n' >&2; exit 2; }; OUT="$2"; shift 2 ;;
+		*) printf 'usage: build_tools.sh [--out DIRECTORY]\n' >&2; exit 2 ;;
+	esac
+done
 NDK="${NDK:-/opt/ndkroot/android-ndk-r26b}"
 TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-API="${API:-21}"
-CC="$TOOL/aarch64-linux-android${API}-clang"
-
-[ -x "$CC" ] || { echo "!! 找不到 $CC（用 NDK=... 指定 NDK 根目录）"; exit 1; }
-
-build_one() {	# build_one <名字> <额外参数...>
-	local name="$1"; shift
-	echo "=== 编译 $name ==="
-	"$CC" -O2 -Wall -Wextra -Wno-unused-parameter \
-		-fno-strict-aliasing -Wl,--build-id=none \
-		-o "$HERE/$name" "$HERE/$name.c" "$@" 2>&1 | sed 's/^/  /'
-	local rc=${PIPESTATUS[0]}
-	[ $rc -ne 0 ] || [ ! -f "$HERE/$name" ] && { echo "!! $name 编译失败 rc=$rc"; return 1; }
-	"$TOOL/llvm-strip" "$HERE/$name"
-	ls -la "$HERE/$name" | sed 's/^/  /'
-}
-
-build_one fakepkg
-# fakethreads 开线程用 pthread，必须 -pthread
-build_one fakethreads -pthread
+if [[ -z ${CC:-} ]]; then
+	CC="$TOOL/aarch64-linux-android${API:-21}-clang"
+	STRIP="${STRIP:-$TOOL/llvm-strip}"
+else
+	STRIP="${STRIP:-strip}"
+fi
+command -v "$CC" >/dev/null || { printf 'compiler unavailable: %s\n' "$CC" >&2; exit 1; }
+command -v "$STRIP" >/dev/null || { printf 'strip unavailable: %s\n' "$STRIP" >&2; exit 1; }
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd -P)"
+[[ "$OUT" != "$HERE" ]] || { printf 'refusing to overwrite shipped test binaries\n' >&2; exit 2; }
+TMP="$(mktemp -d "$OUT/.tools.XXXXXX")"
+trap 'rm -rf -- "$TMP"' EXIT
+for name in fakepkg fakethreads; do
+	EXTRA=()
+	[[ "$name" != fakethreads ]] || EXTRA=(-pthread)
+	"$CC" -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Werror -fPIE -pie \
+		-Wl,--build-id=none "$HERE/$name.c" "${EXTRA[@]}" -o "$TMP/$name"
+	"$STRIP" "$TMP/$name"
+	chmod 0755 "$TMP/$name"
+done
+for name in fakepkg fakethreads; do mv -f -- "$TMP/$name" "$OUT/$name"; done
+printf 'Built test tools in %s\n' "$OUT"

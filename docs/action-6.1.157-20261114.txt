@@ -1,0 +1,15 @@
+CTN Patch v2.2 self-check
+mode=read-only
+time=2026-11-14 14:31:32
+ctn_patch: verification mode=read-only
+ctn_patch: profile=6.1.157 kernel=6.1.157-android14-11-o-g00d81d97d759 vendor=/vendor/lib/modules/oplus_bsp_game_opt.ko package=development runtime_test=passed
+ctn_patch: FILE module=v2.2 profile=6.1.157 build_id=94992e1b3dbc223dd3a5fbbc944acdfc45286a7e23c02e2550f84fba9c163ca8 KO_SHA256=ed681189a38a39cc89673d052a0c521d386b908f22811daa1c56ca2d46012297
+ctn_patch: FILE daemon_SHA256=9cbbaf1759fc8a3203012a13a3a6c3f8c157c287d982b7628538fa07b418a38c (not a running-version claim)
+ctn_patch: RUNNING module=not_loaded
+ctn_patch: RUNNING current daemon=not_verified (stale/unrelated PIDs are ignored)
+ctn_patch: MODULE disabled/removing; its flags are unchanged
+ctn_patch: Static checks only: no loading, node writes, new threads, PID signals, log writes, or enable changes.
+ctn_patch: No runtime exercise was performed; a matching on-disk file is not proof of a running new version.
+
+SELF_CHECK_EXIT=0
+日志位置：/data/adb/ctn_patch/action.log

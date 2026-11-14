@@ -1,0 +1,160 @@
+{
+  "schema": 1,
+  "id": "6.1.157",
+  "kernel_version": "6.1.157",
+  "arch": "aarch64",
+  "page_size": 4096,
+  "runtime_releases": [
+    "6.1.157-android14-11-o-g00d81d97d759"
+  ],
+  "vendor": {
+    "name": "oplus_bsp_game_opt",
+    "paths": [
+      "/vendor/lib/modules/oplus_bsp_game_opt.ko",
+      "/vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko"
+    ],
+    "sha256": [
+      "9e414d8e4d9a1ca5f12d70ae1b40ce1503d27e9138a1f79737d1c2388fb333a9"
+    ],
+    "vermagic": "6.1.157-android14-11-o-g09754c943022 SMP preempt mod_unload modversions aarch64"
+  },
+  "native_node": false,
+  "device": {
+    "model": "PJX110",
+    "firmware": "PJX110_17.0.1.201(CN01)"
+  },
+  "abi": {
+    "structures": {
+      "module": {
+        "size": 1088,
+        "members": {
+          "state": 0,
+          "list": 8,
+          "name": 24,
+          "init": 368,
+          "core_layout": 384,
+          "init_layout": 464,
+          "kallsyms": 704,
+          "core_kallsyms": 712,
+          "btf_data": 848,
+          "exit": 984,
+          "refcnt": 992
+        }
+      },
+      "module_layout": {
+        "size": 80,
+        "members": {
+          "base": 0,
+          "size": 8,
+          "text_size": 12,
+          "ro_size": 16,
+          "ro_after_init_size": 20
+        }
+      },
+      "mod_kallsyms": {
+        "size": 32,
+        "members": {
+          "symtab": 0,
+          "num_symtab": 8,
+          "strtab": 16,
+          "typetab": 24
+        }
+      },
+      "task_struct": {
+        "size": 4800,
+        "members": {
+          "comm": 2120,
+          "pid": 1584,
+          "tgid": 1588
+        }
+      }
+    },
+    "vendor_symbols": {
+      "critical_task": {
+        "size": 16,
+        "section": ".rodata"
+      },
+      "critical_heavy_boost_dir": {
+        "size": 8,
+        "section": ".bss"
+      },
+      "related_threads": {
+        "size": 6144,
+        "section": ".bss"
+      },
+      "total_num": {
+        "size": 4,
+        "section": ".bss"
+      },
+      "have_valid_render_pid": {
+        "size": 4,
+        "section": ".bss"
+      },
+      "rt_info_rwlock": {
+        "size": 8,
+        "section": ".bss"
+      }
+    },
+    "kcfi": {
+      "ct_enable_proc_read": "0xe866e2f4",
+      "ct_enable_proc_write": "0x9a660ea0",
+      "init_module": "0x36b1c5a6",
+      "cleanup_module": "0xa540670c"
+    },
+    "module_layout_crc": "0xea759d7f",
+    "required_sections": [
+      ".modinfo",
+      ".gnu.linkonce.this_module",
+      "__versions",
+      ".init.eh_frame",
+      ".note.Linux"
+    ],
+    "pid_source_verified": true,
+    "name_readers_rcu_verified": true,
+    "dynamic_kcfi_policy": "Verify each live function type before first indirect call; no static approval switch.",
+    "reader_evidence": {
+      "function_hashes": {
+        "update_critical_task_time": "26263a33af290ec1ad6dbc6555cdf18a114a2e7e71e938e47cfcd078b80fa8bc",
+        "get_critical_task_state": "65ebf333612f5590305754141b8792b03b35e6dab1451a3d2d0e12674824f271",
+        "rt_info_proc_write": "7b7853f1d5bdd56d984e0c541ca3e589540bf69ee516b3ad1e4be9b18385d539"
+      },
+      "analysis_sha256": "1b8be400f27640a62d2a289c7616c5dfc641c512366eba241605ceeaa85050cf",
+      "name_reader": "critical_task relocations resolve only to update_critical_task_time, called by registered sched_switch callback",
+      "rcu_basis": "tracepoint.h __DO_TRACE preempt-disabled section; Linux >=5.0 synchronize_rcu waits for this section",
+      "pid_policy": "rwlock-protected entries plus RCU task lookup and task pointer/PID identity; no direct vendor stale-task dereference"
+    }
+  },
+  "source": {
+    "status": "reference",
+    "repo": "https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8650",
+    "commit": "7a7ae28e849b0f9b42b8b6fc26feebe1864bf7ac",
+    "modules_repo": "https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650",
+    "modules_commit": "dda73f7205501c09f7d0f48fd5f6d7f4b2220ca7",
+    "archive_sha256": "785edfcdfed8d6ef12386a3f0664bec27bbb4d96946bb703728ea2ff68b83919",
+    "note": "Official SM8650 13R reference source; not claimed to be exact PJX110 OEM source. Device config/CRC/BTF remain authoritative.",
+    "modules_archive_sha256": "87e67bac8358e01c4f8852f5848e135e09030a5d2672ee4f239ee15ad9b772ce"
+  },
+  "files": {
+    "config": {
+      "path": "kernel.config",
+      "sha256": "f97b33d442e7a730e6ee81be9366f8ababba7d55b9ac7093353768218bde06b5"
+    },
+    "symvers": {
+      "path": "Module.symvers",
+      "sha256": "beb7698540f61a5356401f82f744bf2ae1f05c80c95c0400a592f9b1a2527bea"
+    }
+  },
+  "evidence": {
+    "vendor_sha256": "9e414d8e4d9a1ca5f12d70ae1b40ce1503d27e9138a1f79737d1c2388fb333a9",
+    "btf_sha256": "0046d06e8dca121f4daabb67f073db89175b7c7c334975c74924000689f7944d",
+    "config_source_sha256": "26dd4810b505aaecf56095a5b4d0b605df5166c32efb481ecc53a30307df86a2",
+    "module_count": 386,
+    "crc_count": 3765,
+    "skipped_module_count": 47
+  },
+  "validation": {
+    "baseline": "captured",
+    "build": "not_tested",
+    "runtime": "not_tested"
+  }
+}

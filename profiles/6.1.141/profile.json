@@ -1,0 +1,159 @@
+{
+  "schema": 1,
+  "id": "6.1.141",
+  "kernel_version": "6.1.141",
+  "arch": "aarch64",
+  "page_size": 4096,
+  "runtime_releases": [
+    "6.1.141-android14-11-o-gd2a6093d5589"
+  ],
+  "vendor": {
+    "name": "oplus_bsp_game_opt",
+    "paths": [
+      "/vendor/lib/modules/oplus_bsp_game_opt.ko",
+      "/vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko"
+    ],
+    "sha256": [
+      "addda8f97c222c6d24e3fcceebfbbacdba2732cb83503b9dbeeb8f48c338552f"
+    ],
+    "vermagic": "6.1.141-android14-11-o-gdc1b6a03413f SMP preempt mod_unload modversions aarch64"
+  },
+  "native_node": false,
+  "device": {
+    "model": "PJX110",
+    "firmware": "PJX110_16.0.5.701(CN01)"
+  },
+  "abi": {
+    "structures": {
+      "module": {
+        "size": 1088,
+        "members": {
+          "state": 0,
+          "list": 8,
+          "name": 24,
+          "init": 368,
+          "core_layout": 384,
+          "init_layout": 464,
+          "kallsyms": 704,
+          "core_kallsyms": 712,
+          "btf_data": 848,
+          "exit": 984,
+          "refcnt": 992
+        }
+      },
+      "module_layout": {
+        "size": 80,
+        "members": {
+          "base": 0,
+          "size": 8,
+          "text_size": 12,
+          "ro_size": 16,
+          "ro_after_init_size": 20
+        }
+      },
+      "mod_kallsyms": {
+        "size": 32,
+        "members": {
+          "symtab": 0,
+          "num_symtab": 8,
+          "strtab": 16,
+          "typetab": 24
+        }
+      },
+      "task_struct": {
+        "size": 4800,
+        "members": {
+          "comm": 2120,
+          "pid": 1584,
+          "tgid": 1588
+        }
+      }
+    },
+    "vendor_symbols": {
+      "critical_task": {
+        "size": 16,
+        "section": ".rodata"
+      },
+      "critical_heavy_boost_dir": {
+        "size": 8,
+        "section": ".bss"
+      },
+      "related_threads": {
+        "size": 6144,
+        "section": ".bss"
+      },
+      "total_num": {
+        "size": 4,
+        "section": ".bss"
+      },
+      "have_valid_render_pid": {
+        "size": 4,
+        "section": ".bss"
+      },
+      "rt_info_rwlock": {
+        "size": 8,
+        "section": ".bss"
+      }
+    },
+    "kcfi": {
+      "ct_enable_proc_read": "0xe866e2f4",
+      "ct_enable_proc_write": "0x9a660ea0",
+      "init_module": "0x36b1c5a6",
+      "cleanup_module": "0xa540670c"
+    },
+    "module_layout_crc": "0xea759d7f",
+    "required_sections": [
+      ".modinfo",
+      ".gnu.linkonce.this_module",
+      "__versions",
+      ".init.eh_frame",
+      ".note.Linux"
+    ],
+    "pid_source_verified": true,
+    "name_readers_rcu_verified": true,
+    "dynamic_kcfi_policy": "Verify each live function type before first indirect call; no static approval switch.",
+    "reader_evidence": {
+      "function_hashes": {
+        "update_critical_task_time": "26263a33af290ec1ad6dbc6555cdf18a114a2e7e71e938e47cfcd078b80fa8bc",
+        "get_critical_task_state": "65ebf333612f5590305754141b8792b03b35e6dab1451a3d2d0e12674824f271",
+        "rt_info_proc_write": "7b7853f1d5bdd56d984e0c541ca3e589540bf69ee516b3ad1e4be9b18385d539"
+      },
+      "analysis_sha256": "2e8c41ebe2209d4aa2f1c06ffbce42c7c7525398ba285d63921bcabcc8a7cbf9",
+      "name_reader": "critical_task relocations resolve only to update_critical_task_time, called by registered sched_switch callback",
+      "rcu_basis": "tracepoint.h __DO_TRACE preempt-disabled section; Linux >=5.0 synchronize_rcu waits for this section",
+      "pid_policy": "rwlock-protected entries plus RCU task lookup and task pointer/PID identity; no direct vendor stale-task dereference"
+    }
+  },
+  "source": {
+    "status": "reference",
+    "repo": "https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650",
+    "commit": "3ce62e9b9534b4cac64300b91a7ead2b0deda495",
+    "modules_repo": "https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650",
+    "modules_commit": "a7ab73a78d71452a1f3bd4c04e2f8aa9ea4ea014",
+    "archive_sha256": "e8b032f6c493c41480c8a78a6051f855b8d097ea965aab5d1d9c81d447b3c02f",
+    "modules_archive_sha256": "a0bfec0b309c8cf62ca01159939831005f3a324a6158cac3a664fc651cba5e5f"
+  },
+  "files": {
+    "config": {
+      "path": "kernel.config",
+      "sha256": "95b7940182d4141c36e1872623005fff883837b10b1c9b9deae2d96c12b5b532"
+    },
+    "symvers": {
+      "path": "Module.symvers",
+      "sha256": "ae0fdb8360bb88c5c80bf29173ff0ec1c4b0263ba090a286506580084113e384"
+    }
+  },
+  "evidence": {
+    "vendor_sha256": "addda8f97c222c6d24e3fcceebfbbacdba2732cb83503b9dbeeb8f48c338552f",
+    "btf_sha256": "a86cf0aa22e5607cd8ff7607a5ee1955d2e7ece5223b474d211d34df8708bee4",
+    "config_source_sha256": "95b7940182d4141c36e1872623005fff883837b10b1c9b9deae2d96c12b5b532",
+    "module_count": 386,
+    "crc_count": 3768,
+    "skipped_module_count": 46
+  },
+  "validation": {
+    "baseline": "captured",
+    "build": "not_tested",
+    "runtime": "not_tested"
+  }
+}

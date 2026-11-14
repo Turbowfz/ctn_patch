@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "result": "passed",
+  "profile_id": "6.1.157",
+  "mode": "read-only",
+  "log_path": "/data/adb/ctn_patch/action.log",
+  "self_check_exit": 0,
+  "log_sha256": "8a00d0f69d2a865605855c4daffc333d8f35848581441749559df084a0c2758c",
+  "log_permissions": "0600",
+  "original_module_disabled": true,
+  "module_loaded": false,
+  "scope": "Action log output on disabled temporary package; enabled write-read path verified with Debian sh/mksh mocks",
+  "game_pid_note": "Positive PID observed at test end; Action ran read-only and did not write game_pid."
+}

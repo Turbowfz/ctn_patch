@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# 外部模块构建文件（配合内核源码树使用）
+# Per-profile build copies generate kernel/ctn_profile.h; no fallback profile.
+ccflags-y += -I$(src)/kernel -include $(src)/kernel/ctn_profile.h
 obj-m += ctn_patch.o

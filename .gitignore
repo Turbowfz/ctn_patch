@@ -11,6 +11,8 @@ Module.symvers
 ctn_patch.zip
 ctn_patch_magisk.zip
 build_work/
+out/
+!profiles/*/Module.symvers
 
 # 设备抽取物（体积大、可自行从设备再抽；如需可复现构建则手动加进来）
 vmlinux.btf

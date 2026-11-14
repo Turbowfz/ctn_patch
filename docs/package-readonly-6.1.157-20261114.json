@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "mode": "read-only",
+  "profile_id": "6.1.157",
+  "result": "passed",
+  "returncode": 0,
+  "output_sha256": "5505a12699c944b792989c9cfc22ad9adc4bb0668a1da3944f764f24589604e9",
+  "loaded_module": false,
+  "started_daemon": false,
+  "note": "Default package verification only. Not installation, enabled boot, or runtime exercise."
+}

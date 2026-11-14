@@ -1,0 +1,18 @@
+PASS SQLite fixture applies to actual CTN node
+PASS original value persisted before node write
+PASS default leaves ct_enable unchanged
+PASS SQLite error retains applied names
+PASS unknown config is not interpreted as deletion
+PASS changed CTN reapplies while PID is unchanged
+PASS empty CTN restores original names
+PASS next game applies valid CTN
+PASS whitespace CTN restores original names
+PASS reapply before direct switch
+PASS direct switch to no-row game restores original names
+PASS positive PID resets exit debounce
+PASS continuous negative PID restores after 5 seconds
+PASS reapply before graceful shutdown
+PASS shutdown repays actual node restoration debt
+PASS shutdown preserves original CTN value
+PASS ct_enable still unchanged after all tests
+RESULT checks=17 failures=0 restored=1

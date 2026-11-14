@@ -1,120 +1,85 @@
-# 这是 GitHub Actions 工作流：云端一键构建 ctn_patch。
-# 想启用：把它放在 .github/workflows/build.yml 推上去即可（网页粘贴也行，
-# 不受「token 需要 workflow scope」的限制）。Actions 页 → build-ctn-patch → Run workflow，
-# 跑完在本次运行的 Artifacts 里下载 ctn_patch-ko（里面有 .ko 和 zip）。
+# SPDX-License-Identifier: GPL-2.0-only
 name: build-ctn-patch
-
 on:
   workflow_dispatch:
   push:
     paths:
       - 'ctn_patch.c'
+      - 'kernel/**'
       - 'Kbuild'
-      - 'device_kernel.config'
-      - 'Module.symvers.device'
+      - 'Makefile'
       - 'build.sh'
+      - 'build_zip.py'
+      - 'profiles/**'
       - 'daemon/**'
+      - 'magisk/**'
+      - 'verify.sh'
+      - 'tools/**'
+      - 'tests/**'
       - '.github/workflows/build.yml'
-
+permissions:
+  contents: read
 jobs:
   build:
-    # ko 在 debian:13 容器里现编 —— 与本机构建（WSL Debian 13）同一发行版，
-    # 编译器用 Debian 仓库自带的 clang-17（同 major 版本，纯本地安装，
-    # 不依赖 dl.google.com —— runner 上下载 NDK 大文件实测不可靠）。
-    # daemon 三件套（ctnd/fakethreads/fakepkg）是 Android 用户态程序，必须用
-    # NDK 的 bionic sysroot 才能编，仓库里带的是本机 Debian 13 + NDK r26b 编好的
-    # 产物 —— 打包时直接带上，所以 zip 里全部二进制都是 Debian 出的。
     runs-on: ubuntu-24.04
     container: debian:13
     timeout-minutes: 120
-
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: 取本仓库
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: 装依赖（容器里是 root，不用 sudo）
+      - name: Debian build dependencies
         run: |
-          set -o pipefail
-          {
-            apt-get update
-          apt-get install -y --no-install-recommends \
-            clang-17 lld-17 llvm-17 ca-certificates dwarves \
-            build-essential bc bison flex libssl-dev libelf-dev \
-            python3 git curl
-            echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            clang --version | head -1
-          } 2>&1 | tee /tmp/apt.log || tail -c 3800 /tmp/apt.log | python3 -c \
-            "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
-
-      - name: 下内核/modules 两个仓的 tar（codeload 内网直连，比 git clone 的 checkout 阶段稳）
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl unzip \
+            build-essential bc bison flex libssl-dev libelf-dev libsqlite3-dev \
+            dwarves python3 git util-linux mksh clang-17 llvm-17 lld-17
+      - name: Linux Android NDK r26b
         run: |
-          set -o pipefail
-          bash -exc '
-            mkdir -p "$RUNNER_TEMP/ctnwork" "$RUNNER_TEMP/ctnwork/mods"
-            curl -fL --retry 3 -o /tmp/kernel.tar.gz \
-              "https://codeload.github.com/OnePlusOSS/android_kernel_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_ace_3_pro"
-            tar -xzf /tmp/kernel.tar.gz -C "$RUNNER_TEMP/ctnwork"
-            curl -fL --retry 3 -o /tmp/mods.tar.gz \
-              "https://codeload.github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_ace_3_pro"
-            tar -xzf /tmp/mods.tar.gz -C "$RUNNER_TEMP/ctnwork/mods" --strip-components=1
-            ls "$RUNNER_TEMP/ctnwork" "$RUNNER_TEMP/ctnwork/mods/vendor"
-          ' 2>&1 | tee /tmp/src.log || {
-            tail -c 3800 /tmp/src.log | python3 -c \
-              "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
-            exit 1
-          }
-
-      - name: 编内核模块 ko（重指断链 + modules_prepare + 编译）
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/ndk-download" "$RUNNER_TEMP/ndk-extracted"
+          curl --fail --location --retry 3 --connect-timeout 30 \
+            https://dl.google.com/android/repository/android-ndk-r26b-linux.zip \
+            --output "$RUNNER_TEMP/ndk-download/archive.zip"
+          unzip -tq "$RUNNER_TEMP/ndk-download/archive.zip"
+          unzip -q "$RUNNER_TEMP/ndk-download/archive.zip" -d "$RUNNER_TEMP/ndk-extracted"
+          NDK="$RUNNER_TEMP/ndk-extracted/android-ndk-r26b"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+          printf 'NDK=%s\n' "$NDK" >> "$GITHUB_ENV"
+          printf '%s\n' "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Host regressions and sanitizers
         run: |
-          set -o pipefail
-          SRC=$(ls -d "$RUNNER_TEMP"/ctnwork/android_kernel_oneplus_sm8650-* | head -1)
-          echo "源码树: $SRC"
-          bash build.sh \
-            --srcdir "$SRC" \
-            --moddir "$RUNNER_TEMP/ctnwork/mods" \
-            --clang /usr/lib/llvm-17/bin/clang \
-            --work "$RUNNER_TEMP/ctnwork" 2>&1 | tee /tmp/ko.log || {
-            # 发版 token 没有 actions:read（日志/artifact API 全 403），
-            # 把日志尾部塞进 error 注解 —— 注解走 check-run API 匿名可读。
-            # 单条注解上限 4000 字符；base64 单行最稳（不怕换行/转义折损）
-            tail -c 2800 /tmp/ko.log | base64 -w0 | python3 -c \
-              "import sys; print('::error::ko 日志尾部(base64)=' + sys.stdin.read())"
-            exit 1
-          }
-
-      - name: 打 root 模块 zip（ko 为本次现编；daemon 用仓库内 Debian 预编译产物）
+          set -euo pipefail
+          CTND_SANITIZERS=required bash daemon/test.sh
+          python3 -I -B tests/test_packaging.py
+          CTN_TEST_SHELL=mksh python3 -I -B tests/test_packaging.py
+          python3 -I -B tests/test_profile_tools.py
+      - name: Build both verified ABI profiles from pinned official sources
         run: |
-          set -o pipefail
-          {
-            python3 build_zip.py
-            ls -la ctn_patch.ko daemon/ctnd daemon/fakethreads ctn_patch.zip
-          } 2>&1 | tee /tmp/zip.log || tail -c 3800 /tmp/zip.log | python3 -c \
-            "import sys; print('::error::' + sys.stdin.read().replace(chr(10), '%0A')[-3800:])"
-
-      - name: 汇总产物信息
-        if: success()
+          set -euo pipefail
+          for profile in 6.1.141 6.1.157; do
+            python3 -I tools/fetch_profile.py --profile "$profile" --out "$RUNNER_TEMP/source-$profile"
+            SRC=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["source"])' "$RUNNER_TEMP/source-$profile/paths.json")
+            bash build.sh --profile "$profile" --srcdir "$SRC" \
+              --work "$RUNNER_TEMP/work-$profile" \
+              --clang "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --jobs 4
+          done
+      - name: Build Android userspace from source
         run: |
-          # grep -a 在含 NUL 的二进制上 '[ -~]*' 会匹配 0 字符（GNU grep 3.11 实测），
-          # vermagic 用 python 正则抽，不受 NUL 影响
-          VERMAGIC=$(python3 -c "import re; m = re.search(rb'vermagic=([\x20-\x7e]+)', open('ctn_patch.ko','rb').read()); print(m.group(1).decode() if m else '')")
-          {
-            echo "## ctn_patch 构建结果（debian:13 + clang-17）"
-            echo
-            echo '```'
-            echo "vermagic : $VERMAGIC"
-            echo "ko       : $(stat -c%s ctn_patch.ko) 字节  sha256 $(sha256sum ctn_patch.ko | cut -d' ' -f1)"
-            echo "ctnd     : $(stat -c%s daemon/ctnd) 字节  sha256 $(sha256sum daemon/ctnd | cut -d' ' -f1)"
-            echo "zip      : $(stat -c%s ctn_patch.zip) 字节  sha256 $(sha256sum ctn_patch.zip | cut -d' ' -f1)"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 上传产物
-        if: success()
+          set -euo pipefail
+          bash daemon/build.sh
+          bash daemon/build_tools.sh
+      - name: Development package only (CI cannot certify real-device runtime)
+        run: |
+          set -euo pipefail
+          python3 -I build_zip.py --development --out "$GITHUB_WORKSPACE/out/ctn_patch-development.zip"
+          printf '%s\n' 'Both profiles passed static checks. CI performs no insmod or real-device runtime testing.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload candidates and verification reports
         uses: actions/upload-artifact@v4
         with:
-          name: ctn_patch-ko
-          path: |
-            ctn_patch.ko
-            ctn_patch.zip
+          name: ctn_patch-debian-development
+          path: out/
           if-no-files-found: error

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "profile_id": "6.1.157",
+  "result": "passed",
+  "checks_passed": 17,
+  "checks_failed": 0,
+  "module_sha256": "ed681189a38a39cc89673d052a0c521d386b908f22811daa1c56ca2d46012297",
+  "driver_sha256": "80bfdb707c6c7cea5c4534535512ca17b9ccb2f8dee740863e6d86de52cd925b",
+  "test_mode": "actual production state/db/runtime implementation, synthetic package/PID events, synthetic database, actual CTN node",
+  "game_pid_written": false,
+  "ct_enable_written": false,
+  "production_database_written": false,
+  "original_module_disabled": true,
+  "module_unloaded_after_test": true,
+  "state_result_sha256": "557c50e6afcaaa8230f73a8ebe16eee1cce07b7217b205e4e28fbafae16f80e9",
+  "dmesg_after_sha256": "b14691c65e514c6f8c008888666f0c6461ca23d109709968376c5ea905b90735",
+  "not_tested": [
+    "automatic live game detection on device",
+    "real game scheduling benefit",
+    "141 runtime",
+    "module installation and reboot"
+  ]
+}

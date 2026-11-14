@@ -1,673 +1,163 @@
-# ctn_patch
+# CTNP / CTN Patch
 
-给一加 8Gen3 / 6.1 内核补回 `/proc/game_opt/task_boost/critical_task_name`
-可写节点，并自动按云控配置为每个游戏填入关键线程名。
+为已核验的一加 SM8650（8 Gen 3）6.1 内核补出
+`/proc/game_opt/task_boost/critical_task_name`，由 `ctnd` 从 COSA 数据库读取
+`game_config.ctn` 后应用。没有本地 CTN 覆盖文件，也不读取 `from_server`。
 
-作者：Turbo ｜ 许可：GPL-2.0-only
+模块 ID 保持 `ctn_patch`，当前版本 `v3.0 / versionCode 30`。v3.0 适配
+Android 17 的 6.1.157 内核，保留 6.1.141 兼容；旧版 `v2.2 / versionCode 22`
+仅面向 6.1.141，已停更但 Release 继续保留可下载。
 
-**已在真机验证**：一加 Ace 3 Pro / PJX110 / 16.0.5.701 / 内核
-`6.1.141-android14-11-o-gd2a6093d5589` / KernelSU。
+## 当前验证范围
 
----
+| 基线 | 设备/固件来源 | 静态验证 | 本轮真机验证 |
+|---|---|---|---|
+| 6.1.141 | PJX110，保存的 16.0.5.701 手机提取物 | 构建、vermagic、CRC、KCFI、布局通过 | 未测试；旧版本测试不能替代本次 KO 测试 |
+| 6.1.157 | PJX110，17.0.1.201 手机提取物 | 构建、vermagic、CRC、KCFI、布局通过 | 临时 KO 加载、名字写读、输入拒绝、恢复和卸载通过；无游戏时真实 PID 样本跳过 |
 
-## 一、为什么需要它
+“兼容 141/157”不代表所有机型和所有同版本固件都自动兼容。安装与开机选择器还会
+核对完整内核 release、厂商模块文件身份和包内文件哈希。未知基线拒绝加载，不轮流
+试两份 KO。当前未批准原生节点的 daemon-only 模式。
 
-一加 8Gen3 的 6.1 内核里，`oplus_bsp_game_opt.ko` 把关键线程名单**写死**成
-`UnityMain` / `UnityGfxDevice`，6.6 才做成可写节点。这带来两个问题，要分两步解决：
+## 原始方案与重写边界
 
-1. **节点不存在** → 外部内核模块补出来（`ctn_patch.ko`）
-2. **没人写它** → 一加 6.1 的 gameopt HAL 走的是 sched_assist 那条路
-   （`GameoptIoctl` 的 ioctl + `pipeline_pids_cpus`），**从没碰过内核的
-   `critical_task[]`**（HAL 二进制里 `critical_task_name` 出现 0 次）。
-   所以还得有个 daemon 去写（`ctnd`）
+最初的内核方案来自用户提供的 `ctb_name_patch.c`：
 
-只装内核模块的话，节点永远停在默认值 —— 这对 Unity 游戏刚好合适，
-但对**虚幻引擎游戏**（`GameThread` / `RenderThread`）完全没用。
+- 旧 `critical_task` 是只读段里的两指针数组，不是新版的内联字符数组。
+- 通过 `vmap` 创建同一物理页的可写别名，发布名字指针。
+- 双缓冲配合 `synchronize_rcu()` 后复用；卸载先排空 proc 回调，再还原指针。
 
-## 二、组成
+重写保留上述核心，不新增调度、频率或热控功能。补充目标模块引用保护、精确的
+对象大小/内存区域校验、动态函数 KCFI 检验，以及安全的 PID 身份查询。不能核实
+PID 数据源时只显示 `-1`，不裸读厂商可能失效的 task 指针。
 
-| 部分 | 作用 |
-|---|---|
-| `ctn_patch.ko` | 外部 LKM，补出可写节点 |
-| `ctnd` | 用户态 daemon，按云控配置自动写节点 |
-| `ctn_patch.zip` | Magisk / KernelSU 刷入包（含上面全部） |
+## 输入与读取
 
-## 三、安装
+节点接受一到两个名字，以空白分隔；单名复制到两槽。每个名字最多 99 字节。
+第三个名字、全空白、嵌入 NUL、越界长度或非零写偏移拒绝。
 
-Magisk / KernelSU / APatch → 模块 → 从存储安装 → 选 `ctn_patch.zip` → 重启。
-
-刷入时会做 9 组兼容性检查，不满足直接拒绝安装（见第七节）。
-
-重启后确认：
-
-```bash
-cat /data/adb/modules/ctn_patch/boot.log     # 模块加载 + daemon 启动
-cat /data/adb/modules/ctn_patch/daemon.log   # daemon 干活记录
+```sh
+# 以下会改节点；仅在匹配的已验证模块上手动调试时使用。
+printf '%s\n' 'GameThread RenderThread' > /proc/game_opt/task_boost/critical_task_name
 cat /proc/game_opt/task_boost/critical_task_name
+# 例：GameThread:1234,RenderThread:1235；没有已注册匹配线程则为 -1。
 ```
 
+两个槽记录同一线程不产生双倍加成。99 字节是接口上限；task 的 comm 最多
+15 个名字字节，因此更长的名字不能匹配真实线程。
 
-### 3.1 自检（管理器里的「操作 / Action」按钮）
+## 数据库和恢复行为
 
-装了之后，在 Magisk / KernelSU 的模块页点**操作**按钮，它会重载模块 + 重启
-daemon + 跑一遍完整自检，结果写进 `action.log`。输出是**一项一行**：
+源数据库全程只读。默认候选是 COSA 的 `db_game_database`；`-d` 指定路径时不回退
+到真实库，方便隔离测试。数据库和存在的 WAL 要完整复制到私有临时快照，前后
+文件身份、尺寸、精细时间和 WAL 状态一致才使用；失败保持节点状态。
 
-```
-ctn_patch 自检  v2.1
-  机型 PJX110 / pineapple ｜ 内核 6.1.141-... ｜ 页 4096 ｜ SELinux Enforcing
-
-[OK]  模块文件      ko 34800B ｜ ctnd 20008B 0755 ELF
-[OK]  厂商模块      sha256 与构建时一致
-[OK]  vermagic      6.1.141-android14-11-o
-[OK]  insmod        成功，oplus_bsp_game_opt refcount 1→2（已钉住）
-[OK]  节点          -rw-rw-r-- root root
-[OK]  读格式        [UnityMain:-1,UnityGfxDevice:-1]
-[OK]  写入读回      正确
-[OK]  反复写        8/8 正确（双缓冲/RCU 路径）
-[OK]  边界输入      单名接受(补成两槽)/16字符 接受；三名/120字符/全空白 被拒
-[OK]  恢复默认值    UnityMain/UnityGfxDevice
-[OK]  dmesg 异常    本次无 BUG/WARNING/oops/CFI failure
-[OK]  卸载          rmmod 后节点已消失，refcount 还原
-  --- 恢复运行状态 ---
-    模块已重新加载
-    daemon 已拉起
-[OK]  daemon        ctnd 2.1 运行中（pid 24937）
-[OK]  daemon 依赖    sqlite=ok cosa库=ok
-[OK]  daemon 日志   近 200 行无失败记录
-------------------------------------------------
-结果: 15 项全过
-```
-
-三档标记，一眼能扫：
-
-| 标记 | 含义 |
+| 情况 | 行为 |
 |---|---|
-| `[OK]` | 通过 |
-| `[!!]` | **失败 —— 失败时才会在下面缩进打印细节** |
-| `[--]` | 跳过 / 备注（没条件测，或不算失败的情况） |
+| 查询到合法非空 CTN | 规范化并写节点，写成功后才提交应用状态 |
+| 游戏运行中 CTN 变化 | 默认每 30 秒复查，变化后下发 |
+| 明确移除、空串或纯空白 CTN | 撤销本次仍拥有的应用，恢复原值 |
+| 直接切换到无 CTN 游戏 | 撤销前一个游戏的应用 |
+| 库、SQL 或解析失败 | 不当作删除；保持现状，按重试周期再查 |
+| 写入/恢复失败 | 保留未完成状态和恢复债务，不能假报成功 |
+| 正常退出、停止或同次启动崩溃后重启 | 对仍由 daemon 拥有的节点偿还恢复债务 |
+| HAL/用户已另写节点 | 让出所有权，不覆盖其新值 |
 
-脚本退出码 = 失败项数（0 = 全过），可以直接被脚本调用。
+轮询为 800ms，连续负 PID 约 5 秒才认定退出；正 PID 和未知读数会中断负 PID
+计时。缓存指纹按包保存，避免其它游戏查询把旧缓存伪装成新缓存。
 
-**它自己负责模块的加载和卸载**，所以别先手动 `insmod` —— 那样「insmod」和
-「卸载」两项就只能跳过。`action.sh` 会先 `rmmod` 再调它，所以走按钮永远是
-完整测试。
+默认只管理 CTN，不额外开启 CTB。保留调试 CLI：
 
-压测单独有 `tools/stress_node.sh`（写读几千次，专压双缓冲/RCU 那条路）：
-
-```bash
-adb push tools/stress_node.sh /data/local/tmp/
-adb shell su -c 'sh /data/local/tmp/stress_node.sh 2000'
+```sh
+bin/ctnd -V
+bin/ctnd -h
+bin/ctnd -d /absolute/path/to/test.db -r 5
+# -e 仅显式选用：独立按 ctb 管 ct_enable，并让 HAL/外部写入优先。
 ```
 
-## 四、用法
+没有 `ctn.conf` 或 `ctnd.conf`。运行目录 `/data/adb/ctn_patch` 下的
+`restore.state` 是程序内部的原值/恢复债务日志，绑定 boot ID，不是可编辑配置。
 
-节点接受**一到两个名字**，空格分隔（制表符、换行也行；只填一个时第二槽自动补成同名，见下表）：
+## 源码与安装结构
 
-```bash
-echo "名字1 名字2" > /proc/game_opt/task_boost/critical_task_name
-cat /proc/game_opt/task_boost/critical_task_name
-# 名字1:-1,名字2:-1
+```text
+ctn_patch.c / kernel/       内核源码及实际输入解析器
+profiles/6.1.141/           141 独立配置、CRC 和证据描述
+profiles/6.1.157/           157 独立配置、CRC 和证据描述
+daemon/                    数据库、解析、状态机、运行文件及测试源码
+magisk/                    安装、启停、卸载与公共选择器源码
+tools/                     固定源码获取、ABI 解析、构建及核验
+tests/                     安装/打包/构建工具回归
+out/                       构建产物和逐项报告，不入 Git
 ```
 
-读回格式是官方 6.6 的 `名字:pid,名字:pid`。**pid 是真实值**（v2.1 起）：
-模块会去 6.1 自己的 `related_threads[]`（游戏运行时 HAL 登记的相关线程）里按名字
-找对应线程，匹配规则与 6.6 的 `find_critical_task_pid()` 一致。没有游戏在跑、
-或名字匹配不到线程时显示 `-1`（和 6.6 写入后的初始值一样）。
+安装包根目录是管理器脚本和 `module.prop`；可执行 daemon 在 `bin/ctnd`，
+公共脚本在 `lib/common.sh`，两套 KO 与清单在 `kernels/<版本>/`。
+运行锁、PID、日志与内部债务放在独立 runtime，避免升级目录变化。
+禁用/删除标记不被自检或开机脚本解除。
 
-| 输入 | 结果 |
-|---|---|
-| `A B` / `A    B` / `A<TAB>B` | 接受 |
-| `A`（只填一个） | **接受**，第二槽自动补成同名 → `A:-1,A:-1` |
-| `A B C`（三个） | 拒绝 `-EINVAL` |
-| 全是空白（如一个空格） | 拒绝 `-EINVAL` |
-| `write(fd, buf, 0)` | 拒绝 `-E2BIG`（注意 `: > 节点` 这类 shell 写法压根不产生 write 调用，是空操作，不是被接受） |
-| 99 字符 | 接受（接口上限，与官方 `%99s` 一致） |
+包内不放测试库、构建工具、conf 或独立 LICENSE 文件。源码保留 GPL-2.0-only
+许可证全文和 SPDX；内核的 `MODULE_LICENSE("GPL")` 不能去掉。
 
-**写入是整体替换**，不保留原值。想留着 Unity 默认名就自己带上：
-`echo "UnityMain MyGameMain" > ...`
+## Debian 构建与检验
 
-**只盯一个线程**：直接 `echo "A" > ...` 就行。两个槽记同一线程、同一 CPU，
-等价于只填一个，不会双倍加成。
+使用现有 **WSL Debian 13**；无需重装发行版。编译工具优先使用已装的 Linux
+NDK r26b（Clang 17.0.2），最终以产物 ABI 核验为准。构建目录每轮独立，不写源码
+根目录中的旧发布二进制。
 
-**名字建议 ≤15 字符**：接口放到 99 是为了跟官方对齐，但内核比对用的是
-`strncmp(task->comm, name, strlen(name))`，而 `task->comm` 只有 16 字节（含 NUL），
-超过 15 字符的名字永远匹配不到（不会越界，只是白填）。
+```sh
+# Debian 原生编译器、真实解析/状态/SQLite/进程回归及 sanitizers。
+bash daemon/test.sh
+python3 -I -B tests/test_packaging.py
+python3 -I -B tests/test_profile_tools.py
 
-装好 daemon 后通常不用手动写 —— 它会在游戏启动时自动填。
+# 已准备好固定源码时，明确选 profile。
+bash build.sh --profile 6.1.157 --srcdir /path/to/pinned/kernel \
+  --work /path/to/new-work --clang /path/to/linux-ndk/bin/clang --jobs 4
 
-## 五、原理
+# 自动取固定的 OnePlusOSS 源码与 modules，验证归档哈希，安全解包。
+python3 -I tools/fetch_profile.py --profile 6.1.157 --out /path/to/new-source-download
 
-### 5.1 内核模块
-
-6.1 的名单是 `const char* critical_task[2]`，**数组在只读段**，直接写会触发内核
-写保护异常。所以：
-
-- `kprobe` 取 `kallsyms_lookup_name`，按 `模块名:符号名` 查
-  `oplus_bsp_game_opt:critical_task` 和 `...:critical_heavy_boost_dir`
-- `vmap(&page, 1, VM_MAP, PAGE_KERNEL)` 建**可写别名**，只通过别名改数组内容
-- **双缓冲 + `synchronize_rcu()`** 换指针：读者是 `sched_switch` tracepoint 里的
-  `update_critical_task_time()`，6.1 的 `__DO_TRACE` 用
-  `rcu_read_lock_sched_notrace()` 包住回调，所以 `synchronize_rcu()` 等得到它
-- `find_module()` + `try_module_get()` **钉住目标模块**，防止它先被 `rmmod`
-  导致手里的符号变野指针
-
-布局守卫：6.6 的 `critical_task` 是内联 `char[2][100]`，用「上半区指针」判断
-把它拒掉（`-EINVAL`），避免把新内核改坏。
-
-### 5.2 daemon
-
-```
-轮询 /proc/game_opt/game_pid (800ms)
-  │  HAL 在游戏启动时写 pid、退出写 -1
-  └ pid 由 -1 变正数
-      ├ 读 /proc/<pid>/cmdline 取包名
-      ├ 查云控库：
-      │     命中缓存且库指纹没变 → 直接用（不碰库）
-      │     否则拷 db + -wal 到临时目录，SQLite 查该包的 game_config
-      │       库: /data/user/0/com.oplus.cosa/databases/db_game_database
-      ├ 有 ctn（明文 JSON 或 base64 编码的 JSON）→ **写节点**（唯一会写的情况）
-      ├ 有配置无 ctn（Unity 游戏）  → **不碰节点**，只记日志
-      ├ 库里没这个包（OPLUS 不认识）→ **不碰节点**
-      ├ 配置是加密/未知形态        → **不碰节点**，只记日志
-      └ 读库失败                  → **不碰节点**
-  └ pid 连续 6 次（约 5 秒）为 -1 → 恢复默认名字
+# 全部用户态程序也在 Debian 从源码构建。
+bash daemon/build.sh
+bash daemon/build_tools.sh
 ```
 
-`game_config` 里的 **`ctn`** 就是官方给的关键线程名，格式与节点完全一致：
+141 参考源码是 OnePlusOSS `android_kernel_oneplus_sm8650` 固定提交
+`3ce62e9b9534b4cac64300b91a7ead2b0deda495`；157 参考源码是官方
+`android_kernel_common_oneplus_sm8650` 固定提交
+`7a7ae28e849b0f9b42b8b6fc26feebe1864bf7ac`，实际 Makefile 为 6.1.157。
+后者来自 SM8650 13R 分支，**不声称是 PJX110 当前 OEM 内核的精确源码**。
+手机提取的配置、CRC、BTF 和厂商函数证据才是适配基线。
 
-| 包 | `ctn` | 引擎 |
-|---|---|---|
-| `com.tencent.tmgp.pubgmhd` | `RenderThread Thread-` | 虚幻 |
-| `com.hottagames.yh.laohu` / `dfm` / `mingchao` / `codev` | `GameThread RenderThread` | 虚幻 |
-| `com.miHoYo.Nap` 等 | 无 `ctn` | Unity → 用内核默认值 |
+逐项报告 `verification.json` 绑定原始 profile 字节、KO 哈希、编译器与 build ID。
+静态通过包括完整 vermagic、每个导入 CRC、回调 KCFI、真实结构布局及必要 ELF
+段。动态函数在第一次间接调用前再核对现机 KCFI，失败直接拒绝。
 
-Unity 游戏没有 `ctn`，因为内核默认的 `UnityMain` / `UnityGfxDevice` 正好就是
-它们的线程名 —— 这也说明 `ctn` 就是为「非 Unity 游戏」准备的。
+CI 的 Debian 容器从源码构建两套 KO 和用户态程序，先跑回归测试，只输出标明
+未实机测试的开发候选。更新后的 CI 本轮未推送、未云端运行，不能称云端通过。
 
-实现上的几个必要选择：
+## 打包与设备测试
 
-| 点 | 做法 | 原因 |
-|---|---|---|
-| 读 SQLite | `dlopen("/system/lib64/libsqlite.so")` | 平台私有库，NDK 没 stub；各机型路径不同，dlopen 好回退 |
-| 库是 WAL 模式 | 拷 db + -wal 再读（**不拷 -shm**） | 直接开原库会动它的 -shm；-shm 是 COSA 正在 mmap 的共享内存，拷它既没必要（SQLite 会重建）也可能拷到撕裂内容 |
-| 配置缓存 | 按包名缓存 64 条，比对库指纹 | 同一个包反复启停只解析一次，省掉重复拷贝 600KB 库 |
-| 库指纹 | db/-wal 的 `mtime+size+inode` 哈希 | 库没变就整段跳过拷贝和解析 |
-| JSON 解析 | 手写取值器 | `game_config` 是扁平 JSON，省一个依赖 |
-| `ctn` 字符串 / `ctb` 数字 | 两个取值器 | 混用会取不到 `ctb` |
-| base64 编码 | 自带解码器（含无填充残余处理） | 云控可能下发编码过的 JSON，省掉 libcrypto 依赖 |
-| 退出防抖 | 连续 6 次 -1 才算退出 | 加载期 `game_pid` 会反复抖好几秒 |
-| 单实例 | `flock` 锁文件 | 防止被两条路径重复拉起 |
-| 库路径 | 内置多候选 + `--db <路径>` 覆盖 | 换机型/换 OPLUS 版本时库不在候选列表里，留个出口 |
-
-### 5.3 云控配置的三种形态，daemon 怎么处理
-
-云控库 `game_config` 这一列的内容**不一定是明文 JSON**。daemon 按下面顺序判定：
-
-| 形态 | 判别 | 处理 |
-|---|---|---|
-| 明文 JSON | 串里有 `{` | 直接取 `ctn` / `ctb` |
-| base64 编码的 JSON | 不含 `{`，但能完整 base64 解码 | 先解码，再在解码结果里取 |
-| 加密 / 未知 | 上面两条都不成立 | **不硬猜也不写节点**：只记日志说明读不出来，内核保持原样 |
-
-> 判定用「有没有 `{`」是因为 base64 字符集里不含 `{`，这个判别很稳，不需要猜。
-> 实测本机 84 条官方配置**全部是明文 JSON**，加密形态目前没出现过 —— 留这条
-> 分支是为了「不管云控怎么下发，注入这条路都走得通」。
-
-### 5.4 「没有配置就不碰节点」—— v2.0 的行为约定
-
-这是本版最重要的一条，也是为功耗问题定的：**daemon 只在云控里真拿到 `ctn`
-时才写节点；拿不到就完全不碰**。
-
-| 云控里的情况 | 旧版（≤v1.9） | 现在（v2.0） |
-|---|---|---|
-| 有 `ctn` | 写进去 | **写进去**（唯一会写的情况） |
-| 有配置但没 `ctn`（Unity 游戏） | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-| 库里没有这个游戏 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-| 配置是加密/未知形态 | 写回 `UnityMain UnityGfxDevice` | **不碰节点** |
-
-旧版那三种「写回默认值」虽然值和内核默认一样，但等于**每启动一个游戏都去动一次
-内核**（会触发内核里的 RCU 同步换指针）。现在这些情况 daemon 对内核**零影响**。
-
-游戏退出时也不再写死回 Unity 串，而是**恢复成启动时读到的原值** —— 万一节点被
-别的工具设过，不会被覆盖掉。
-
-> v2.0 同时**移除了本地覆盖文件 `ctn.conf`**（连同 `ctn.conf.example` 和开机
-> 铺开逻辑）。指定关键线程名现在只有一条路：云控配置里的 `ctn`。
-
-### 5.5 占用与性能（真机实测，Ace 3 Pro）
-
-| 项目 | 实测值 | 说明 |
-|---|---|---|
-| **内核模块** | **27.8 KB** | 已剥掉 `.debug_*`（构建脚本里 `llvm-strip --strip-debug`，内核装模块时也是这么做的）。带调试段时是 305KB —— 装载器一个字节都用不到 |
-| **刷入包** | **117 KB** | 上面是主要贡献 |
-| daemon 常驻内存 | **3.7 MB** | 不查云控库时**根本不加载** `libsqlite.so`；单线程 |
-| daemon 磁盘 | **0** | 查完库立刻把临时副本删掉（以前会留 600KB） |
-| 空闲 CPU | **约 0.017%**（单核） | 每 800ms 读一次几十字节的 `/proc/game_opt/game_pid` |
-| 启动一个游戏 | **10 ms** CPU | 命中 TTL 缓存；第一次查库是 20ms（要拷库 + 开 SQLite） |
-| 自检（操作按钮） | **3 秒** | v2.1 之前会卡几分钟（那版在扫全系统的文件描述符） |
-
-**云控库的缓存策略**：库是 WAL 模式，`-wal` 每秒都在变，所以按「库指纹」判失效
-等于**永不命中**（旧版每个游戏每次启动都重拷 600KB + 重开一次 SQLite）。
-现在用 **TTL（600 秒）**：这段时间内直接用缓存的 `ctn`，过了才重查一次。
-代价是云控改了配置最多 10 分钟后生效 —— 重启 daemon（或重启手机）立刻生效。
-
-占用怎么量的：`daemon/measure.sh`（推到设备上 root 跑，会打出内存/CPU/磁盘）。
-
-**不做的优化**：不 `dlclose` libsqlite —— 实测 bionic 的 `dlclose` 不会真卸载
-（Android 已知行为），而且它是全系统共享库，多一个进程映射的边际成本只是页表那点。
-
-### 5.6 游戏运行中复查云控（v2.1 起）
-
-云控推配置是随时发生的，而 daemon 早期只在**游戏启动那一瞬间**查一次库：
-游戏跑着的时候云控把某个游戏的 `ctn` 改了，节点上挂的还是旧值，得杀掉游戏重开
-才生效。现在 daemon 会在游戏运行期间**每 30 秒复查一次**云控：
-
-| 复查发现 | daemon 做什么 |
-|---|---|
-| `ctn` 变了 | 重新写节点（「云控改了配置也要生效」走的就是这条） |
-| `ctn` 被移除/清空 | 恢复成启动时读到的原值 |
-| `ctb` 变了（`-e` 模式） | `ct_enable` 跟着重写 |
-| 没变化 | 一行日志都不出，也一个字节都不写 |
-| **库读不动**（拷库失败 / SQLite 打不开） | **保持现状**，什么都不动，下轮重试 |
-| 游戏直切（没写 -1 就换了 pid）且新游戏无 ctn | 撤销上一个游戏的应用、恢复原值（v2.2） |
-
-最后一行是刻意的：「查不动库」和「云控删了配置」是两回事。一次临时 IO 故障
-如果被当成后者，就会把正在加速的节点恢复成默认名，30 秒后下个周期又写回来 ——
-来回跳。所以 `lookup_cfg()` 的返回值专门区分了「查询成功」与「查不动」。
-
-复查周期可调：`ctnd -r 60`（秒，最小 5，`0` = 关掉复查回到旧行为）。
-**默认 30 秒的复查几乎不花钱**：查询带两层判定 —— 先看 TTL（600 秒）兜底，
-再看库文件的 `stat` 指纹（mtime + size，含 `-wal`）；**指纹没变就是零拷贝**
-（不拷那 600KB 库、也不开 SQLite）。指纹是**按包记的**，不是全局一个，
-否则会出现「B 包缓存于 F0 → 库变成 F1 → A 包查询把全局指纹刷成 F1 →
-B 包再启动时指纹又"相同"了 → 拿到改库前的旧缓存」这种串味。
-
-### 5.7 手动跑 ctnd（排查用）
-
-开机时由 `service.sh` 自动拉起，平时不用管。想手动跑或改行为：
-
-```bash
-/data/adb/modules/ctn_patch/ctnd -h          # 看用法
-/data/adb/modules/ctn_patch/ctnd -e          # 连 ct_enable 一起按 ctb 代管
-/data/adb/modules/ctn_patch/ctnd -d /path/to/db   # 指定云控库（换机型/库不在候选里）
-/data/adb/modules/ctn_patch/ctnd -r 60       # 复查周期改 60 秒（默认 30，0=关）
-/data/adb/modules/ctn_patch/ctnd -V          # 看版本
+```sh
+python3 -I build_zip.py --development --out /path/to/ctn_patch-development.zip
+# 正式双版本包：两份本次 KO 的实机核验都通过才允许。
+python3 -I build_zip.py --out /path/to/ctn_patch-full.zip
 ```
 
-日志全走 stderr（开机时由 `service.sh` 重定向到
-`/data/adb/modules/ctn_patch/daemon.log`）。手动跑就自己重定向到文件。
-**同时只能跑一个实例**（`flock` 锁），重复启动会打印一行然后以退出码 3 退出，
-`service.sh` 见到 3 就不再重启它 —— 所以手动调试前先
-`touch /data/adb/modules/ctn_patch/.stop` 把守护循环停掉，调完删掉哨兵。
+缺件、哈希不符、静态失败或缺真实验证记录时拒绝，不回退旧产物。141 本轮未实机
+验证，因此目前只能提供明确标记的开发包，不能称为全验证正式包。
 
-## 六、构建
+Action（操作）按钮直接运行自检，保存结果到
+`/data/adb/ctn_patch/action.log`，并在终端显示日志路径。模块启用且空闲时执行
+受控写读/恢复；禁用、删除中或游戏运行时自动只读检查，不解除禁用。
+`action.sh --read-only` 可强制只读；直接调用默认 `verify.sh` 仍只读且不写日志。
+文件身份与运行身份分别报告，失败退出码原样保留。
 
-### 6.1 内核模块
+141 继续保留旧版的一/两名写法、读取格式、数据库下发和独立 KO。历史可用性保留
+为历史记录，不用新版策略替换成其它调度；仍需对应版本设备补本轮完整实测。
 
-需要一份能用的内核构建产物。本机（Windows）没有工具链，实际是在 **WSL Debian 13** 里
-用 **NDK r26b 的 clang 17.0.2** 编的 —— 这个版本和设备内核**同一个 llvm-project
-提交**（`d9f89f4d…`），所以 kCFI 类型号必然一致（实测我们回调的类型号和设备
-模块逐字相等）。
+本轮额外临时 KO 测试是用户明确允许的独立测试，保持原先禁用标记、结束卸载。
+不修改 `rt_info`、不写 `game_pid`、不清空 dmesg、不自动重启手机。
 
-```bash
-bash build.sh                      # 一键全流程（克隆内核 → 铺配置 → 编译 → 校验）
-bash build.sh --srcdir 已有内核树   # 复用已下载的内核源码
-bash build.sh --moddir modules仓   # 单独下载内核仓时必须给：重指 vendor 断链
-```
-
-流程：装依赖 → 取内核源码 → 铺设备真实 `.config` → `modules_prepare` →
-编 `.ko` → 校验（vermagic 逐字比对 + `struct module` 布局硬校验）。
-
-**关于 `--moddir`**：OnePlusOSS 内核仓里 Oplus 私有的目录全是符号链接
-（`kernel/oplus_cpu -> ../../../vendor/...`），而 `vendor/` 的真身在另一个仓
-（`android_kernel_modules_and_devicetree_oneplus_sm8650`）。所以**单独下载内核仓
-必然断链**，`olddefconfig` 会报 `can't open file kernel/oplus_cpu/sched/Kconfig`。
-给 `--moddir` 指到 modules 仓根，脚本会自动重指 41 个断链、补 9 个空 Kconfig。
-
-**云端构建**：`.github/workflows/build.yml` 在 GitHub 的 `debian:13` 容器里现编
-（与本机同发行版 + apt 的 clang-17），内核/modules 两个仓都用 codeload 的 tar 包
-直下（`git clone` 的 checkout 阶段在容器里实测会无声中断）。推代码即触发，
-产物在 Actions 页的 Artifacts 里（`ctn_patch-ko`）。
-
-**两个关键约束**：
-
-- **`.config` 必须忠实沿用设备配置**。为省事关掉 `CONFIG_DEBUG_INFO_BTF(_MODULES)`
-  会让 `sizeof(struct module)` 从 1088 掉到 1024，装载器按自己的布局越界写坏指针，
-  `insmod` 时在 `mod_sysfs_setup` panic（**实测踩过**）。`build.sh` 第 8 步会硬校验
-  `.gnu.linkonce.this_module` 段大小。
-- **符号 CRC 取自设备**。内核开了 `CONFIG_MODVERSIONS`，整编一遍要几小时；
-  这里从设备自带的 432 个 `.ko` 的 `__versions` 段抽出 4168 个符号 CRC
-  （`tools/extract_symvers.py` → `Module.symvers.device`），够用且不必整编。
-  唯一缺的 `copy_from_kernel_nofault`（被 `TRIM_UNUSED_KSYMS` 裁掉）改成运行时
-  用 kallsyms 取址。
-
-### 6.2 daemon
-
-```bash
-bash daemon/build.sh       # ctnd（NDK aarch64 clang，产出约 20KB 单文件）
-bash daemon/build_tools.sh # fakepkg / fakethreads（e2e 与自检用的测试小工具）
-bash daemon/lint.sh        # 严格警告检查（应零输出）
-bash daemon/test.sh        # PC 上跑解析逻辑单元测试（不需要设备）
-```
-
-只依赖 `libc.so` / `libdl.so`，无其他运行时依赖。`test.sh` 覆盖 base64
-解码（含无填充残余）、明文/base64 JSON 取值、加密形态识别、名字归一化、
-`game_pid` 解析 —— 改 `ctnd.c` 的解析逻辑后务必先跑它。
-
-真机上还有一套端到端用例（`daemon/device_e2e.sh`，19 项）：
-
-```bash
-# 需要 root shell。用 --db 指向一份**合成**的云控库，把各种配置形态走一遍；
-# fakepkg 负责伪造「进程名 = 包名」的进程来驱动判断链。
-# 不改动设备上真正的 COSA 库与模块目录（脚本自己备份/还原测试库）。
-bash daemon/build.sh && bash daemon/build_tools.sh
-adb push daemon/ctnd daemon/fakepkg daemon/device_e2e.sh \
-         daemon/synth.db daemon/synth2.db daemon/synth_removed.db ctn_patch.ko /data/local/tmp/
-adb shell su -c 'chmod 755 /data/local/tmp/{ctnd,fakepkg}; sh /data/local/tmp/device_e2e.sh'
-```
-
-覆盖：单名/明文/base64（含无填充）写入、三种「不该写」的形态、
-**运行中改库自动重新应用**、**运行中查库失败保持现状**、运行中删配置恢复原值、
-**云控把 ctn 改成空串 → 视同移除恢复**、**游戏直切恢复**、游戏退出恢复、dmesg 写入次数。
-
-### 6.3 打包
-
-```bash
-python build_zip.py      # 产出 ctn_patch.zip
-```
-
-打包时会回读 zip 校验每个条目的 `create_system` 与权限位（见第十二节第 10 条），
-不对就直接报错退出。
-
-## 七、兼容性
-
-| 维度 | 要求 |
-|---|---|
-| 内核 | `6.1.141-android14-11-o-*`（git hash 尾差容忍：内核自身 `…gd2a6093d5589`、模块 `…gdc1b6a03413f`，模块照样加载） |
-| 机型 | 8Gen3 / sm8650 一加系列（一加12、Ace3Pro、Ace5、GT6、Pad2 的 6.1 `game_opt` 源码已实测同源） |
-| 目标模块 | `oplus_bsp_game_opt` 必须是**模块**（内建机型不支持） |
-| root | Magisk / KernelSU / APatch |
-| 架构 | arm64（页大小不限，只要求那 16 字节指针数组不跨页） |
-
-### 7.1 跨机型能不能通用：看 `struct module` 布局，不是看文件哈希
-
-一加12 / Ace3Pro / Ace5 / GT6 这些 8Gen3 机型，在**同一内核版本**
-（如 6.1.118、6.1.141）下，官方风驰（`game_opt`）代码是**同源**的，所以同一个
-刷入包通常可以直接通用。但不同机型、不同构建批次编出来的 `oplus_bsp_game_opt.ko`
-**二进制哈希天然不同** —— 拿哈希当闸门会把本来能用的机型全拒掉。
-
-所以检查 4 判的是**布局**而不是哈希：
-
-| 情况 | 判定 |
-|---|---|
-| 厂商模块哈希与构建时一致 | `[OK]` 完全一致 |
-| 哈希不同，但 `.gnu.linkonce.this_module` 段大小**相同** | `[OK]` 另一份构建、布局一致 → **放行** |
-| 哈希不同，段大小**不同** | `[不满足]` → 拒绝（这会崩机） |
-| 哈希不同，且量不出段大小 | `[警告]` → 放行，提示装完看 `boot.log` |
-
-为什么段大小是关键：设备上那份 `oplus_bsp_game_opt.ko` 是给那个内核编的，它的
-`.gnu.linkonce.this_module` 段大小 == 那个内核的 `sizeof(struct module)`。
-我们的 `.ko` 也是 1088。两边一致就说明装载器不会越界写 —— 这是**唯一**会导致
-`insmod` 崩机（而不是干净失败）的差异。段大小用 `elf_sec_size.sh` 读，只依赖
-`od` + `awk`（设备上没有 `readelf`）。
-
-另外，本 `.ko` 的符号 CRC 取自设备模块表，和它自己的实际布局是一致的
-（`build.sh` 第 8 步硬校验段大小）。所以在别的内核上若 CRC 对不上，内核会
-**干净地拒绝加载**（`disagrees about version of symbol`），不会崩机。
-
-**真要重编的情况**：内核版本不同（vermagic 前缀变）、或段大小不同。步骤见 6.1，
-需要那台设备的 `/proc/config.gz` + 它的 `oplus_bsp_game_opt.ko`（抽符号 CRC）。
-
-**刷入时的闸门**（`customize.sh`，9 组检查，不满足直接 `abort`）：
-内核版本 / `.ko` 与 vermagic / `oplus_bsp_game_opt` 是否模块 / **厂商模块布局** /
-节点是否已存在 / `ctnd` 与依赖 / 内核配置项 / 运行时符号 / 其它环境。
-分 `[不满足]`（拒绝安装）、`[警告]`、`[备注]` 三级。平时只打进度
-（`[4/9] 厂商模块与布局 ✓`），**只有被拦的那一组才展开完整明细**。
-
-**升级路径**：升到 6.6 内核 → 自带 ctn 且布局变了 → 守卫直接拒，不会重复建节点
-也不会崩，此时应卸载本模块。升到更高 6.1.x → vermagic 前缀变 → 拒绝，需重编。
-
-**与其他修改的关系**：别人也做同一件事 → `proc_create_data` 返回 NULL →
-`-EEXIST` 安全退出不覆盖；别人想卸载 `game_opt` → 被我们钉住（refcount +1，
-有意设计）；不碰 `oplus_bsp_sched_ext`、不碰 HAL、不依赖 Zygisk/LSPosed。
-
-## 八、已知限制
-
-1. **`ct_enable` 是另一道门**。名字设对了，boost 本身还归 HAL 控制 —— 它按
-   `game_config.ctb` 加**游戏场景激活**（`/proc/uag/is_game_scene`）判定。实测
-   某游戏配置 `ctb=1` 但运行期 `is_game_scene` 始终为 0，`ct_enable` 也就一直
-   是 0。这是 OPLUS 自己的场景判定，不在本模块能控的范围。想让 daemon 绕过它：
-   `ctnd -e` 会按配置的 `ctb` 直接写 `ct_enable`（代价是绕过了 HAL 的场景门控，
-   可能影响功耗/温控，自己权衡）。
-2. **名字超过 15 字符匹配不到**（见第四节）。
-3. ~~读取里的 pid 固定是 -1~~ —— **v2.1 已解决**：pid 改成读节点时现算（数据源是
-   6.1 自己的 `related_threads[]`，规则照 6.6 的 `find_critical_task_pid()`）。
-   只在「没有游戏在跑」或「名字匹配不到线程」时才是 -1。
-4. **本设备 6.1 的 HAL 不读这个节点**（走
-   `/proc/sys/oplus_sched_ext/pid_unitymain`），所以补节点是补齐 6.6 标准接口 +
-   让内核侧匹配名单可改。
-5. **daemon 依赖 COSA 的云控库**。库里没有的游戏（OPLUS 不认识）、或库里那条
-   是加密内容时，daemon 不碰节点（见 5.4）。
-6. 模块不持久化；刷 zip 则由 `service.sh` 开机自动加载。
-
-## 九、许可
-
-**GPL-2.0-only**，见 `LICENSE`。所有源文件头部有
-`SPDX-License-Identifier: GPL-2.0-only`。
-
-### 为什么不是 GPL-3.0
-
-内核模块的许可不是自由选择，GPL-3.0 既不可行也不合法：
-
-**技术上会加载失败。** 内核判定「GPL 兼容」用白名单
-（`include/linux/license.h`）：
-
-```c
-return (strcmp(license, "GPL") == 0
-	|| strcmp(license, "GPL v2") == 0
-	|| strcmp(license, "GPL and additional rights") == 0
-	|| strcmp(license, "Dual BSD/GPL") == 0
-	|| strcmp(license, "Dual MIT/GPL") == 0
-	|| strcmp(license, "Dual MPL/GPL") == 0);
-```
-
-`"GPL v3"` 不在其中。而本模块用到三个 **GPL-only** 符号 —— `register_kprobe`、
-`unregister_kprobe`、`synchronize_rcu`（都是 `EXPORT_SYMBOL_GPL`）。
-一旦被判为非 GPL，它们无法解析，`insmod` 直接失败。而 RCU 同步没有非 GPL 的
-替代品，绕不过去。
-
-**法律上互不兼容。** 内核 `COPYING` 是 `GPL-2.0 WITH Linux-syscall-note`，
-正文明确是 *GNU GPL version 2 **only***。GPLv2 与 GPLv3 互相不兼容，而内核模块
-是内核的衍生作品，必须 GPLv2 兼容。
-
-> 想要 GPLv3 的专利授权/反 Tivoization 条款的话，在 Linux 内核模块这个形态下
-> 拿不到 —— 这是内核的固有约束。
-
-### 使用者须知
-
-可自由使用、修改、再分发（含商用）；再分发**二进制**时必须同时提供完整对应源码
-和 `LICENSE`（刷入包里已含）；修改后的版本也须以 GPL-2.0 兼容许可发布并保留版权声明。
-
-### 版权
-
-- `ctn_patch.c`、`ctnd.c` 及配套脚本：Copyright (c) Turbo
-- `LICENSE`：GNU GPL v2 全文，取自 Linux 内核 `LICENSES/preferred/GPL-2.0`
-
-本项目是**独立的外部模块**，不修改内核源码、不修改任何分区文件，只通过公开内核
-API（kprobe / procfs / vmap / RCU）在运行时补一个 proc 节点。读写格式参照一加
-6.6 官方源码（OnePlusOSS 开源仓，GPL-2.0）实现，项目中**不包含**任何一加的专有
-代码或二进制。
-
-## 十、云更新
-
-`module.prop` 里有：
-
-```
-updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json
-```
-
-管理器会拉这个 JSON，比对 `versionCode`，远端更大就显示「更新」按钮。
-
-### 10.1 更新弹窗里的「更新日志」是哪个文件
-
-`update.json` 的 `changelog` 指向 **`update-changelog.md`**，不是 `CHANGELOG.md`：
-
-| 文件 | 给谁看 | 内容 |
-|---|---|---|
-| `CHANGELOG.md` | 人 / 仓库 | **完整历史**，从 v1.0 到现在，一版都不删 |
-| `update-changelog.md` | 更新弹窗 | **只有当前这一版**，由 `gen_changelog.py` 从上面那个抽出来 |
-
-为什么拆开：KernelSU 会把 `changelog` 地址的内容**整段**当 markdown 渲染进更新
-弹窗（源码 `ModuleViewModel.kt:437-486`，没有任何截断）。直接喂 `CHANGELOG.md`
-的话，发到 v1.5 时弹窗里就是「v1.0 到 v1.5」的一大段墙；更新弹窗本来就该只讲
-「这次更新改了什么」。
-
-> 文件名不能叫 `changelog.md` —— 仓库在 Windows 上，它和 `CHANGELOG.md`
-> 是**同一个文件**（大小写不敏感），会互相覆盖。
-
-生成时会**去掉「校验值」那一段**（`sha256` 代码块 + 它上面的小标题）：
-
-- 更新弹窗是给「这次更新改了什么」看的，而管理器**不校验** `sha256`，
-  用户也不会拿着 64 位哈希去比对，摆在弹窗里纯属噪音；
-- 但 `CHANGELOG.md` 里留着有价值 —— 那是仓库里**唯一**记着「每一版发出去的
-  到底是哪个二进制」的地方（`expected_vendor.txt` 记的是厂商模块，不是我们的
-  产物）。核对下载到的东西对不对，就靠它。
-
-`update-changelog.md` 是生成物，**别手改**。改内容请改 `CHANGELOG.md`，然后重跑
-`python gen_changelog.py`。
-
-### 10.2 发新版本的顺序
-
-顺序有讲究（`zipUrl` 里带 tag，`changelog` 拉的是 `main` 分支，弄反了会 404
-或发错内容）：
-
-```bash
-python bump.py 1.1        # 1. 改版本：module.prop 与 update.json 一起更新
-#                          2. 在 CHANGELOG.md 顶部补一段 v1.1 的说明
-python gen_changelog.py   # 3. 抽出这一版 → update-changelog.md
-python build_zip.py       # 4. 打包
-git add -A && git commit -m 'v1.1'
-git push gitee main && git push github main      # 5. 先推代码（更新器拉 main）
-git tag -a v1.1 -m 'v1.1' && git push gitee v1.1 && git push github v1.1
-GITEE_TOKEN=xxx python make_release.py           # 6. 两边建 Release + 传 zip 附件
-```
-
-几个工具的分工：
-
-- `bump.py --show` 检查 `module.prop` 与 `update.json` 是否一致；
-  `bump.py --sync` 按 `module.prop` 现有版本重写 `update.json`（不改版本号，
-  换地址之类的小改动用它，不用硬升版本）。
-- `gen_changelog.py` 从 `CHANGELOG.md` 抽当前版本那一节。版本号匹配带
-  「后面不能紧跟数字/点」的约束，所以取 `v1.1` 不会误命中 `v1.10`。
-- `make_release.py` 会先**校验** `update-changelog.md` 就是当前这一版的，
-  不对就拒绝发版 —— 忘了跑第 3 步是很容易犯的错，而且很隐蔽：弹窗里有内容，
-  只是内容不对。它还从 git 凭据管理器读 GitHub 凭据、从 `GITEE_TOKEN`
-  读 Gitee token，两边都已存在 Release 时跳过而不是报错，可以反复跑。
-
-**三个注意点**：① 仓库必须公开（管理器是未登录状态拉 `update.json` 的，
-私有仓库返回 403）—— **绝不能**把 token 写进 `update.json` 或 `module.prop`
-来绕过，那等于把仓库写权限发给每个装模块的人。② `versionCode` 必须单调递增，
-`bump.py` 已强制校验。③ Gitee 上把私有仓库改成公开需要账号安全评级达标：
-评级不足时 Gitee 直接拒绝（`您的帐号安全评级较低，发布公开内容前请在
-「个人设置」完成2FA设置, 或绑定可靠第三方帐号`）。这一步只能账号本人在
-Gitee 网页上做，API 绕不过去 —— 本仓库已绑第三方账号并通过 API 改成公开。
-
-### 10.3 改完自己验一遍
-
-都用未登录身份（就是管理器的视角）：
-
-```bash
-curl -sL .../raw/main/update.json          # 200，versionCode 比本地大
-curl -sL .../raw/main/update-changelog.md  # 200，且**只有**当前这一版
-curl -sL .../releases/download/v1.1/ctn_patch.zip   # 200，大小/哈希与本地一致
-```
-
-Gitee 的 `/raw/` 会 302 跳到 `raw.giteeusercontent.com`，这是正常的
-（管理器跟得上跳转）；但如果哪天发现管理器拉不到，先看这里是不是被挡了。
-
-**更新弹窗不显示日志**（只有「开始下载 xxx」）说明 `changelog` 那个地址没取到 ——
-KernelSU 取不到时会退回去查 `modules.kernelsu.org`（我们没发布在那儿），
-所以最终是空的。这时按上面三条 curl 挨个查。
-
-## 十一、排查
-
-| 现象 | 原因 / 处理 |
-|---|---|
-| `boot.log` 里 `insmod 失败: disagrees about version of symbol` | CRC 不匹配，必须用同内核的 `Module.symvers` 重编 |
-| `boot.log` 里 `Invalid module format` | vermagic 差太多（比如 6.6 内核刷了 6.1 的 ko） |
-| `insmod` 后 `mod_sysfs_setup` panic | `struct module` 布局不符 —— 检查是不是关了 BTF，`build.sh` 第 8 步会拦 |
-| 刷入时被 `[不满足]` 拒绝 | 闸门拦住了，消息里写明是哪一条 |
-| `daemon.log` 里没有「游戏启动」 | `game_pid` 没变 → 这游戏不在 OPLUS 名单里，HAL 不认 |
-| `sqlite: 所有候选路径都加载失败` | 该机型库名/路径不同，改 `ctnd.c` 的 `SQLITE_CANDIDATES` |
-| `云控库里没有这个游戏` | OPLUS 不认识这个包 → daemon 不碰节点，内核保持原样 |
-| `既不是 JSON 也不是 base64-JSON` | 该包配置是加密/未知形态 → daemon 不碰节点 |
-| 节点是 `UnityMain` 但游戏是虚幻的 | 读库失败（看日志），或该包配置里确实没有 `ctn` |
-| 名字对了但没效果 | `ct_enable=0` → 见第八节第 1 条 |
-| `daemon.log` 里只有「启动」没有「游戏启动」 | `game_pid` 没变过 → HAL 没把这游戏当游戏（不在 OPLUS 名单里），或在用 `--db` 指了别的库 |
-| 模块装上了但 `daemon.log` 不生成 | `ctnd` 解包后丢了可执行位（见第十二节第 10 条），手动 `chmod 755` 或重装 |
-| `daemon.log` 一直刷「已有另一个 ctnd 在跑」 | 有重复的守护循环，正常会自己退出；若持续刷说明守护脚本是旧版 |
-
-## 十二、开发中踩过的坑（改代码前请读）
-
-这几条都是实测出来的，改相关代码时容易重新踩：
-
-1. **`struct module` 大小必须和设备一致**。关掉 `CONFIG_DEBUG_INFO_BTF(_MODULES)`
-   会让它少 64 字节 → `insmod` 时 panic。而且改完 `.config` **必须重跑
-   `make modules_prepare`**，否则 `autoconf.h` 还是旧的，会误判「BTF 不影响大小」。
-2. **`| head -N` 会提前关管道**，给 WSL 里的构建进程发 SIGTERM（Error 143），
-   看起来像编译失败。看构建输出用 `tail` 或重定向到文件。
-3. **`mv "$VAR"/*` 在变量为空时展开成 `/*`**，会把整个根文件系统搬走。
-   写脚本时永远先判空。
-4. **一加会把上一轮 dmesg 存到** `/data/persist_log/backup/SYSTEM_LAST_KMSG.txt`
-   —— pstore 是空的也不代表没崩过。
-5. **设备 `/sys/kernel/btf/vmlinux` 含运行内核全部结构体布局**，
-   `tools/btf_struct_dump.py` 可以直接 dump 任意 struct 的成员偏移，比猜配置快得多。
-6. **`game_pid` 在游戏加载期会在正数和 -1 之间反复抖好几秒**，退出判定必须防抖。
-7. **`game_config` 里 `ctn` 是字符串、`ctb` 是数字**，JSON 取值器要分开。
-8. **无填充的 base64 尾部必须单独处理**。只按 4 字符一组解码的话，
-   `aGVsbG8`（`hello`）这种会丢掉最后几个字符，解出来的 JSON 被截断。
-   `daemon/test.sh` 里有用例覆盖这条。
-9. **`ctn` 和 `ctb` 必须从同一个源串取**。base64 形态下只在原始串上找 `ctb`
-   永远找不到 —— 解出来的 JSON 才是真源。这条也是单元测试抓出来的。
-10. **打 zip 必须设 `ZipInfo.create_system = 3`**。Python 默认写 0（=DOS），
-    解包器（KernelSU 用的 Info-ZIP unzip）就只看 DOS 属性、无视 `external_attr`
-    里的 Unix 权限位，`ctnd` 解出来变成 0644 —— 表现是「模块装上了，但
-    `daemon.log` 不生成、节点没人写」。带 `#!` 的脚本侥幸没事，因为管理器会给
-    有 shebang 的文件补 0755；**裸二进制没有这层照顾**。`build_zip.py` 现在
-    打完包会回读校验，`customize.sh` 里也补了 `set_perm` 兜底。
-11. **`game_pid` 节点只认裸 pid**。内核里是 `sscanf(page, "%d", &pid)`
-    （`task_util.c:56`），而且要求这个 pid 是**线程组组长**（`pid == tgid`）。
-    写成 `game_pid=123 child_num=0` 会被 `-EINVAL` 拒掉 —— 那个格式是**读**出来的，
-    不是写进去的。调试时别照着读的格式写。
-12. **两个平台的 Release 附件上传方式不一样**。GitHub 的 asset 接口收的是
-    **裸字节**（`Content-Type: application/zip` + 文件内容），用 multipart 传
-    它会把整个表单包体原样存下来 —— 得到的是「外面裹了一层 `--BOUNDARY` 的
-    zip」，多出 149 字节，`unzip` 未必认得。Gitee 的 `attach_files` 反过来，
-    就要求 multipart。所以 `make_release.py` 里两边走不同分支，传完都要回读
-    比对大小/哈希。另外 Gitee 的 release 详情里**没有** `attach_files` 字段
-    （只有 `assets`，且不含附件 id），判重必须单独查
-    `/releases/{id}/attach_files`。
-13. **「节点已存在」这个检查必须区分「我们自己在跑」和「别人建的」**（v1.2 修掉
-    的 bug，害得所有升级都被拒）。KernelSU 装新版是装到 `modules_update`，
-    **旧版的 ko 还在内存里跑着、节点还在** —— 检查 5 要是不区分，就会把每一次
-    正常升级都当成「重复安装」拒掉。判据：`ctn_patch` 出现在 `/proc/modules` 里
-    → 节点是我们自己建的（内核本来就有该节点的话，我们 `insmod` 时
-    `proc_create_data` 会返回 NULL、`init` 直接 `-EEXIST` 退出，`ctn_patch`
-    根本不会出现在 `/proc/modules` 里）。**写「安装时检查」这类逻辑时，先想清楚
-    升级路径下设备处于什么状态** —— 升级时新旧两版是同时在的。
-14. **发布出去的东西不原地改**。v1.1 的刷入包有上面那个 bug，但没去替换 v1.1 的
-    附件，而是发了 v1.2（`bump.py` 也强制 versionCode 递增）。理由：已经发布的
-    artifact 和它的哈希是记录，改了以后「谁装的是哪个」就说不清了。顺带一个
-    好处：`customize.sh` 是**被安装的那个 zip 里**的脚本，所以从有 bug 的 v1.1
-    升到修好的 v1.2 不会踩这个坑（用的是新版的脚本）。
-15. **自检不能先把模块加载好再跑**，否则「加载」和「卸载」两项永远只能跳过 ——
-    而这两项恰恰是最该测的（insmod 失败会崩机、rmmod 失败会留野指针）。
-    正确顺序是：先 `rmmod`，让自检自己 `insmod` → 测试 → `rmmod`。v1.3 之前的
-    `action.sh` 就是先加载再调 `verify.sh`，等于那两项一直没测过。
-16. **节点读回偶尔会读到「上一轮的值」**。实测遇到过一次：模块刚重载 + 连续写
-    的序列里，某次读回的是**好几轮之前**的一对名字（`A4Main/A4Gfx`）。之后
-    用 900+ 次迭代（含 daemon 开/关、每轮重新加载模块、300 轮大循环）都复现不
-    出来，模块的双缓冲逻辑逐行看也没问题。处理办法不是掩盖：`verify.sh` 的
-    `wread()` 在首次读回不一致时会**立刻重读两次**，重读对上就记一条「瞬时旧值」
-    备注（不算失败）并把首次读到的旧值原样打印出来；重读也对不上才算失败。
-    这样既不会让自检抖，真出问题时又能从日志里看到现场。
+详细本轮检验状态见 [docs/重写检验报告.md](docs/重写检验报告.md)。

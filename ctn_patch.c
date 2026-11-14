@@ -5,728 +5,852 @@
  * 把官方 6.6（一加13）的 /proc/game_opt/task_boost/critical_task_name
  * 移植到 8Gen3 / 6.1 内核（一加 Ace3Pro / Ace5 / 一加12 / GT6）。
  *
- * ============================ 移植来源 ============================
- * 全部取自本工作区 6.6_一加13/官方源码仓库/…/vendor/oplus/kernel/cpu/game_opt/：
- *   critical_task_boost.c:78   static char critical_task[2][100] = {"UnityMain","UnityGfxDevice"};
- *   critical_task_boost.c:80   static pid_t critical_task_pids[2] = {-1,-1};
- *   critical_task_boost.c:602  critical_task_name_proc_write()
- *                                —— sscanf(page, "%99s %99s")；写完把两个 pid 置 -1
- *   critical_task_boost.c:631  critical_task_name_proc_read()
- *                                —— sprintf(page, "%s:%d,%s:%d\n", 名字, pid, 名字, pid)
- *   rt_info.c:492              check_task_name()          —— 名字必须 < TASK_COMM_LEN 才有 pid
- *   rt_info.c:528              is_matching_thread()      —— 两个槽不指向同一个线程
- *   rt_info.c:543              find_critical_task_pid()  —— 在 related_threads[] 里按名字找 pid
- *   rt_info.c:568              update_critical_task_pids()—— 解析流程：先槽 1、再槽 0
+ * 移植来源：6.6 critical_task_boost.c 的两槽名字、99字节上限和
+ * "%s:%d,%s:%d\n" 读取格式；单名仍复制到两槽，第三名和嵌入 NUL 拒绝。
+ * 6.1 critical_task 是 .rodata 中的 const char *[2]，通过物理页的
+ * vmap 可写别名发布名字指针，不修改任何调度/频率控制或热路径 hook。
  *
- * ===================== 6.1 与 6.6 的差异，本模块怎么补 =====================
- * 1) 名单布局：6.1 是 `const char *critical_task[2]`，在模块 .rodata（只读）。
- *    直接写会触发内核写保护异常 —— 本模块用 vmap(&page,1,VM_MAP,PAGE_KERNEL)
- *    建同一物理页的可写别名，只通过别名改内容。
- *    （6.6 是内联 char[2][100] 在可写段，所以官方能直接 sscanf 写进去。）
+ * 生命周期证据（不能只凭这个参考源码给未知固件放行）：
+ * 6.1 vendor/oplus/kernel/cpu/game_opt/critical_task_boost.c:349-401
+ * 的 update_critical_task_time 由 sched_switch_hook 调用并注册到
+ * register_trace_sched_switch；两个已提取 vendor ELF 的 critical_task
+ * .text 重定位仅指向这个读者。include/linux/tracepoint.h:184-214
+ * 的 __DO_TRACE 以 preempt_disable_notrace 包住调用；Linux >=5.0 的
+ * synchronize_rcu 也等待 preempt-disabled 区（rcupdate.h:760-762）。
+ * 因而宽限期后才能复用双缓冲/卸载；两槽各自 release 发布，不是原子成对。
+ * profile 必须显式确认这些读者证据及动态函数 KCFI；缺证据拒绝启动。
  *
- * 2) 没有 critical_task_pids[]：6.1 全仓搜不到（critical_task_pids /
- *    update_ctb_pids 均 0 命中）。本模块在**读节点时现算**：
- *    去 6.1 自己的 related_threads[]（rt_info.c）里按名字找，
- *    规则与 6.6 的 update_critical_task_pids() 一致（含「两槽不重 pid」）。
- *    于是读出来的是**当前真实 pid**，而不是写死 -1。
- *    数据源取不到（内核变体不同）时自动退化成 -1，功能不受影响。
+ * PID 仅是冷路径显示：rt_info.c:104-153 追加的任务未全持有引用，故即使
+ * 拿了 rt_info_rwlock 也不能裸读 entry->task。先在 RCU 中按 pid 查找，
+ * 核对指针身份及 task->pid，再 nofault 读 comm；profile/锁未证实则显示 -1。
  *
- * 3) 单名写入：6.6 的 sscanf 要求恰好两个，写一个会被 -EINVAL 拒。
- *    本模块放宽为「一个也行」，第二个槽复制同一个名字 —— 内核里两槽记同一
- *    线程等价于一个（decide_boost_status 只是对同一个 CPU 重复
- *    cpumask_set_cpu，不会双倍加成）。云控 game_config 的 ctn 只给一个名字时
- *    也就直接生效。
- *
- * ============================ 安全性 ============================
- * - 换指针用「双缓冲 + synchronize_rcu()」：读者是 sched_switch tracepoint 里的
- *   update_critical_task_time()（critical_task_boost.c:349），6.1 的 __DO_TRACE
- *   用 rcu_read_lock_sched_notrace() 包住回调，所以 synchronize_rcu() 等得到它们。
- * - find_module + try_module_get 钉住 oplus_bsp_game_opt，防止它先被 rmmod
- *   导致手里的符号变野指针。
- * - related_threads 的读法与 6.1 自己的 get_critical_task_state()（rt_info.c:404）
- *   完全相同（裸读指针 + NULL 检查）—— 同样的暴露面，而且这里是冷路径
- *   （只在有人 cat 节点时跑一次），不像它是 sched_switch 热路径。
- * - 布局守卫：6.6 的 critical_task[0] 内联在数组里（低字节是 'U'），不是内核
- *   指针；用「上半区指针」一判就拒掉，避免把新内核改坏。
- *
- * 加载顺序：oplus_bsp_game_opt 先加载（开机就在）；卸载顺序相反。
- * v2.2：内核侧无功能改动（仅版本号）；本版的修复和新增都在 daemon 侧
- *      （游戏直切恢复、ctnd.conf 配置文件），见 daemon/ctnd.c 头注释。
- * v2.1：不再依赖外部保证顺序 —— 本模块先于 game_opt 加载时（比如 insmod
- * 早了/服务脚本没等够），init 不再失败退出，而是挂一个延迟工作队列
- * （10 秒一次，最多 60 次），目标模块一出现就自动补丁并建节点。
+ * v3.0 起按 profile 双基线构建：6.1.141 与 6.1.157 各自核对 ABI 后出独立的
+ * ko，装载时再校验本内核身份。延迟重试保留：只重试尚未出现/尚未 LIVE 的
+ * 目标模块，布局、原值、符号或 proc 创建等永久失败保持 patch_ready=false。
  */
 
+#include <linux/atomic.h>
 #include <linux/build_bug.h>
+#include <linux/elf.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/pid_namespace.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
+#include <linux/utsname.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
-#define CT_NUM			2
-/* 官方 6.6 用 char[2][100]、写入上限 "%99s"：名字最长 99 字符 + NUL。 */
-#define CT_NAME_LEN		100
-#define CT_INPUT_LEN		256
-#define CT_PTR_ARRAY_BYTES	(CT_NUM * sizeof(const char *))
+#define INCLUDE_VERMAGIC
+#include <linux/vermagic.h>
+#undef INCLUDE_VERMAGIC
 
-/* 6.1 game_ctrl.h:13 */
-#define MAX_TID_COUNT		256
+#include "ctn_profile.h"
+#include "ctn_patch_internal.h"
+
+#if !defined(CONFIG_ARM64) || !defined(CONFIG_CFI_CLANG) || \
+    !defined(CONFIG_KALLSYMS_ALL) || !defined(CONFIG_MODULE_UNLOAD)
+#error "ctn_patch requires the verified arm64 KCFI/module-unload/kallsyms-all ABI"
+#endif
+#if !defined(CTN_PROFILE_ID) || !defined(CTN_BUILD_ID) || \
+    !defined(CTN_RUNTIME_RELEASE) || !defined(CTN_MODULE_VERMAGIC) || \
+    !defined(CTN_EXPECT_MODULE_SIZE) || !defined(CTN_EXPECT_TASK_COMM_OFFSET) || \
+    !defined(CTN_EXPECT_TASK_PID_OFFSET) || !defined(CTN_EXPECT_RRT_SIZE) || \
+    !defined(CTN_EXPECT_RT_LOCK_SIZE) || !defined(CTN_EXPECT_CRITICAL_TASK_BYTES) || \
+    !defined(CTN_EXPECT_DEFAULT0) || !defined(CTN_EXPECT_DEFAULT1) || \
+    !defined(CTN_PID_SOURCE_VERIFIED) || !defined(CTN_NAME_READERS_RCU_VERIFIED)
+#error "ctn_profile.h must contain the complete verified profile contract"
+#endif
 
 #define VICTIM_MODULE		"oplus_bsp_game_opt"
-#define SYM_CRITICAL_TASK	VICTIM_MODULE ":critical_task"
-#define SYM_TASK_BOOST_DIR	VICTIM_MODULE ":critical_heavy_boost_dir"
-#define SYM_RELATED_THREADS	VICTIM_MODULE ":related_threads"
-#define SYM_TOTAL_NUM		VICTIM_MODULE ":total_num"
-#define SYM_HAVE_VALID_RP	VICTIM_MODULE ":have_valid_render_pid"
-#define SYM_RT_LOCK		VICTIM_MODULE ":rt_info_rwlock"
+#define MAX_TID_COUNT		256
+#define CT_PTR_ARRAY_BYTES	(CT_NUM * sizeof(const char *))
+#define PROBE_RETRY_MS		10000
+#define PROBE_MAX_TRIES		60
+#define CT_SYMBOL_NAME_LEN	128
 
-/*
- * 6.1 rt_info.c:22 的 struct render_related_thread 镜像。
- * 那个结构体在 vendor 模块里是私有的（头文件不在开源仓里），所以这里按源码
- * 逐字复刻；arm64 布局：pid_t(4) + 4 填充 + task_struct*(8) + u32(4) + 4 尾部
- * 填充 = 24 字节。设备上的行为测试（把已知 pid 写进 rt_info 再读节点核对）
- * 就是对这个布局的实锤 —— 布局错了 pid 根本对不上。
- */
 struct rrt_entry {
 	pid_t pid;
 	struct task_struct *task;
 	u32 wake_count;
 };
 
-/* ------------------------------------------------------------------ */
-
-static const char **critical_task;	/* 只读映射里的原数组（读当前值用） */
-static const char **critical_task_rw;	/* 同一物理页的可写别名 */
+static const char **critical_task;
+static const char **critical_task_rw;
 static void *critical_task_vmap;
-static struct proc_dir_entry *task_boost_dir;
 static struct proc_dir_entry *name_entry;
-static bool patched;
-
+static struct module *victim;
+static struct module_layout victim_layout;
+static struct mod_kallsyms victim_kallsyms;
+static size_t victim_strtab_bytes;
 static const char *original_name[CT_NUM];
 static char name_buf[CT_NUM][2][CT_NAME_LEN];
 static u8 active_slot[CT_NUM];
+static bool patched;
+static bool patch_ready;
+static bool pid_display_available;
+static bool stopping;
+static DEFINE_MUTEX(patch_lock);
+static struct delayed_work probe_work;
+static unsigned int probe_tries;
 
-static struct module *victim;
-
-/* pid 解析用的数据源（6.6 的 critical_task_pids 在 6.1 的替代品） */
 static struct rrt_entry *g_related_threads;
 static int *g_total_num;
-static int *g_have_valid_rp;
-/*
- * 6.1 rt_info.c:32 的 static DEFINE_RWLOCK(rt_info_rwlock)。
- * 厂商自己在 rt_info_proc_write() 里改 related_threads[]（含 put_task_struct）
- * 是持 write_lock 的；我们读时也拿 read_lock，就不会读到「刚要被释放的 task」。
- * 拿不到这个符号就退回不加锁 —— 那也和厂商自己的热路径 get_critical_task_state()
- * 一样（它读 related_threads 是不加锁的），只是没比它更差而已。
- */
+static atomic_t *g_have_valid_rp;
 static rwlock_t *g_rt_lock;
-
-static DEFINE_MUTEX(patch_lock);
-
-/*
- * v2.1：加载顺序兼容 —— 目标模块还没加载时，每 PROBE_RETRY_MS 重试一次
- * try_patch()（最多 PROBE_MAX_TRIES 次），它一出现就自动补丁并建节点。
- * exit 时 cancel_delayed_work_sync，不会留下还在跑的工作。
- */
-static struct delayed_work probe_work;
-static int probe_tries;
-#define PROBE_RETRY_MS		10000
-#define PROBE_MAX_TRIES		60	/* 10 秒 × 60 = 10 分钟 */
-
+static struct mutex *module_mutex_ptr;
 static unsigned long (*lookup_name)(const char *name);
 static struct module *(*find_module_fn)(const char *name);
+static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
+static struct task_struct *(*find_task_by_pid_ns_fn)(pid_t pid, struct pid_namespace *ns);
+static struct pid_namespace *initial_pid_namespace;
 
-/* ------------------------------------------------------------------ */
-/* 符号解析                                                            */
-/* ------------------------------------------------------------------ */
-
-static int resolve_lookup_name(void)
+/* Reject module-load overrides too: 0444 alone does not prevent insmod args. */
+static int ctn_param_reject(const char *value, const struct kernel_param *kp)
 {
-	struct kprobe probe = {
-		.symbol_name = "kallsyms_lookup_name",
-	};
+	return -EPERM;
+}
+
+static int ctn_param_get_string(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", (const char *)kp->arg);
+}
+
+static int ctn_param_get_bool(char *buf, const struct kernel_param *kp)
+{
+	const bool *value = kp->arg;
+
+	return scnprintf(buf, PAGE_SIZE, "%c\n", smp_load_acquire(value) ? 'Y' : 'N');
+}
+
+static const struct kernel_param_ops ctn_string_param_ops = {
+	.set = ctn_param_reject,
+	.get = ctn_param_get_string,
+};
+static const struct kernel_param_ops ctn_bool_param_ops = {
+	.set = ctn_param_reject,
+	.get = ctn_param_get_bool,
+};
+module_param_cb(profile, &ctn_string_param_ops, (void *)CTN_PROFILE_ID, 0444);
+module_param_cb(build_id, &ctn_string_param_ops, (void *)CTN_BUILD_ID, 0444);
+module_param_cb(patch_ready, &ctn_bool_param_ops, &patch_ready, 0444);
+module_param_cb(pid_display_available, &ctn_bool_param_ops,
+		&pid_display_available, 0444);
+MODULE_PARM_DESC(profile, "Immutable build profile identity");
+MODULE_PARM_DESC(build_id, "Immutable source/profile/compiler build identity");
+MODULE_PARM_DESC(patch_ready, "Validated critical_task_name node is ready");
+MODULE_PARM_DESC(pid_display_available, "Verified locked PID source is available");
+
+static int ctn_validate_profile(void)
+{
+	/* These are BTF-derived fields, not a guessed struct-module byte prefix. */
+	BUILD_BUG_ON(sizeof(struct module) != CTN_EXPECT_MODULE_SIZE);
+	BUILD_BUG_ON(offsetof(struct module, state) != CTN_EXPECT_MODULE_STATE_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module, name) != CTN_EXPECT_MODULE_NAME_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module, core_layout) !=
+		     CTN_EXPECT_MODULE_CORE_LAYOUT_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module, core_kallsyms) !=
+		     CTN_EXPECT_MODULE_CORE_KALLSYMS_OFFSET);
+	BUILD_BUG_ON(sizeof(struct module_layout) != CTN_EXPECT_MODULE_LAYOUT_SIZE);
+	BUILD_BUG_ON(offsetof(struct module_layout, base) !=
+		     CTN_EXPECT_MODULE_LAYOUT_BASE_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module_layout, size) !=
+		     CTN_EXPECT_MODULE_LAYOUT_SIZE_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module_layout, text_size) !=
+		     CTN_EXPECT_MODULE_LAYOUT_TEXT_SIZE_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module_layout, ro_size) !=
+		     CTN_EXPECT_MODULE_LAYOUT_RO_SIZE_OFFSET);
+	BUILD_BUG_ON(offsetof(struct module_layout, ro_after_init_size) !=
+		     CTN_EXPECT_MODULE_LAYOUT_RO_AFTER_INIT_SIZE_OFFSET);
+	BUILD_BUG_ON(sizeof(struct mod_kallsyms) != CTN_EXPECT_MOD_KALLSYMS_SIZE);
+	BUILD_BUG_ON(offsetof(struct mod_kallsyms, symtab) !=
+		     CTN_EXPECT_MOD_KALLSYMS_SYMTAB_OFFSET);
+	BUILD_BUG_ON(offsetof(struct mod_kallsyms, num_symtab) !=
+		     CTN_EXPECT_MOD_KALLSYMS_NUM_SYMTAB_OFFSET);
+	BUILD_BUG_ON(offsetof(struct mod_kallsyms, strtab) !=
+		     CTN_EXPECT_MOD_KALLSYMS_STRTAB_OFFSET);
+	BUILD_BUG_ON(offsetof(struct mod_kallsyms, typetab) !=
+		     CTN_EXPECT_MOD_KALLSYMS_TYPETAB_OFFSET);
+	/* task_struct may have a dynamic tail on 157; only consumed fields match. */
+	BUILD_BUG_ON(offsetof(struct task_struct, comm) != CTN_EXPECT_TASK_COMM_OFFSET);
+	BUILD_BUG_ON(offsetof(struct task_struct, pid) != CTN_EXPECT_TASK_PID_OFFSET);
+	BUILD_BUG_ON(sizeof(struct rrt_entry) != CTN_EXPECT_RRT_SIZE);
+	BUILD_BUG_ON(offsetof(struct rrt_entry, task) != 8);
+	BUILD_BUG_ON(offsetof(struct rrt_entry, wake_count) != 16);
+	BUILD_BUG_ON(sizeof(rwlock_t) != CTN_EXPECT_RT_LOCK_SIZE);
+	BUILD_BUG_ON(sizeof(atomic_t) != 4);
+	BUILD_BUG_ON(sizeof(int) != 4 || sizeof(void *) != 8 || TASK_COMM_LEN != 16);
+	BUILD_BUG_ON(CT_PTR_ARRAY_BYTES != CTN_EXPECT_CRITICAL_TASK_BYTES);
+	BUILD_BUG_ON(CTN_PID_SOURCE_VERIFIED != 0 && CTN_PID_SOURCE_VERIFIED != 1);
+	BUILD_BUG_ON(CTN_NAME_READERS_RCU_VERIFIED != 0 &&
+		     CTN_NAME_READERS_RCU_VERIFIED != 1);
+	BUILD_BUG_ON(sizeof(CTN_EXPECT_DEFAULT0) > CT_NAME_LEN ||
+		     sizeof(CTN_EXPECT_DEFAULT1) > CT_NAME_LEN);
+
+	if (!CTN_PROFILE_ID[0] || !CTN_BUILD_ID[0] || !CTN_EXPECT_DEFAULT0[0] ||
+	    !CTN_EXPECT_DEFAULT1[0] || !CTN_NAME_READERS_RCU_VERIFIED)
+		return -EPROTONOSUPPORT;
+	if (strcmp(utsname()->release, CTN_RUNTIME_RELEASE) ||
+	    strcmp(init_utsname()->release, CTN_RUNTIME_RELEASE) ||
+	    strcmp(VERMAGIC_STRING, CTN_MODULE_VERMAGIC))
+		return -ENOEXEC;
+	return 0;
+}
+
+static bool ctn_kernel_address(const void *ptr)
+{
+	return ptr && (long)(unsigned long)ptr < 0;
+}
+
+/*
+ * Non-circular bootstrap: exception-table loads, no unverified indirect call.
+ * This is NOT a memcpy fallback if copy_from_kernel_nofault is unavailable.
+ * Only the three KCFI type words are bootstrapped through this primitive.
+ */
+static int ctn_bootstrap_type(const void *fn, u32 *type)
+{
+	const u32 *source;
+	u32 value = 0;
+	int err = 0;
+
+	if (!ctn_kernel_address(fn) || ((unsigned long)fn & 3))
+		return -EINVAL;
+	source = (const u32 *)((unsigned long)fn - sizeof(*type));
+	pagefault_disable();
+	/* Code pages have no allocation tag; keep fault fixup without MTE data helpers. */
+	__raw_get_mem("ldr", value, source, err, K);
+	pagefault_enable();
+	if (err)
+		return -EFAULT;
+	*type = value;
+	return 0;
+}
+
+static noinline __used unsigned long ctn_lookup_stub(const char *name)
+{
+	return 0;
+}
+static noinline __used struct module *ctn_find_module_stub(const char *name)
+{
+	return NULL;
+}
+static noinline __used long ctn_nofault_stub(void *dst, const void *src, size_t size)
+{
+	return -EFAULT;
+}
+static noinline __used struct task_struct *ctn_pid_ns_stub(pid_t pid,
+						      struct pid_namespace *ns)
+{
+	return NULL;
+}
+
+static int ctn_validate_kcfi(const void *live, const void *local)
+{
+	u32 live_type, local_type;
+
+	if (ctn_bootstrap_type(live, &live_type) ||
+	    ctn_bootstrap_type(local, &local_type))
+		return -EFAULT;
+	if (!live_type || live_type != local_type)
+		return -EPROTOTYPE;
+	return 0;
+}
+
+static int ctn_probe_address(const char *symbol, void **address)
+{
+	struct kprobe probe = { .symbol_name = symbol };
 	int ret;
 
 	ret = register_kprobe(&probe);
 	if (ret)
 		return ret;
-
-	lookup_name = (void *)probe.addr;
+	*address = (void *)probe.addr;
 	unregister_kprobe(&probe);
-	return lookup_name ? 0 : -ENOENT;
+	return *address ? 0 : -ENOENT;
 }
 
-static bool kernel_address_looks_valid(const void *ptr)
+static int ctn_resolve_functions(void)
 {
-	/* arm64 内核/模块地址都在上半区，最高位为 1。 */
-	return ptr && (long)(unsigned long)ptr < 0;
-}
+	void *lookup, *nofault, *finder;
+	char probe_byte;
+	int ret;
 
-/*
- * copy_from_kernel_nofault 没导出给模块用：本内核 CONFIG_TRIM_UNUSED_KSYMS=y，
- * 它被裁掉了 —— 432 个设备模块的 __versions 段里都找不到它（其余我们用到的符号
- * 全都能找到，见 Module.symvers.device）。所以只能运行时用 kallsyms 取地址。
- * 取不到就退回 memcpy：这里读的地址要么是模块 .rodata 里已校验过的字符串，
- * 要么是我们自己的缓冲区，都是确定映射的，memcpy 同样安全。
- */
-static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
-
-/*
- * 从内核地址拷一个 NUL 结尾的字符串出来。
- * 先按 task->comm 的容量读 16 字节（正常名字到这里就有 NUL 了），
- * 没找到 NUL 再补读剩下的 —— 避免一上来就读 100 字节踩到未映射页。
- * 全程找不到 NUL 说明源串非法，报错而不是静默截断。
- */
-static int copy_kernel_string(const char *src, char *dst, size_t dst_len)
-{
-	size_t n;
-
-	if (!src || !dst || dst_len < 2)
-		return -EINVAL;
-
-	n = min(dst_len, (size_t)TASK_COMM_LEN);
-
-	if (copy_from_kernel_nofault_fn) {
-		if (copy_from_kernel_nofault_fn(dst, src, n))
-			return -EFAULT;
-	} else {
-		memcpy(dst, src, n);
-	}
-	if (memchr(dst, '\0', n))
-		return 0;
-	if (n == dst_len)
+	ret = ctn_probe_address("kallsyms_lookup_name", &lookup);
+	if (ret)
+		return ret;
+	ret = ctn_probe_address("copy_from_kernel_nofault", &nofault);
+	if (ret)
+		return ret;
+	ret = ctn_validate_kcfi(lookup, ctn_lookup_stub);
+	if (ret)
+		return ret;
+	ret = ctn_validate_kcfi(nofault, ctn_nofault_stub);
+	if (ret)
+		return ret;
+	lookup_name = (void *)lookup;
+	copy_from_kernel_nofault_fn = (void *)nofault;
+	finder = (void *)lookup_name("find_module");
+	ret = ctn_validate_kcfi(finder, ctn_find_module_stub);
+	if (ret)
+		return ret;
+	find_module_fn = (void *)finder;
+	module_mutex_ptr = (void *)lookup_name("module_mutex");
+	if (!ctn_kernel_address(module_mutex_ptr) ||
+	    (unsigned long)module_mutex_ptr % __alignof__(struct mutex) ||
+	    copy_from_kernel_nofault_fn(&probe_byte, module_mutex_ptr, 1))
 		return -EFAULT;
 
-	if (copy_from_kernel_nofault_fn) {
-		if (copy_from_kernel_nofault_fn(dst + n, src + n, dst_len - n))
-			return -EFAULT;
+	/* Optional PID display uses the initial namespace, never the proc reader's. */
+	finder = (void *)lookup_name("find_task_by_pid_ns");
+	initial_pid_namespace = (void *)lookup_name("init_pid_ns");
+	if (ctn_kernel_address(initial_pid_namespace) &&
+	    (unsigned long)initial_pid_namespace % __alignof__(struct pid_namespace) == 0 &&
+	    !copy_from_kernel_nofault_fn(&probe_byte, initial_pid_namespace, 1) &&
+	    !ctn_validate_kcfi(finder, ctn_pid_ns_stub)) {
+		find_task_by_pid_ns_fn = (void *)finder;
 	} else {
-		memcpy(dst + n, src + n, dst_len - n);
+		find_task_by_pid_ns_fn = NULL;
+		initial_pid_namespace = NULL;
+		pr_warn("ctn_patch: verified initial-namespace lookup unavailable; PID display disabled\n");
 	}
-	if (!memchr(dst + n, '\0', dst_len - n))
-		return -EFAULT;
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* pid 解析（6.6 rt_info.c:543 find_critical_task_pid 的 6.1 版）      */
-/* ------------------------------------------------------------------ */
-
-/*
- * 在游戏的相关线程里按名字找一个 pid。
- * 与 6.1 自己的 get_critical_task_state()（rt_info.c:404）用同一套匹配：
- * strncmp(名字, task->comm, strlen(名字)) == 0。
- * last_pid 是 6.6 is_matching_thread() 的去重规则：已经给上一个槽的 pid 跳过。
- */
-static pid_t find_pid_by_name(const char *name, pid_t *last_pid)
+static int ctn_nofault(void *dst, const void *src, size_t bytes)
 {
-	unsigned long flags;
-	size_t name_len = strlen(name);
-	pid_t found = -1;
-	int n, j;
+	if (!copy_from_kernel_nofault_fn || !ctn_kernel_address(src) ||
+	    !bytes || (unsigned long)src > ULONG_MAX - (bytes - 1))
+		return -EFAULT;
+	return copy_from_kernel_nofault_fn(dst, src, bytes) ? -EFAULT : 0;
+}
 
-	/* 6.6 check_task_name()：名字 ≥ TASK_COMM_LEN 永远匹配不到任何线程 */
-	if (name_len == 0 || name_len >= TASK_COMM_LEN)
-		return -1;
-	if (!g_related_threads || !g_total_num)
-		return -1;
-	/* 6.6 check_task_name() 还要求渲染名单有效 */
-	if (g_have_valid_rp && !READ_ONCE(*g_have_valid_rp))
-		return -1;
+/* Read exactly one byte at a time: never touch bytes beyond the first NUL. */
+static int ctn_nofault_string(const char *src, char *dst, size_t capacity,
+			      size_t available)
+{
+	size_t i;
 
-	if (g_rt_lock)
-		read_lock_irqsave(g_rt_lock, flags);
-
-	n = READ_ONCE(*g_total_num);
-	if (n <= 0 || n > MAX_TID_COUNT)
-		goto out;	/* 越界说明符号取错了，宁可不显示 */
-
-	for (j = 0; j < n; j++) {
-		const struct rrt_entry *e = &g_related_threads[j];
-		struct task_struct *t = READ_ONCE(e->task);
-		pid_t pid;
-
-		if (!t)
-			continue;
-		if (strncmp(name, t->comm, name_len) != 0)
-			continue;
-
-		pid = e->pid;
-		if (*last_pid != -1 && *last_pid == pid)
-			continue;	/* 已被另一个槽占用，继续找下一个 */
-		*last_pid = pid;
-		found = pid;
-		break;
+	for (i = 0; i < capacity && i < available; i++) {
+		if (ctn_nofault(dst + i, src + i, 1))
+			return -EFAULT;
+		if (!dst[i])
+			return 0;
 	}
+	return -ENAMETOOLONG;
+}
+
+static bool ctn_in_range(const void *ptr, size_t bytes,
+			 unsigned long base, size_t length)
+{
+	unsigned long address = (unsigned long)ptr;
+
+	return bytes && length <= ULONG_MAX - base && address >= base &&
+	       address - base < length && bytes <= length - (address - base);
+}
+
+static bool ctn_core_range(const void *ptr, size_t bytes)
+{
+	return ctn_in_range(ptr, bytes, (unsigned long)victim_layout.base,
+			    victim_layout.size);
+}
+
+static bool ctn_rodata_range(const void *ptr, size_t bytes)
+{
+	return ctn_in_range(ptr, bytes, (unsigned long)victim_layout.base +
+			    victim_layout.text_size,
+			    victim_layout.ro_size - victim_layout.text_size);
+}
+
+static bool ctn_data_range(const void *ptr, size_t bytes)
+{
+	return ctn_in_range(ptr, bytes, (unsigned long)victim_layout.base +
+			    victim_layout.ro_after_init_size,
+			    victim_layout.size - victim_layout.ro_after_init_size);
+}
+
+static bool ctn_module_mapping(const void *ptr)
+{
+	unsigned long address = (unsigned long)ptr;
+
+#ifdef MODULES_VADDR
+	if (address >= MODULES_VADDR && address < MODULES_END)
+		return true;
+#endif
+	return is_vmalloc_addr(ptr);
+}
+
+/* find and try_module_get form one transaction under the real module_mutex. */
+static int ctn_get_victim(void)
+{
+	struct module *mod;
+	enum module_state state;
+	char name[MODULE_NAME_LEN];
+	int ret = -EAGAIN;
+
+	mutex_lock(module_mutex_ptr);
+	mod = find_module_fn(VICTIM_MODULE);
+	if (!mod)
+		goto out;
+	if (ctn_nofault(&state, &mod->state, sizeof(state)) ||
+	    ctn_nofault_string(mod->name, name, sizeof(name), sizeof(mod->name))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (strcmp(name, VICTIM_MODULE)) {
+		ret = -ENOEXEC;
+		goto out;
+	}
+	if (state != MODULE_STATE_LIVE)
+		goto out;
+	if (!try_module_get(mod))
+		goto out;
+	victim = mod;
+	ret = 0;
 out:
-	if (g_rt_lock)
-		read_unlock_irqrestore(g_rt_lock, flags);
-	return found;
+	mutex_unlock(module_mutex_ptr);
+	return ret;
 }
 
-/*
- * 解析两个槽的 pid。解析顺序照 6.6 update_critical_task_pids()：先槽 1、再槽 0
- * （这样去重时优先保住槽 1 的匹配）。
- * 特例：两个名字相同时（单名写入就是这种），两槽本来就指向同一个线程，
- * 如实显示同一个 pid —— 而不是像 6.6 那样把槽 0 去重成 -1。
- */
-static void resolve_pids(const char *n0, const char *n1, pid_t *out)
+static int ctn_snapshot_layout(void)
 {
-	pid_t last = -1;
+	unsigned long base, strtab, typetab;
+	size_t symtab_bytes;
 
-	out[0] = -1;
-	out[1] = -1;
-
-	if (strcmp(n0, n1) == 0) {
-		out[0] = find_pid_by_name(n0, &last);
-		out[1] = out[0];
-		return;
-	}
-	out[1] = find_pid_by_name(n1, &last);
-	out[0] = find_pid_by_name(n0, &last);
-}
-
-/* ------------------------------------------------------------------ */
-/* proc 节点                                                           */
-/* ------------------------------------------------------------------ */
-
-static bool is_space_char(char c)
-{
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-	       c == '\v' || c == '\f';
-}
-
-static int parse_one_name(const char **cursor, char *out)
-{
-	const char *start;
-	const char *p = *cursor;
-	size_t len;
-
-	while (*p && is_space_char(*p))
-		p++;
-	if (!*p)
-		return -EINVAL;
-	start = p;
-	while (*p && !is_space_char(*p))
-		p++;
-	len = p - start;
-	if (!len)
-		return -EINVAL;
-	if (len >= CT_NAME_LEN)
-		return -ENAMETOOLONG;
-	memcpy(out, start, len);
-	out[len] = '\0';
-	*cursor = p;
+	if (ctn_nofault(&victim_layout, &victim->core_layout, sizeof(victim_layout)))
+		return -EFAULT;
+	base = (unsigned long)victim_layout.base;
+	if (!ctn_kernel_address(victim_layout.base) || (base & ~PAGE_MASK) ||
+	    !victim_layout.text_size ||
+	    victim_layout.text_size > victim_layout.ro_size ||
+	    victim_layout.ro_size > victim_layout.ro_after_init_size ||
+	    victim_layout.ro_after_init_size > victim_layout.size ||
+	    victim_layout.size > ULONG_MAX - base ||
+	    !ctn_module_mapping(victim_layout.base) ||
+	    !ctn_module_mapping((void *)(base + victim_layout.size - 1)))
+		return -ENOEXEC;
+	/* core_kallsyms is permanent and was populated before vendor module_init. */
+	if (ctn_nofault(&victim_kallsyms, &victim->core_kallsyms,
+			sizeof(victim_kallsyms)))
+		return -EFAULT;
+	if (!victim_kallsyms.num_symtab ||
+	    victim_kallsyms.num_symtab > victim_layout.size / sizeof(Elf_Sym))
+		return -ENOEXEC;
+	symtab_bytes = (size_t)victim_kallsyms.num_symtab * sizeof(Elf_Sym);
+	strtab = (unsigned long)victim_kallsyms.strtab;
+	typetab = (unsigned long)victim_kallsyms.typetab;
+	/* add_kallsyms/layout_symtab place typetab directly after core strtab. */
+	if (typetab <= strtab || !ctn_core_range(victim_kallsyms.symtab, symtab_bytes) ||
+	    (unsigned long)victim_kallsyms.symtab % __alignof__(Elf_Sym) ||
+	    !ctn_core_range(victim_kallsyms.strtab, typetab - strtab) ||
+	    !ctn_core_range(victim_kallsyms.typetab, victim_kallsyms.num_symtab))
+		return -ENOEXEC;
+	victim_strtab_bytes = typetab - strtab;
 	return 0;
 }
 
-static int parse_names(const char __user *ubuf, size_t count,
-		       char out[CT_NUM][CT_NAME_LEN])
+/* Exact ELF st_size/type, not kallsyms' distance to the next symbol. */
+static int ctn_object_symbol(const char *wanted, size_t expected_size,
+			     bool rodata, void **out)
 {
-	char input[CT_INPUT_LEN];
-	const char *cursor;
-	const char *after_first;
+	Elf_Sym symbol;
+	char symbol_name[CT_SYMBOL_NAME_LEN], type;
+	unsigned int i;
+	void *found = NULL;
 	int ret;
 
-	if (!count || count >= sizeof(input))
-		return -E2BIG;
-	if (copy_from_user(input, ubuf, count))
-		return -EFAULT;
-	if (memchr(input, '\0', count))
-		return -EINVAL;
-	input[count] = '\0';
-
-	/* 第一个名字必须有 */
-	cursor = input;
-	ret = parse_one_name(&cursor, out[0]);
-	if (ret)
-		return ret;
-
-	/*
-	 * 第二个名字**可选**：只写一个时复制到第二个槽（理由见文件头 3）。
-	 * 三个及以上仍然拒绝 —— 多出来的字符会被下面的检查发现。
-	 */
-	after_first = cursor;
-	ret = parse_one_name(&cursor, out[1]);
-	if (ret) {
-		/* 没有第二个：复制第一个，游标退回原位，好让后面
-		 * 「还有没有多余字符」的检查从正确位置继续 */
-		cursor = after_first;
-		strscpy(out[1], out[0], CT_NAME_LEN);
+	for (i = 1; i < victim_kallsyms.num_symtab; i++) {
+		ret = ctn_nofault(&symbol, victim_kallsyms.symtab + i, sizeof(symbol));
+		if (ret)
+			return ret;
+		if (!symbol.st_name || symbol.st_shndx == SHN_UNDEF)
+			continue;
+		if (symbol.st_name >= victim_strtab_bytes)
+			return -ENOEXEC;
+		ret = ctn_nofault_string(victim_kallsyms.strtab + symbol.st_name,
+					 symbol_name, sizeof(symbol_name),
+					 victim_strtab_bytes - symbol.st_name);
+		/* Long unrelated symbol names are legitimate, but cannot match wanted. */
+		if (ret == -ENAMETOOLONG)
+			continue;
+		if (ret)
+			return ret;
+		if (strcmp(symbol_name, wanted))
+			continue;
+		if (found || symbol.st_size != expected_size ||
+		    ELF_ST_TYPE(symbol.st_info) != STT_OBJECT ||
+		    symbol.st_shndx >= SHN_LORESERVE)
+			return -ENOEXEC;
+		found = (void *)kallsyms_symbol_value(&symbol);
+		if (!found || ctn_nofault(&type, victim_kallsyms.typetab + i, 1))
+			return -EFAULT;
+		if (rodata ? (!ctn_rodata_range(found, expected_size) || type != 'r') :
+		    (!ctn_data_range(found, expected_size) || (type != 'b' && type != 'd')))
+			return -ENOEXEC;
 	}
-
-	while (*cursor && is_space_char(*cursor))
-		cursor++;
-	if (*cursor)
-		return -EINVAL;
+	if (!found)
+		return -ENOENT; /* Missing symbol in a LIVE module is permanent. */
+	*out = found;
 	return 0;
 }
 
-static ssize_t critical_task_name_read(struct file *file, char __user *ubuf,
-				       size_t count, loff_t *ppos)
+static void ctn_clear_pid_source(void)
 {
-	/* 官方 6.6 读取格式是 "%s:%d,%s:%d\n"；99 字符名字 * 2 + pid 展开
-	 * 最长约 224 字节，256 够放（官方源码用 128 其实是会溢出的）。 */
-	char page[CT_INPUT_LEN];
-	char first[CT_NAME_LEN];
-	char second[CT_NAME_LEN];
-	pid_t pids[CT_NUM];
-	int len;
-
-	mutex_lock(&patch_lock);
-	if (!critical_task ||
-	    copy_kernel_string(READ_ONCE(critical_task[0]), first,
-			       sizeof(first)) ||
-	    copy_kernel_string(READ_ONCE(critical_task[1]), second,
-			       sizeof(second))) {
-		mutex_unlock(&patch_lock);
-		return -EFAULT;
-	}
-	/*
-	 * pid 现算（不是写死 -1）：数据源是 6.1 自己的 related_threads[]，
-	 * 解析规则照 6.6 的 update_critical_task_pids()。没有游戏在跑、
-	 * 或名字匹配不到线程时就是 -1 —— 和 6.6 写入后的初始值一致。
-	 */
-	resolve_pids(first, second, pids);
-	len = scnprintf(page, sizeof(page), "%s:%d,%s:%d\n",
-			first, (int)pids[0], second, (int)pids[1]);
-	mutex_unlock(&patch_lock);
-
-	return simple_read_from_buffer(ubuf, count, ppos, page, len);
-}
-
-static ssize_t critical_task_name_write(struct file *file,
-					const char __user *ubuf, size_t count,
-					loff_t *ppos)
-{
-	char new_name[CT_NUM][CT_NAME_LEN];
-	int ret;
-	int i;
-
-	if (*ppos != 0)
-		return -EINVAL;
-
-	/* 与官方 6.6 写入语义一致：两个空格分隔的名字；本模块额外接受单名。 */
-	ret = parse_names(ubuf, count, new_name);
-	if (ret)
-		return ret;
-
-	mutex_lock(&patch_lock);
-	if (!critical_task_rw) {
-		mutex_unlock(&patch_lock);
-		return -ENODEV;
-	}
-
-	/*
-	 * 换指针前先等一个 RCU 宽限期，保证上一次（N-2）发布出去的那块
-	 * 缓冲已经没人用了，接下来覆写它才安全。
-	 */
-	if (patched)
-		synchronize_rcu();
-
-	for (i = 0; i < CT_NUM; i++) {
-		u8 next = active_slot[i] ^ 1;
-
-		strscpy(name_buf[i][next], new_name[i], CT_NAME_LEN);
-		/* 先填内容、再发布指针，读者才可能读到完整的新串。 */
-		smp_wmb();
-		WRITE_ONCE(critical_task_rw[i], name_buf[i][next]);
-		active_slot[i] = next;
-	}
-	patched = true;
-	mutex_unlock(&patch_lock);
-
-	/*
-	 * 每一次改动都留一行 dmesg（含 pid）：排查「谁在什么时候改了名单、改成了
-	 * 什么、当时匹配到哪个线程」时，dmesg | grep ctn_patch 一条命令看全，
-	 * 和 ctnd 写的 /dev/kmsg 同一条时间线。写入频率很低（一个游戏会话两次），
-	 * 不会刷屏。
-	 */
-	{
-		pid_t pids[CT_NUM];
-
-		resolve_pids(new_name[0], new_name[1], pids);
-		pr_info("ctn_patch: 名单更新 [%s:%d] [%s:%d]\n",
-			new_name[0], (int)pids[0], new_name[1], (int)pids[1]);
-	}
-
-	*ppos = count;
-	return count;
-}
-
-static const struct proc_ops critical_task_name_proc_ops = {
-	.proc_read = critical_task_name_read,
-	.proc_write = critical_task_name_write,
-	.proc_lseek = default_llseek,
-};
-
-/* ------------------------------------------------------------------ */
-/* 恢复                                                                */
-/* ------------------------------------------------------------------ */
-
-static void restore_pointers(void)
-{
-	int i;
-
-	if (!patched || !critical_task_rw)
-		return;
-
-	for (i = 0; i < CT_NUM; i++)
-		WRITE_ONCE(critical_task_rw[i], original_name[i]);
-
-	/* 读者跑在 sched_switch tracepoint 的 RCU 读侧临界区里。 */
-	synchronize_rcu();
-	patched = false;
-}
-
-/* ------------------------------------------------------------------ */
-/* init / exit                                                         */
-/* ------------------------------------------------------------------ */
-
-static void resolve_pid_source(void)
-{
-	unsigned long addr;
-
+	smp_store_release(&pid_display_available, false);
 	g_related_threads = NULL;
 	g_total_num = NULL;
 	g_have_valid_rp = NULL;
 	g_rt_lock = NULL;
-
-	addr = lookup_name(SYM_RELATED_THREADS);
-	if (addr)
-		g_related_threads = (struct rrt_entry *)addr;
-
-	addr = lookup_name(SYM_TOTAL_NUM);
-	if (addr)
-		g_total_num = (int *)addr;
-
-	addr = lookup_name(SYM_HAVE_VALID_RP);
-	if (addr)
-		g_have_valid_rp = (int *)addr;
-
-	addr = lookup_name(SYM_RT_LOCK);
-	if (addr)
-		g_rt_lock = (rwlock_t *)addr;
-
-	if (g_related_threads && g_total_num) {
-		pr_info("ctn_patch: pid 数据源已就位（related_threads + total_num）\n");
-	} else {
-		/* 不致命：节点功能照常，只是读出来的 pid 一直是 -1 */
-		pr_warn("ctn_patch: 取不到 related_threads/total_num，pid 将显示 -1\n");
-	}
 }
 
-/*
- * 实际打补丁：从「钉住目标模块」到「建节点」的全部动作。
- * 返回 0 = 成功；-ENOENT = 目标模块/符号/proc 目录还没就绪（值得重试）；
- * 其它 = 真失败（重试也没用）。
- * 从 ctn_patch_init 拆出来的：init 只做符号解析准备，补丁本体在这里，
- * 这样 v2.1 的延迟重试工作队列也能调它。
- */
-static int try_patch(void)
+static void ctn_resolve_pid_source(void)
 {
-	unsigned long addr;
-	unsigned long offset;
-	struct page *page;
-	const char *name;
-	int ret;
+	void *related, *total, *valid, *lock;
+	rwlock_t lock_snapshot;
+
+	ctn_clear_pid_source();
+	if (!CTN_PID_SOURCE_VERIFIED || !find_task_by_pid_ns_fn ||
+	    !initial_pid_namespace)
+		return;
+	if (ctn_object_symbol("related_threads", MAX_TID_COUNT * CTN_EXPECT_RRT_SIZE,
+			      false, &related) ||
+	    ctn_object_symbol("total_num", sizeof(int), false, &total) ||
+	    ctn_object_symbol("have_valid_render_pid", sizeof(atomic_t), false, &valid) ||
+	    ctn_object_symbol("rt_info_rwlock", CTN_EXPECT_RT_LOCK_SIZE, false, &lock) ||
+	    (unsigned long)related % __alignof__(struct rrt_entry) ||
+	    (unsigned long)total % __alignof__(int) ||
+	    (unsigned long)valid % __alignof__(atomic_t) ||
+	    (unsigned long)lock % __alignof__(rwlock_t) ||
+	    ctn_nofault(&lock_snapshot, lock, sizeof(lock_snapshot))) {
+		pr_warn("ctn_patch: PID source unavailable; locked display disabled\n");
+		return;
+	}
+	g_related_threads = related;
+	g_total_num = total;
+	g_have_valid_rp = valid;
+	g_rt_lock = lock;
+	smp_store_release(&pid_display_available, true);
+}
+
+/* Called with patch_lock. The rwlock protects entries; RCU protects task lookup. */
+static pid_t ctn_find_pid(const char *name, pid_t excluded)
+{
+	struct rrt_entry entry;
+	struct task_struct *task;
+	unsigned long flags;
+	char comm[TASK_COMM_LEN];
+	size_t length = strlen(name);
+	pid_t found = -1, task_pid;
+	int n, valid, i;
+
+	if (!smp_load_acquire(&pid_display_available) || !length ||
+	    length >= TASK_COMM_LEN)
+		return -1;
+	read_lock_irqsave(g_rt_lock, flags);
+	rcu_read_lock();
+	if (ctn_nofault(&n, g_total_num, sizeof(n)) || n <= 0 || n > MAX_TID_COUNT ||
+	    ctn_nofault(&valid, &g_have_valid_rp->counter, sizeof(valid)) || !valid)
+		goto out;
+	for (i = 0; i < n; i++) {
+		if (ctn_nofault(&entry, g_related_threads + i, sizeof(entry)))
+			break;
+		if (entry.pid <= 0 || entry.pid == excluded || !entry.task)
+			continue;
+		task = find_task_by_pid_ns_fn(entry.pid, initial_pid_namespace);
+		/* Never dereference the potentially unreferenced vendor entry.task. */
+		if (!task || task != entry.task ||
+		    ctn_nofault(&task_pid, &task->pid, sizeof(task_pid)) ||
+		    task_pid != entry.pid ||
+		    ctn_nofault_string(task->comm, comm, sizeof(comm), sizeof(task->comm)))
+			continue;
+		if (!strncmp(name, comm, length)) {
+			found = entry.pid;
+			break;
+		}
+	}
+out:
+	rcu_read_unlock();
+	read_unlock_irqrestore(g_rt_lock, flags);
+	return found;
+}
+
+static void ctn_resolve_pids(const char names[CT_NUM][CT_NAME_LEN], pid_t pids[CT_NUM])
+{
+	pids[1] = ctn_find_pid(names[1], -1);
+	pids[0] = !strcmp(names[0], names[1]) ? pids[1] :
+		  ctn_find_pid(names[0], pids[1]);
+}
+
+/* Verify current ownership before reading/publishing. Unexpected writers fail closed. */
+static int ctn_check_slots(const char *slots[CT_NUM])
+{
 	int i;
 
-	/* 先把目标模块钉住，避免它在后面被 rmmod 造成野指针。 */
-	victim = find_module_fn(VICTIM_MODULE);
-	if (!victim) {
-		pr_debug("ctn_patch: 模块 %s 尚未加载\n", VICTIM_MODULE);
-		return -ENOENT;
-	}
-	if (!try_module_get(victim)) {
-		pr_err("ctn_patch: try_module_get(%s) 失败\n", VICTIM_MODULE);
-		victim = NULL;
-		return -ENOENT;
-	}
+	if (ctn_nofault(slots, critical_task, CT_PTR_ARRAY_BYTES))
+		goto stale;
+	for (i = 0; i < CT_NUM; i++) {
+		const char *expected = patched ? name_buf[i][active_slot[i]] : original_name[i];
 
-	/* module:symbol 形式：内核 kallsyms_lookup_name 末尾会落到
-	 * module_kallsyms_lookup_name()，它按 ':' 拆成模块名+符号名。 */
-	addr = lookup_name(SYM_CRITICAL_TASK);
-	if (!addr) {
-		pr_err("ctn_patch: 找不到 %s\n", SYM_CRITICAL_TASK);
-		ret = -ENOENT;
-		goto fail_put;
+		if (slots[i] != expected)
+			goto stale;
 	}
-	critical_task = (const char **)addr;
+	return 0;
+stale:
+	smp_store_release(&patch_ready, false);
+	return -ESTALE;
+}
 
-	/*
-	 * 布局校验：6.1 是「两个指针」，6.6 是内联 char[2][100]
-	 * （6.6 源码 critical_task_boost.c:78）。
-	 * 新版里 critical_task[0] 的低字节是 'U' 之类，不会是内核指针，
-	 * 用上半区判断即可拒掉，避免把新内核改坏。
-	 */
-	name = READ_ONCE(critical_task[0]);
-	if (!kernel_address_looks_valid(name)) {
-		pr_err("ctn_patch: critical_task[0] 不是内核指针，可能是新布局，放弃\n");
-		ret = -EINVAL;
-		goto fail_put;
-	}
-	name = READ_ONCE(critical_task[1]);
-	if (!kernel_address_looks_valid(name)) {
-		pr_err("ctn_patch: critical_task[1] 不是内核指针，可能是新布局，放弃\n");
-		ret = -EINVAL;
-		goto fail_put;
-	}
+static ssize_t ctn_read(struct file *file, char __user *ubuf,
+			size_t count, loff_t *ppos)
+{
+	char page[CT_INPUT_LEN], names[CT_NUM][CT_NAME_LEN];
+	const char *slots[CT_NUM];
+	pid_t pids[CT_NUM];
+	size_t available;
+	int ret, i, len;
 
-	addr = lookup_name(SYM_TASK_BOOST_DIR);
-	if (!addr) {
-		pr_err("ctn_patch: 找不到 %s\n", SYM_TASK_BOOST_DIR);
-		ret = -ENOENT;
-		goto fail_put;
+	mutex_lock(&patch_lock);
+	if (!smp_load_acquire(&patch_ready) || READ_ONCE(stopping)) {
+		ret = -ENODEV;
+		goto out;
 	}
-	task_boost_dir = READ_ONCE(*(struct proc_dir_entry **)addr);
-	if (!task_boost_dir) {
-		pr_err("ctn_patch: task_boost 目录尚未建立\n");
-		ret = -ENOENT;
-		goto fail_put;
+	ret = ctn_check_slots(slots);
+	if (ret)
+		goto out;
+	for (i = 0; i < CT_NUM; i++) {
+		available = patched ? CT_NAME_LEN :
+			(unsigned long)victim_layout.base + victim_layout.ro_size -
+			(unsigned long)slots[i];
+		ret = ctn_nofault_string(slots[i], names[i], sizeof(names[i]), available);
+		if (ret)
+			goto out;
 	}
+	ctn_resolve_pids(names, pids);
+	len = scnprintf(page, sizeof(page), "%s:%d,%s:%d\n",
+			names[0], (int)pids[0], names[1], (int)pids[1]);
+	mutex_unlock(&patch_lock);
+	return simple_read_from_buffer(ubuf, count, ppos, page, len);
+out:
+	mutex_unlock(&patch_lock);
+	return ret;
+}
 
-	/* 模块内存走 vmalloc；.rodata 被设成只读，所以要另建可写别名。 */
-	if (!is_vmalloc_addr(critical_task)) {
-		pr_err("ctn_patch: critical_task 不在 vmalloc 区\n");
-		ret = -EFAULT;
-		goto fail_put;
+static ssize_t ctn_write(struct file *file, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	char input[CT_INPUT_LEN], names[CT_NUM][CT_NAME_LEN];
+	const char *slots[CT_NUM];
+	pid_t pids[CT_NUM];
+	u8 next[CT_NUM];
+	int ret, i;
+
+	if (*ppos != 0)
+		return -EINVAL;
+	if (!count || count >= sizeof(input))
+		return -E2BIG;
+	if (copy_from_user(input, ubuf, count))
+		return -EFAULT;
+	ret = ctn_parse_names(input, count, names);
+	if (ret)
+		return ret;
+
+	mutex_lock(&patch_lock);
+	if (!smp_load_acquire(&patch_ready) || READ_ONCE(stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = ctn_check_slots(slots);
+	if (ret)
+		goto out;
+	/* Previous inactive buffers may still be referenced by sched_switch readers. */
+	if (patched)
+		synchronize_rcu();
+	ret = ctn_check_slots(slots);
+	if (ret)
+		goto out;
+	for (i = 0; i < CT_NUM; i++) {
+		next[i] = active_slot[i] ^ 1;
+		strscpy(name_buf[i][next[i]], names[i], CT_NAME_LEN);
+	}
+	for (i = 0; i < CT_NUM; i++) {
+		/* Independent per-slot release stores, never an atomic pair claim. */
+		smp_store_release(&critical_task_rw[i], name_buf[i][next[i]]);
+		active_slot[i] = next[i];
+	}
+	patched = true;
+	ctn_resolve_pids(names, pids);
+	pr_info_ratelimited("ctn_patch: names [%s:%d] [%s:%d]\n",
+			names[0], (int)pids[0], names[1], (int)pids[1]);
+	*ppos = count;
+	ret = count;
+out:
+	mutex_unlock(&patch_lock);
+	return ret;
+}
+
+static const struct proc_ops ctn_proc_ops = {
+	.proc_read = ctn_read,
+	.proc_write = ctn_write,
+	.proc_lseek = default_llseek,
+};
+
+static void ctn_release_state(void)
+{
+	if (critical_task_vmap)
+		vunmap(critical_task_vmap);
+	critical_task_vmap = NULL;
+	critical_task_rw = NULL;
+	critical_task = NULL;
+	ctn_clear_pid_source();
+	if (victim)
+		module_put(victim);
+	victim = NULL;
+	memset(&victim_layout, 0, sizeof(victim_layout));
+	memset(&victim_kallsyms, 0, sizeof(victim_kallsyms));
+	victim_strtab_bytes = 0;
+}
+
+static int ctn_try_patch(void)
+{
+	struct proc_dir_entry *parent;
+	struct page *page;
+	void *critical, *parent_symbol;
+	unsigned long offset;
+	const char *defaults[CT_NUM] = { CTN_EXPECT_DEFAULT0, CTN_EXPECT_DEFAULT1 };
+	char original[CT_NAME_LEN];
+	int ret, i;
+
+	mutex_lock(&patch_lock);
+	if (READ_ONCE(stopping)) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+	ret = ctn_get_victim();
+	if (ret)
+		goto out;
+	ret = ctn_snapshot_layout();
+	if (ret)
+		goto fail;
+	ret = ctn_object_symbol("critical_task", CTN_EXPECT_CRITICAL_TASK_BYTES,
+				true, &critical);
+	if (ret)
+		goto fail;
+	ret = ctn_object_symbol("critical_heavy_boost_dir", sizeof(parent),
+				false, &parent_symbol);
+	if (ret)
+		goto fail;
+	if ((unsigned long)critical % __alignof__(const char *) ||
+	    (unsigned long)parent_symbol % __alignof__(struct proc_dir_entry *) ||
+	    ctn_nofault(&parent, parent_symbol, sizeof(parent)) ||
+	    !ctn_kernel_address(parent)) {
+		ret = -ENODEV;
+		goto fail;
+	}
+	critical_task = critical;
+	ret = ctn_nofault(original_name, critical_task, CT_PTR_ARRAY_BYTES);
+	if (ret)
+		goto fail;
+	for (i = 0; i < CT_NUM; i++) {
+		/* Original strings must belong to the pinned module's non-text RO range. */
+		if (!ctn_rodata_range(original_name[i], 1)) {
+			ret = -ENOEXEC;
+			goto fail;
+		}
+		ret = ctn_nofault_string(original_name[i], original, sizeof(original),
+			(unsigned long)victim_layout.base + victim_layout.ro_size -
+			(unsigned long)original_name[i]);
+		if (ret)
+			goto fail;
+		if (strcmp(original, defaults[i])) {
+			ret = -ESTALE;
+			goto fail;
+		}
+		strscpy(name_buf[i][0], original, CT_NAME_LEN);
+		active_slot[i] = 0;
 	}
 	offset = (unsigned long)critical_task & ~PAGE_MASK;
-	if (offset + CT_PTR_ARRAY_BYTES > PAGE_SIZE) {
-		pr_err("ctn_patch: 指针数组跨页，本模块不支持\n");
-		ret = -EINVAL;
-		goto fail_put;
+	if (!ctn_module_mapping(critical_task) ||
+	    offset > PAGE_SIZE - CT_PTR_ARRAY_BYTES) {
+		ret = -ENOEXEC;
+		goto fail;
 	}
 	page = vmalloc_to_page(critical_task);
 	if (!page) {
 		ret = -EFAULT;
-		goto fail_put;
+		goto fail;
 	}
 	critical_task_vmap = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
 	if (!critical_task_vmap) {
 		ret = -ENOMEM;
-		goto fail_put;
+		goto fail;
 	}
 	critical_task_rw = (const char **)((char *)critical_task_vmap + offset);
-
-	/* 信息性检查：符号是否落在目标模块 core 区里（头文件不一致时只告警）。 */
-	if ((unsigned long)critical_task < (unsigned long)victim->core_layout.base ||
-	    (unsigned long)critical_task >= (unsigned long)victim->core_layout.base +
-					     victim->core_layout.size)
-		pr_warn("ctn_patch: critical_task 不在 %s 的 core 区，仅告警\n",
-			VICTIM_MODULE);
-
-	for (i = 0; i < CT_NUM; i++) {
-		original_name[i] = READ_ONCE(critical_task[i]);
-		ret = copy_kernel_string(original_name[i], name_buf[i][0],
-					 sizeof(name_buf[i][0]));
-		if (ret) {
-			pr_err("ctn_patch: 读取原始名字失败 (%d)\n", ret);
-			goto fail_unmap;
-		}
-	}
-
-	resolve_pid_source();
-
-	/* 如果这个内核本来就有这个节点，proc_create_data 会失败，正好不重复建。 */
-	name_entry = proc_create_data("critical_task_name", 0664, task_boost_dir,
-				      &critical_task_name_proc_ops, NULL);
+	ctn_resolve_pid_source();
+	name_entry = proc_create_data("critical_task_name", 0664, parent,
+				      &ctn_proc_ops, NULL);
 	if (!name_entry) {
-		pr_err("ctn_patch: 创建 critical_task_name 失败（可能已存在）\n");
 		ret = -EEXIST;
-		goto fail_unmap;
+		goto fail;
 	}
-
-	pr_info("ctn_patch: 已为 %s 补上 critical_task_name，当前 [%s] [%s]\n",
-		VICTIM_MODULE, name_buf[0][0], name_buf[1][0]);
-	return 0;
-
-fail_unmap:
-	if (critical_task_vmap) {
-		vunmap(critical_task_vmap);
-		critical_task_vmap = NULL;
-	}
-	critical_task_rw = NULL;
-	critical_task = NULL;
-fail_put:
-	if (victim) {
-		module_put(victim);
-		victim = NULL;
-	}
+	/* All state is initialized before the node is advertised to userspace. */
+	smp_store_release(&patch_ready, !READ_ONCE(stopping));
+	pr_info("ctn_patch: profile=%s build_id=%s ready; PID display %s\n",
+		CTN_PROFILE_ID, CTN_BUILD_ID,
+		smp_load_acquire(&pid_display_available) ? "available" : "disabled");
+	ret = 0;
+	goto out;
+fail:
+	ctn_release_state();
+out:
+	mutex_unlock(&patch_lock);
 	return ret;
 }
 
-/*
- * game_opt 还没加载时的重试体：ENOENT 继续等，其它失败放弃（重试无用）。
- * 成功就收工 —— 节点已建好，本模块转入静默值守状态。
- */
-static void probe_work_fn(struct work_struct *w)
+static void ctn_probe_work(struct work_struct *work)
 {
 	int ret;
 
-	ret = try_patch();
-	if (!ret) {
-		pr_info("ctn_patch: 延迟补丁成功（第 %d 次尝试）\n",
-			probe_tries + 1);
+	if (READ_ONCE(stopping))
+		return;
+	probe_tries++;
+	ret = ctn_try_patch();
+	if (!ret)
+		return;
+	if (ret == -EAGAIN && probe_tries < PROBE_MAX_TRIES && !READ_ONCE(stopping)) {
+		schedule_delayed_work(&probe_work, msecs_to_jiffies(PROBE_RETRY_MS));
 		return;
 	}
-	if (ret == -ENOENT && ++probe_tries < PROBE_MAX_TRIES) {
-		schedule_delayed_work(&probe_work,
-				      msecs_to_jiffies(PROBE_RETRY_MS));
-		return;
-	}
-	pr_err("ctn_patch: 延迟补丁放弃（ret=%d，共尝试 %d 次）—— %s 一直没出现\n",
-	       ret, probe_tries + 1, VICTIM_MODULE);
+	pr_err("ctn_patch: not ready, retry stopped ret=%d attempts=%u\n", ret, probe_tries);
 }
 
 static int __init ctn_patch_init(void)
 {
 	int ret;
 
-	BUILD_BUG_ON(sizeof(struct rrt_entry) != 24);
-
-	ret = resolve_lookup_name();
+	ret = ctn_validate_profile();
 	if (ret) {
-		pr_err("ctn_patch: kallsyms_lookup_name 不可用: %d\n", ret);
+		pr_err("ctn_patch: profile/version/layout evidence rejected: %d\n", ret);
 		return ret;
 	}
-
-	find_module_fn = (void *)lookup_name("find_module");
-	if (!find_module_fn) {
-		pr_err("ctn_patch: 找不到 find_module\n");
-		return -ENOENT;
+	ret = ctn_resolve_functions();
+	if (ret) {
+		pr_err("ctn_patch: dynamic symbols/nofault/KCFI rejected: %d\n", ret);
+		return ret;
 	}
-
-	/* 非导出符号，只能运行时取（见 copy_kernel_string 上方说明）。 */
-	copy_from_kernel_nofault_fn =
-		(void *)lookup_name("copy_from_kernel_nofault");
-	if (!copy_from_kernel_nofault_fn)
-		pr_warn("ctn_patch: 取不到 copy_from_kernel_nofault，退回 memcpy 读串\n");
-
-	INIT_DELAYED_WORK(&probe_work, probe_work_fn);
-
-	ret = try_patch();
-	if (ret == -ENOENT) {
-		/*
-		 * v2.1：目标模块还没加载 —— 不再 init 失败一走了之，
-		 * 挂起延迟重试，它一出现就自动补上（启动顺序自愈）。
-		 */
-		pr_warn("ctn_patch: %s 未加载，每 %dms 重试一次（最多 %d 次）\n",
-			VICTIM_MODULE, PROBE_RETRY_MS, PROBE_MAX_TRIES);
-		schedule_delayed_work(&probe_work,
-				      msecs_to_jiffies(PROBE_RETRY_MS));
+	INIT_DELAYED_WORK(&probe_work, ctn_probe_work);
+	probe_tries = 1;
+	ret = ctn_try_patch();
+	if (ret == -EAGAIN) {
+		schedule_delayed_work(&probe_work, msecs_to_jiffies(PROBE_RETRY_MS));
+		pr_info("ctn_patch: waiting for LIVE %s; patch_ready=false\n", VICTIM_MODULE);
 		return 0;
 	}
 	return ret;
@@ -734,46 +858,42 @@ static int __init ctn_patch_init(void)
 
 static void __exit ctn_patch_exit(void)
 {
-	/* 重试工作可能还在等：先取消（同步等在跑的那次结束），再做清理 */
-	cancel_delayed_work_sync(&probe_work);
+	int i;
 
+	WRITE_ONCE(stopping, true);
+	smp_store_release(&patch_ready, false);
+	cancel_delayed_work_sync(&probe_work);
+	/* Never hold patch_lock across proc_remove: it drains blocked callbacks. */
 	if (name_entry) {
 		proc_remove(name_entry);
 		name_entry = NULL;
 	}
-
 	mutex_lock(&patch_lock);
-	restore_pointers();
+	if (patched) {
+		for (i = 0; i < CT_NUM; i++) {
+			/* The private vmap alias remains mapped and the vendor stays pinned. */
+			const char *slot = READ_ONCE(critical_task_rw[i]);
+
+			if (slot == name_buf[i][0] || slot == name_buf[i][1])
+				smp_store_release(&critical_task_rw[i], original_name[i]);
+			else if (slot != original_name[i])
+				pr_err("ctn_patch: slot %d owned externally; not overwritten\n", i);
+		}
+		/* Both slots no longer point into this module before its buffers disappear. */
+		synchronize_rcu();
+		patched = false;
+	}
+	ctn_release_state();
 	mutex_unlock(&patch_lock);
-
-	if (critical_task_vmap) {
-		vunmap(critical_task_vmap);
-		critical_task_vmap = NULL;
-	}
-	critical_task_rw = NULL;
-	critical_task = NULL;
-
-	g_related_threads = NULL;
-	g_total_num = NULL;
-	g_have_valid_rp = NULL;
-
-	if (victim) {
-		module_put(victim);
-		victim = NULL;
-	}
-
-	pr_info("ctn_patch: 已卸载\n");
+	pr_info("ctn_patch: unloaded\n");
 }
 
 module_init(ctn_patch_init);
 module_exit(ctn_patch_exit);
-
-/* 本模块以 GPL-2.0-only 发布（见 SPDX 头与 LICENSE）。
- * 内核的 license_is_gpl_compatible() 把 "GPL" 认作 GPL-2.0，这是内核模块的
- * 通用写法；同时这样才拿得到 register_kprobe / synchronize_rcu 这些
- * EXPORT_SYMBOL_GPL 符号。 */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
-MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for old Oplus game_opt");
-MODULE_VERSION("2.2");
+MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for verified Oplus 6.1 game_opt");
+MODULE_VERSION("3.0");
+MODULE_INFO(ctn_profile, CTN_PROFILE_ID);
+MODULE_INFO(ctn_build_id, CTN_BUILD_ID);
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

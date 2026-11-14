@@ -1,427 +1,176 @@
 #!/system/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# ctn_patch 自检：内核模块 + daemon + 环境，一趟跑完
-#
-# 输出约定（为了一眼能看出问题）：
-#   [OK]  一行一项，通过了
-#   [!!]  失败 —— 失败时才在下面缩进打印细节
-#   [--]  跳过（没条件测）
-#   最后一行是汇总。脚本退出码 = 失败项数（0 表示全过）。
-#
-# 用法：
-#   sh verify.sh                  # ko 取脚本同目录的 ctn_patch.ko
-#   sh verify.sh /path/to/ko      # 指定 ko
-#
-# 模块生命周期由本脚本负责：自己 insmod、测完自己 rmmod。
-# 所以调它之前请确保模块没被加载（action.sh 会先 rmmod）。
+# Default: read-only static/identity checks. Only --exercise may load/write.
 
-DIR=/proc/game_opt/task_boost
-NODE=$DIR/critical_task_name
-VICTIM=oplus_bsp_game_opt
-# 用 dirname 而不是 ${0%/*}：后者在「裸文件名调用」（sh verify.sh）时会算成
-# 文件名本身（没有斜杠可切），导致 MODDIR=verify.sh，后面所有 $MODDIR/xxx 全错。
-MODDIR=$(dirname "$0")
-KO="${1:-$MODDIR/ctn_patch.ko}"
+CTN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+case "${1:-}" in
+    '') CTN_EXERCISE=0 ;;
+    --exercise) CTN_EXERCISE=1 ;;
+    -h|--help)
+        printf '%s\n' 'Usage: sh verify.sh [--exercise]' \
+            'Default is read-only. --exercise pauses only our service, tests, restores, then resumes it.' \
+            'Run from an installed/extracted package; arbitrary KO paths are not accepted.'
+        exit 0 ;;
+    *) printf '%s\n' 'ctn_patch: only --exercise is supported; no arbitrary KO path' >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || exit 2
+[ -r "$CTN_DIR/lib/common.sh" ] || { printf '%s\n' 'ctn_patch: run verify from the packaged module (missing lib/common.sh)' >&2; exit 1; }
+. "$CTN_DIR/lib/common.sh"
+ctn_init "$CTN_DIR" || exit 1
+ctn_note "verification mode=$([ "$CTN_EXERCISE" = 1 ] && printf exercise || printf read-only)"
+ctn_select || exit $?
+ctn_report_running
 
-PASS=0; FAIL=0; SKIP=0
+CTN_IDENTITY_RC=0
+if ctn_loaded; then
+    ctn_running_identity || CTN_IDENTITY_RC=1
+elif [ -e "$CTN_NODE" ]; then
+    ctn_error 'unknown native node provenance; no daemon-only profile is approved'
+    CTN_IDENTITY_RC=1
+fi
 
-# 标签手工补齐到显示宽 12（中文算 2 列，printf 的 %-12s 按字符数算，用不了）
-row() { printf '[%s]  %s  %s\n' "$1" "$2" "$3"; }
-ok()  { PASS=$((PASS+1)); row OK "$1" "$2"; }
-ng()  { FAIL=$((FAIL+1)); row '!!' "$1" "$2"; }
-sk()  { SKIP=$((SKIP+1)); row '--' "$1" "$2"; }
-det() { printf '        %s\n' "$*"; }
-# ---- ctnd 进程探测/击杀：读 pidfile ----
-# 判断 daemon 在不在跑 = 读它自己写的 ctnd.pid（模块目录下）+ 确认 /proc/<pid>
-# 还在、comm 是 ctnd。O(1)，只读一个文件、看一眼目录。
-#
-# 为什么不用别的（都试过，都不行）：
-#   - pgrep/pkill -x：语义因实现而异（busybox 比的是整条命令行），永远匹配不上；
-#   - 扫 /proc/*/fd 找「谁握着锁」：结果对，但**极慢** —— 有的进程 800+ 个 fd，
-#     全系统扫一遍是几万次 readlink。而守护循环每 2 秒跑一次，等于持续在后台
-#     扒全系统的 fd（实测执行轨迹 6.7 万行还没跑完）—— 这本身就是实打实的
-#     后台 CPU/功耗开销，v2.1 干掉。
-# pidfile 陈旧（被 kill -9）也没关系：下面会再确认 /proc/<pid> 和 comm。
-CTND_PIDFILE="$MODDIR/ctnd.pid"
-
-ctnd_pid() {
-	_p=$(cat "$CTND_PIDFILE" 2>/dev/null)
-	_p=${_p%%[!0-9]*}
-	if [ -n "$_p" ] && [ -r "/proc/$_p/comm" ]; then
-		read -r _n < "/proc/$_p/comm" 2>/dev/null
-		[ "$_n" = "ctnd" ] && { echo "$_p"; return; }
-	fi
-	for _d in /proc/[0-9]*; do	# 兜底：pidfile 没有/失效时扫名字（便宜）
-		[ -r "$_d/comm" ] || continue
-		read -r _n < "$_d/comm" 2>/dev/null
-		[ "$_n" = "ctnd" ] && { echo "${_d#/proc/}"; return; }
-	done
+# Parse only names whose read representation can be round-tripped unambiguously.
+# Refuse to test rather than overwrite an original value we cannot restore.
+ctn_read_names() {
+    local raw left right
+    raw=$(ctn_scalar "$CTN_NODE") || return 1
+    left=${raw%%,*}; right=${raw#*,}
+    [ "$left" != "$raw" ] || return 1
+    case "$right" in *,*) return 1 ;; esac
+    CTN_NAME_A=${left%:*}; CTN_PID_A=${left##*:}
+    CTN_NAME_B=${right%:*}; CTN_PID_B=${right##*:}
+    [ "$CTN_NAME_A" != "$left" ] && [ "$CTN_NAME_B" != "$right" ] || return 1
+    case "$CTN_NAME_A$CTN_NAME_B" in *[!A-Za-z0-9_.+-]*) return 1 ;; esac
+    [ -n "$CTN_NAME_A" ] && [ -n "$CTN_NAME_B" ] &&
+        [ "${#CTN_NAME_A}" -le 99 ] && [ "${#CTN_NAME_B}" -le 99 ] || return 1
+    case "$CTN_PID_A" in -1) ;; *) ctn_pid_valid "$CTN_PID_A" || return 1 ;; esac
+    case "$CTN_PID_B" in -1) ;; *) ctn_pid_valid "$CTN_PID_B" || return 1 ;; esac
+    CTN_NAMES="$CTN_NAME_A $CTN_NAME_B"
 }
 
-ctnd_alive() { [ -n "$(ctnd_pid)" ]; }
-ctnd_kill()  { _p=$(ctnd_pid); [ -n "$_p" ] && kill "$_p" 2>/dev/null; rm -f "$CTND_PIDFILE"; }
-# ---- 
+ctn_pid_sample() {
+    local count=0 comm
+    if ctn_read_names; then
+        ctn_note "READ node=$CTN_NAME_A:$CTN_PID_A,$CTN_NAME_B:$CTN_PID_B"
+        if [ "$CTN_PID_A" != -1 ]; then
+            comm=$(ctn_scalar "$CTN_PROC/$CTN_PID_A/comm")
+            [ "$comm" != "$(printf '%.15s' "$CTN_NAME_A")" ] || count=$((count + 1))
+        fi
+        if [ "$CTN_PID_B" != -1 ]; then
+            comm=$(ctn_scalar "$CTN_PROC/$CTN_PID_B/comm")
+            [ "$comm" != "$(printf '%.15s' "$CTN_NAME_B")" ] || count=$((count + 1))
+        fi
+    fi
+    if [ "$count" -gt 0 ]; then
+        ctn_note "READ HAL-registered PID/comm samples matched=$count (a snapshot, not a write/boost test)"
+    else
+        ctn_note 'SKIP real PID exercise: no stable HAL-registered sample; rt_info is never overwritten'
+    fi
+}
+[ ! -r "$CTN_NODE" ] || ctn_pid_sample
 
-# 写一个值、读回核对。不一致时**立刻重读**再判 —— 实测遇到过一次
-# 「读回好几轮之前的旧值」（模块刚重载 + 连续写的场景；之后 300 轮压测复现不出来）。
-# 重读能区分两种情况，而且两种都如实报出来：
-#   瞬时旧值 → 重读就对了，记进 STALE，最后以备注行提示（不算失败）
-#   真写坏了 → 怎么读都不对，返回 1，由调用方报失败
-STALE=""
-STALEN=0
-wread() { # wread <要写的> <期望读回> [轮次说明]
-	echo "$1" > "$NODE" 2>/dev/null
-	got=$(cat "$NODE")
-	[ "$got" = "$2" ] && return 0
-	sleep 0.2; g2=$(cat "$NODE")
-	sleep 0.2; g3=$(cat "$NODE")
-	if [ "$g2" = "$2" ] || [ "$g3" = "$2" ]; then
-		STALEN=$((STALEN+1))
-		STALE="$STALE${STALE:+；}${3:-写 $1} 首次读到 [$got]"
-		return 0
-	fi
-	return 1
+if [ "$CTN_EXERCISE" = 0 ]; then
+    ctn_note 'Static checks only: no loading, node writes, new threads, PID signals, log writes, or enable changes.'
+    ctn_note 'No runtime exercise was performed; a matching on-disk file is not proof of a running new version.'
+    exit "$CTN_IDENTITY_RC"
+fi
+
+[ "$(id -u)" = 0 ] || { ctn_error '--exercise requires root'; exit 1; }
+ctn_disabled && { ctn_error 'disabled/removing: --exercise refused; flags unchanged'; exit 1; }
+[ "$CTN_IDENTITY_RC" = 0 ] || { ctn_error 'cannot exercise an old/unknown loaded instance'; exit 1; }
+ctn_dependency_ready || { ctn_error 'vendor dependency is not ready'; exit 1; }
+ctn_maintenance_lock || exit $?
+CTN_RESUME_SERVICE=0
+CTN_PAUSED=0
+CTN_SAVED_NAMES=
+CTN_SAVED_ENABLE=
+CTN_NAMES_TOUCHED=0
+CTN_KEEP_STOP=0
+[ ! -e "$CTN_RUNTIME/.service.stop" ] || CTN_KEEP_STOP=1
+if ctn_service_pid >/dev/null; then
+    CTN_RESUME_SERVICE=1
+elif ! ctn_service_idle; then
+    ctn_error 'service lock has no matching process identity; refusing to interrupt it'
+    exit 1
+elif ctn_daemon_pid >/dev/null; then
+    ctn_error 'standalone daemon is not managed by this service; refusing to lose its original arguments'
+    exit 1
+fi
+
+ctn_write_node() { printf '%s\n' "$1" > "$CTN_NODE"; }
+ctn_write_enable() { printf '%s\n' "$1" > "$CTN_ENABLE"; }
+ctn_expect_names() {
+    ctn_write_node "$1" || return $?
+    ctn_read_names && [ "$CTN_NAMES" = "$2" ]
 }
 
-# 打一个内核日志标记：第 11 项只扫标记之后的日志，免得被无关模块的
-# WARNING 误伤（实测踩过：抓到 10 分钟前一条无关的 warn_alloc）。
-KLOG_MARK="CTN_VERIFY_$$_$(date +%s)"
-echo "$KLOG_MARK START" > /dev/kmsg 2>/dev/null
+ctn_exercise_cleanup() {
+    local rc=$? restore_rc=0 tries=0
+    trap - EXIT INT TERM HUP
+    if [ "$CTN_NAMES_TOUCHED" = 1 ]; then
+        ctn_write_node "$CTN_SAVED_NAMES" && ctn_read_names &&
+            [ "$CTN_NAMES" = "$CTN_SAVED_NAMES" ] || {
+            restore_rc=$?; ctn_error "cannot restore original names [$CTN_SAVED_NAMES]";
+        }
+        # We do not enable ct_enable for the test. If it drifted, restore the exact
+        # saved value instead of an assumed default.
+        if [ "$(ctn_scalar "$CTN_ENABLE")" != "$CTN_SAVED_ENABLE" ]; then
+            ctn_write_enable "$CTN_SAVED_ENABLE" &&
+                [ "$(ctn_scalar "$CTN_ENABLE")" = "$CTN_SAVED_ENABLE" ] || {
+                restore_rc=$?; ctn_error "cannot restore ct_enable=$CTN_SAVED_ENABLE";
+            }
+        fi
+    fi
+    if [ "$CTN_LOADED_BY_US" = 1 ]; then
+        if [ "$restore_rc" = 0 ] && [ ! -e "$CTN_RUNTIME/restore.state" ]; then
+            rmmod ctn_patch || { restore_rc=$?; ctn_error "cannot unload the test-owned KO rc=$restore_rc"; }
+        else ctn_error 'restoration failed; refusing to unload test KO'; restore_rc=1
+        fi
+    fi
+    if [ "$CTN_PAUSED" = 1 ] && [ "$CTN_KEEP_STOP" = 0 ] && [ "$restore_rc" = 0 ]; then
+        rm -f "$CTN_RUNTIME/.service.stop" || restore_rc=1
+    fi
+    ctn_maintenance_unlock || restore_rc=1
+    if [ "$CTN_RESUME_SERVICE" = 1 ] && [ "$CTN_PAUSED" = 1 ] && [ "$restore_rc" = 0 ]; then
+        if ctn_disabled; then
+            ctn_note 'disable/remove appeared during exercise; service deliberately not resumed'
+        else
+            "$CTN_SHELL" "$MODDIR/service.sh" || restore_rc=1
+            while [ "$restore_rc" = 0 ]; do
+                if ctn_service_pid >/dev/null && ctn_daemon_current >/dev/null; then
+                    ctn_note 'original service and current daemon resumed'; break
+                fi
+                [ "$tries" -lt 15 ] || { ctn_error 'service did not resume; inspect runtime logs'; restore_rc=1; break; }
+                sleep 1; tries=$((tries + 1))
+            done
+        fi
+    fi
+    if [ "$restore_rc" != 0 ]; then rc=$restore_rc; fi
+    ctn_note "exercise finished rc=$rc profile=$CTN_PROFILE build_id=$CTN_BUILD_ID; dmesg was not cleared"
+    exit "$rc"
+}
+trap ctn_exercise_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
-# ---------------------------------------------------------------- 环境
-VER=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
-echo "ctn_patch 自检${VER:+  $VER}"
-echo "  机型 $(getprop ro.product.model 2>/dev/null) / $(getprop ro.board.platform 2>/dev/null)" \
-     "｜ 内核 $(uname -r) ｜ 页 $(getconf PAGE_SIZE 2>/dev/null || echo ?) ｜ SELinux $(getenforce 2>/dev/null)"
-echo
-
-if [ "$(id -u)" != "0" ]; then echo "必须以 root 运行"; exit 1; fi
-if ! grep -q "^$VICTIM " /proc/modules; then
-	echo "$VICTIM 未加载，本模块无意义"
-	exit 1
-fi
-
-# ---------------------------------------------------------------- 1 模块文件
-# ctnd 的可执行位必须显式检查：解包器可能丢掉它（实测踩过，装完 daemon 起不来）
-F_MISS=""; F_BAD=""
-[ -f "$KO" ] || F_MISS="$F_MISS ctn_patch.ko"
-[ -s "$MODDIR/ctnd" ] || F_MISS="$F_MISS ctnd"
-[ -f "$MODDIR/ctnd" ] && [ ! -x "$MODDIR/ctnd" ] && F_BAD="$F_BAD ctnd(无可执行位)"
-if [ -n "$F_MISS" ]; then
-	ng "模块文件    " "缺:$F_MISS"
-elif [ -n "$F_BAD" ]; then
-	ng "模块文件    " "权限不对:$F_BAD（chmod 755 或重装）"
-else
-	ok "模块文件    " "ko $(stat -c%s "$KO")B ｜ ctnd $(stat -c%s "$MODDIR/ctnd")B 0755 $(grep -qa ELF "$MODDIR/ctnd" && echo ELF)"
-fi
-
-# ---------------------------------------------------------------- 3 vermagic
-KO_VM=$(grep -aom1 'vermagic=[ -~]*' "$KO" 2>/dev/null | cut -d= -f2)
-K_REL=$(uname -r)
-if [ -z "$KO_VM" ]; then
-	ng "vermagic    " "读不到 ko 的 vermagic"
-else
-	KO4=$(echo "$KO_VM" | cut -d' ' -f1 | awk -F- '{print $1"-"$2"-"$3"-"$4}')
-	K4=$(echo "$K_REL"  | awk -F- '{print $1"-"$2"-"$3"-"$4}')
-	if [ "$KO4" = "$K4" ]; then
-		ok "vermagic    " "$KO4"
-	else
-		ng "vermagic    " "ko [$KO4] 与内核 [$K4] 不一致，insmod 大概率失败"
-	fi
-fi
-
-# ---------------------------------------------------------------- 4 insmod
-say_loaded=0
-if grep -q '^ctn_patch ' /proc/modules; then
-	# 已经加载着：没法测加载/卸载，但要能测节点行为
-	sk "insmod      " "ctn_patch 已在运行，本次跳过加载/卸载测试"
-	say_loaded=1
-else
-	R0=$(sed -n "s/^$VICTIM [0-9]* \([0-9]*\).*/\1/p" /proc/modules)
-	if insmod "$KO" 2>/dev/null; then
-		R1=$(sed -n "s/^$VICTIM [0-9]* \([0-9]*\).*/\1/p" /proc/modules)
-		if [ "${R1:-0}" -gt "${R0:-0}" ] 2>/dev/null; then
-			ok "insmod      " "成功，$VICTIM refcount $R0→$R1（已钉住）"
-		else
-			ng "insmod      " "成功但 refcount 没涨（$R0→$R1），钉住可能没生效"
-		fi
-	else
-		ng "insmod      " "失败（内核拒绝了这个 .ko）"
-		# 查 bug 看 dmesg：只抓 ctn_patch 相关的行，比 tail 一大片有用
-		KT=$(dmesg 2>/dev/null | grep -i ctn_patch | tail -5)
-		if [ -n "$KT" ]; then
-			printf '%s
-' "$KT" | while read -r l; do det "$l"; done
-		else
-			det "内核日志里没有 ctn_patch 的行 → 连 init 都没进去"
-			det "手动确认：dmesg | tail -30"
-		fi
-	fi
-fi
-
-# ---------------------------------------------------------------- 5 节点
-if [ -e "$NODE" ]; then
-	ok "节点        " "$(ls -l "$NODE" | awk '{print $1, $3, $4}')"
-else
-	ng "节点        " "不存在（模块没加载成功？）"
-fi
-
-# ---------------------------------------------------------------- 6 读格式
-V=$(cat "$NODE" 2>/dev/null)
-case "$V" in
-	*:*","*:*) ok "读格式      " "[$V]" ;;
-	"")        ng "读格式      " "读不到内容" ;;
-	*)         ng "读格式      " "不是 名字:pid,名字:pid 格式：[$V]" ;;
-esac
-
-# ---------------------------------------------------------------- 6.5 pid 机制
-# v2.1 起把 6.6 的 critical_task_pids 移植过来了：读节点时现算真实 pid
-# （数据源是 6.1 自己的 related_threads[]）。没游戏跑时显示 -1 是正常的，
-# 所以这里只检查「格式对不对」+「名字匹配得到线程时 pid 是不是真的」。
-#
-# 怎么造一个能匹配上的线程：fakethreads 起两个线程、comm 改成给定名字，
-# 再用厂商自己的接口把它们的 tid 写进 /proc/game_opt/rt_info 登记 —— 走的是
-# 游戏运行时 HAL 走的那条完全相同的路。
-PIDCHK="skip"
-FT="$MODDIR/fakethreads"
-if [ -x "$FT" ] && [ -w /proc/game_opt/rt_info ]; then
-	FTLOG=/data/local/tmp/.ctn_ft.out
-	rm -f "$FTLOG"
-	"$FT" CtnPidChkA CtnPidChkB > "$FTLOG" 2>&1 &
-	FTPID=$!
-	sleep 3
-	TA=$(awk '/CtnPidChkA/{print $3}' "$FTLOG" 2>/dev/null)
-	TB=$(awk '/CtnPidChkB/{print $3}' "$FTLOG" 2>/dev/null)
-	if [ -n "$TA" ] && [ -n "$TB" ]; then
-		echo "$TA $TB" > /proc/game_opt/rt_info 2>/dev/null
-		sleep 1
-		echo "CtnPidChkA CtnPidChkB" > "$NODE" 2>/dev/null
-		sleep 1
-		GOT=$(cat "$NODE" 2>/dev/null)
-		if [ "$GOT" = "CtnPidChkA:$TA,CtnPidChkB:$TB" ]; then
-			ok "pid 机制    " "名字→真 pid 正确（$TA / $TB）"
-		else
-			ng "pid 机制    " "pid 不对"
-			det "期望 CtnPidChkA:$TA,CtnPidChkB:$TB"
-			det "实际 $GOT"
-		fi
-		# 单名：两槽同名同 pid
-		echo "CtnPidChkA" > "$NODE" 2>/dev/null
-		sleep 1
-		GOT=$(cat "$NODE" 2>/dev/null)
-		if [ "$GOT" = "CtnPidChkA:$TA,CtnPidChkA:$TA" ]; then
-			ok "pid 单名    " "两槽同名同 pid（$TA）"
-		else
-			ng "pid 单名    " "单名两槽不一致"
-			det "实际 $GOT"
-		fi
-	else
-		sk "pid 机制    " "fakethreads 没起来，跳过（不影响其它项）"
-	fi
-	kill $FTPID 2>/dev/null
-	rm -f "$FTLOG"
-else
-	sk "pid 机制    " "没有 fakethreads 或 rt_info 不可写，跳过"
-fi
-
-# ---------------------------------------------------------------- 7 写入读回
-if wread "CTNTestMain CTNTestGfx" "CTNTestMain:-1,CTNTestGfx:-1" "写入读回"; then
-	ok "写入读回    " "正确"
-else
-	ng "写入读回    " "写进去和读回来不一致（重读也对不上）"
-	det "读回 [$(cat "$NODE")]"
-fi
-
-# ---------------------------------------------------------------- 8 反复写
-RCU_BAD=""
-i=1
-while [ $i -le 8 ]; do
-	wread "A${i}Main A${i}Gfx" "A${i}Main:-1,A${i}Gfx:-1" "反复写第 $i 次" || RCU_BAD="$RCU_BAD $i"
-	i=$((i+1))
-done
-if [ -z "$RCU_BAD" ]; then ok "反复写      " "8/8 正确（双缓冲/RCU 路径）"; else ng "反复写      " "第$RCU_BAD 次不一致"; fi
-
-# ---------------------------------------------------------------- 9 边界输入
-E=""
-# v2.2 起：**单名也接受**（内核把第二个槽填成同名）。旧版要求和官方 6.6 一样
-# 「恰好两个」，写一个会被 -EINVAL 拒 —— 这条期望值跟着改了，别忘了。
-echo "onlyone" > "$NODE" 2>/dev/null || E="$E 单名被拒(应接受并补成两槽)"
-[ "$(cat "$NODE")" = "onlyone:-1,onlyone:-1" ] || E="$E 单名没补成两槽[$([ "$(cat "$NODE")" = "onlyone:-1,onlyone:-1" ] || cat "$NODE")]"
-echo "A B C"   > "$NODE" 2>/dev/null && E="$E 三名被接受(应拒)"
-echo "ABCDEFGHIJKLMNO0 ABCDEFGHIJKLMNO1" > "$NODE" 2>/dev/null || E="$E 16字符被拒(应接受)"
-LONG=$(printf 'x%.0s' $(seq 1 120) 2>/dev/null)
-echo "$LONG test" > "$NODE" 2>/dev/null && E="$E 120字符被接受(应拒)"
-printf " " > "$NODE" 2>/dev/null && E="$E 全空白被接受(应拒)"
-if [ -z "$E" ]; then
-	ok "边界输入    " "单名接受(补成两槽)/16字符 接受；三名/120字符/全空白 被拒"
-else
-	ng "边界输入    " "不符合预期:$E"
-fi
-
-# ---------------------------------------------------------------- 10 恢复
-if wread "UnityMain UnityGfxDevice" "UnityMain:-1,UnityGfxDevice:-1" "恢复默认值"; then
-	ok "恢复默认值  " "UnityMain/UnityGfxDevice"
-else
-	ng "恢复默认值  " "恢复失败（重读也对不上）：[$(cat "$NODE")]"
-fi
-
-# ---------------------------------------------------------------- 11 dmesg
-# 只取本次测试期间的日志。标记必须出现，否则说明 /dev/kmsg 写不进去 ——
-# 那种情况绝不能报 OK（等于什么都没查却说没问题），宁可报失败让人看见。
-LOG=$(dmesg | sed -n "/$KLOG_MARK START/,\$p")
-if [ -z "$LOG" ]; then
-	ng "dmesg 异常  " "取不到本次日志段（标记不在 dmesg 里），未扫描"
-	det "确认：dmesg | grep CTN_VERIFY_"
-else
-	BAD=$(echo "$LOG" | grep -iE "BUG:|WARNING:|Unable to handle|Internal error|Call trace|Oops|CFI failure" \
-	      | grep -vE "CTN_VERIFY_" | tail -n 5)
-	if [ -z "$BAD" ]; then
-		ok "dmesg 异常  " "本次无 BUG/WARNING/oops/CFI failure"
-	else
-		ng "dmesg 异常  " "本次测试期间有异常"
-		echo "$BAD" | while read -r l; do det "$l"; done
-	fi
-fi
-echo "$KLOG_MARK END" > /dev/kmsg 2>/dev/null
-
-# ---------------------------------------------------------------- 12 卸载
-if [ "$say_loaded" = "1" ]; then
-	sk "卸载        " "本次没由脚本加载，跳过"
-elif rmmod ctn_patch 2>/dev/null; then
-	if [ -e "$NODE" ]; then
-		ng "卸载        " "rmmod 成功但节点还在"
-	else
-		ok "卸载        " "rmmod 后节点已消失，refcount 还原"
-	fi
-else
-	ng "卸载        " "rmmod 失败（有进程正拿着节点？）"
-fi
-
-# ------------------------------------------------- 恢复运行状态（后面要查 daemon）
-# 自检不能把设备留在「模块没加载 / daemon 没跑」的状态，而且 daemon 那几项
-# 必须它真的在跑才有意义 —— 所以这里先把它拉起来。这几行不算检查项。
-echo "  --- 恢复运行状态 ---"
-if ! grep -q '^ctn_patch ' /proc/modules; then
-	insmod "$KO" 2>/dev/null && echo "    模块已重新加载" || echo "    !! 模块重新加载失败，建议重启"
-fi
-if ! ctnd_alive; then
-	if [ -x "$MODDIR/ctnd" ]; then
-		# 记下 daemon.log 现有行数：起不来时只打新增的那几行当"原因"
-		DL0=$(wc -l < "$MODDIR/daemon.log" 2>/dev/null)
-		[ -n "$DL0" ] || DL0=0
-		i=1
-		while [ $i -le 3 ]; do
-			setsid "$MODDIR/ctnd" >> "$MODDIR/daemon.log" 2>&1 < /dev/null &
-			j=1
-			while [ $j -le 5 ]; do
-				ctnd_alive && break
-				sleep 1
-				j=$((j+1))
-			done
-			ctnd_alive && break
-			# 没起来：清掉残兵再来（锁可能被一个正在退出的 ctnd 占着）
-			ctnd_kill
-			sleep 1
-			i=$((i+1))
-		done
-		# 必须**确认**起来了才敢说"已拉起" —— 早期版本无条件打印，
-		# 结果上面写"已拉起"、下一项又报"没在运行"，自相矛盾（实测踩过）。
-		if ctnd_alive; then
-			echo "    daemon 已拉起（pid $(ctnd_pid)）"
-		else
-			echo "    !! daemon 起不来（试了 3 次），本次尝试期间的新日志："
-			tail -n +$((DL0 + 1)) "$MODDIR/daemon.log" 2>/dev/null | tail -n 5 | while read -r l; do echo "       $l"; done
-		fi
-	else
-		echo "    !! 找不到 $MODDIR/ctnd"
-	fi
-fi
-
-# ---------------------------------------------------------------- 13 daemon
-NP=$(ctnd_alive && echo 1 || echo 0)
-if [ "$NP" = "1" ]; then
-	DV=$("$MODDIR/ctnd" --version 2>/dev/null | awk '{print $2}')
-	ok "daemon      " "ctnd ${DV:-?} 运行中（pid $(ctnd_pid)）"
-elif [ "$NP" = "0" ]; then
-	ng "daemon      " "ctnd 没在运行 —— 节点不会被自动写入"
-else
-	ng "daemon      " "有 $NP 个 ctnd 实例，应只允许 1 个（互抢写节点）"
-fi
-
-# ---------------------------------------------------------------- 14 daemon 依赖
-D=""
-for p in /system/lib64/libsqlite.so /system/lib64/libsqlite3.so \
-         /apex/com.android.runtime/lib64/libsqlite3.so; do
-	[ -r "$p" ] && { D="$D sqlite=ok"; break; }
-done
-case "$D" in *sqlite*) ;; *) D="$D sqlite=缺" ;; esac
-[ -r /data/user/0/com.oplus.cosa/databases/db_game_database ] && D="$D cosa库=ok" || D="$D cosa库=缺"
-case "$D" in
-	*"sqlite=缺"*|*"cosa库=缺"*) ng "daemon 依赖 " "$D" ;;
-	*) ok "daemon 依赖 " "$D" ;;
-esac
-
-# ---------------------------------------------------------------- 15 daemon 日志
-# 只看**本次自检之后新增**的记录：日志里留着升级/重载过渡期的旧记录（比如停
-# daemon 时守护循环抢跑撞了一次锁，它自己退干净了，无后果），拿历史噪音判失败
-# 只会吓人。所以用「行数水位」：上次检查到的行数存进 .verify_logmark，
-# 这次只看新增的行（水位跟日志同目录；日志被轮转/清空时水位自动归零重来）。
-# 另外「已有另一个实例」要分两种情况看：确实有 ctnd 活着 → 是撞锁自愈（无后果）；
-# 没有 ctnd 活着 → 那几条撞锁正是起不来的原因，要判失败（下面按 ctnd_alive 区分）。
-	DLOG="$MODDIR/daemon.log"
-	if [ ! -f "$DLOG" ]; then
-		sk "daemon 日志 " "还没有 $DLOG"
-	else
-		WMARK="$MODDIR/.verify_logmark"
-		PREV=$(cat "$WMARK" 2>/dev/null)
-		[ -n "$PREV" ] || PREV=0
-		CUR=$(wc -l < "$DLOG" 2>/dev/null)
-		[ -n "$CUR" ] || CUR=0
-		# 日志变短了 = 被轮转/清空，水位归零从头看
-		[ "$CUR" -ge "$PREV" ] 2>/dev/null || PREV=0
-
-		NEWL=$(tail -n +$((PREV + 1)) "$DLOG" 2>/dev/null)
-		echo "$CUR" > "$WMARK" 2>/dev/null
-
-		# 第一次建水位：没有「上次看到哪」的基准，历史记录全是旧的、
-		# 没法区分是不是本次产生的 —— 只立水位不评价，下次开始才算数。
-		if [ "$PREV" = "0" ] && [ "$CUR" != "0" ]; then
-			sk "daemon 日志 " "首次检查，只记水位（$CUR 行），历史记录不评价"
-		else
-		# 自愈噪音：撞锁后自己退出（无后果）
-			NOISE_N=$(printf '%s\n' "$NEWL" | grep -cE "已有另一个 ctnd 在跑")
-			# 真失败：需要人为处理的
-			BADF=$(printf '%s\n' "$NEWL" \
-			       | grep -E "加载失败|写入失败|缺少符号|找不到可读的云控库" | tail -n 3)
-
-			if [ -n "$BADF" ]; then
-				ng "daemon 日志 " "本次期间有失败记录"
-				echo "$BADF" | while read -r l; do det "$l"; done
-			elif [ "$NOISE_N" -gt 0 ] 2>/dev/null; then
-				# 撞锁**只有**在确实有 ctnd 活着时才算「自愈、无后果」。
-				# 没有 ctnd 在跑就说明它没自愈 —— 那几条撞锁正是起不来的原因，
-				# 这时候还写「无后果」是误导（实测踩过）。
-				if ctnd_alive; then
-					sk "daemon 日志 " "本次期间有 $NOISE_N 次撞锁自愈（无后果）"
-				else
-					ng "daemon 日志 " "本次期间 $NOISE_N 次撞锁，且当前没有 ctnd 在运行 —— 这就是它起不来的原因"
-				fi
-				printf '%s\n' "$NEWL" | grep -E "已有另一个 ctnd 在跑" | tail -n 3 | while read -r l; do det "$l"; done
-			else
-				ok "daemon 日志 " "本次期间无失败记录"
-			fi
-		fi
-	fi
-
-# ---------------------------------------------------------------- 汇总
-if [ "$STALEN" != "0" ]; then
-	sk "瞬时旧值    " "有 $STALEN 次首次读回旧值（重读即正常，不算失败）"
-	det "$STALE"
-fi
-echo "------------------------------------------------"
-if [ "$FAIL" = "0" ]; then
-	echo "结果: $PASS 项全过${SKIP:+（$SKIP 项跳过/备注）}"
-else
-	echo "结果: $PASS 过 / $FAIL 失败${SKIP:+ / $SKIP 跳过}   ← 看上面标 [!!] 的行"
-fi
-[ "$FAIL" = "0" ]
+ctn_stop_service || exit 1
+CTN_PAUSED=1
+ctn_disabled && { ctn_error 'disabled/removing while waiting'; exit 1; }
+ctn_ensure_module || exit $?
+ctn_read_names || { ctn_error 'original names cannot be restored unambiguously; no writes performed'; exit 1; }
+CTN_SAVED_NAMES=$CTN_NAMES
+CTN_SAVED_ENABLE=$(ctn_scalar "$CTN_ENABLE") || exit 1
+case "$CTN_SAVED_ENABLE" in 0|1) ;; *) ctn_error 'unknown ct_enable original; no writes performed'; exit 1 ;; esac
+[ -w "$CTN_NODE" ] || exit 1
+CTN_NAMES_TOUCHED=1
+ctn_expect_names 'CTNTestMain CTNTestGfx' 'CTNTestMain CTNTestGfx' || {
+    CTN_WRITE_RC=$?; ctn_error "dual-name write/readback failed rc=$CTN_WRITE_RC"; exit "$CTN_WRITE_RC";
+}
+ctn_expect_names 'CTNTestSingle' 'CTNTestSingle CTNTestSingle' || {
+    CTN_WRITE_RC=$?; ctn_error "single-name write/readback failed rc=$CTN_WRITE_RC"; exit "$CTN_WRITE_RC";
+}
+if ctn_write_node 'A B C' 2>/dev/null; then ctn_error 'invalid three-name input was accepted'; exit 1; fi
+if ctn_write_node ' ' 2>/dev/null; then ctn_error 'empty input was accepted'; exit 1; fi
+ctn_note 'Name write/read and rejection tests passed; restoring saved values, not defaults.'
+ctn_note 'SKIP synthetic PID registration: rt_info has no proven reversible restore contract.'
+exit 0

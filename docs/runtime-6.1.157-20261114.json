@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "profile_id": "6.1.157",
+  "module_sha256": "ed681189a38a39cc89673d052a0c521d386b908f22811daa1c56ca2d46012297",
+  "kernel_release": "6.1.157-android14-11-o-g00d81d97d759",
+  "device": "PJX110",
+  "firmware": "PJX110_17.0.1.201(CN01)",
+  "result": "passed",
+  "checks_passed": 12,
+  "checks_failed": 0,
+  "tested": [
+    "readonly_insmod_param_rejected",
+    "load",
+    "profile",
+    "build_id",
+    "patch_ready",
+    "original_names",
+    "dual_names",
+    "single_name",
+    "three_name_rejection",
+    "blank_rejection",
+    "embedded_nul_rejection",
+    "invalid_input_preserves_state",
+    "original_names_restored",
+    "unload_node_removed",
+    "disabled_flag_preserved",
+    "game_pid_unchanged"
+  ],
+  "skipped": [
+    {
+      "name": "HAL registered true PID sample",
+      "reason": "No game was running; rt_info never overwritten"
+    }
+  ],
+  "not_tested": [
+    "module install/boot on real device",
+    "real game scheduling behavior",
+    "new daemon against live production game"
+  ],
+  "evidence": {
+    "ctn_patch.ko": "ed681189a38a39cc89673d052a0c521d386b908f22811daa1c56ca2d46012297",
+    "dmesg-after.txt": "fa4384f3990f9c2b7554cc53a3154bf0fe9c862f98e6c3ee39cd180141722f53",
+    "dmesg-before.txt": "8a30cbdd346c97f84ecd5fd2e0075117d3b1faee3359c69f180aa1b410eece60",
+    "insmod.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "param-test.txt": "71368ad184e3132d12e65de7f100d3c0665865080acb1d19d7f7ab424b695806",
+    "runtime-check.sh": "d5e962e7a1337c434669455776e7199f64acd6a4e039fbf0551c159df343e35c"
+  },
+  "note": "Temporary KO exercised by explicit user authorization; original disabled state preserved. Not a whole-module release certification."
+}
