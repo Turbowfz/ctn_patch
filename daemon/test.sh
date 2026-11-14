@@ -50,7 +50,7 @@ for cc in "${COMPILERS[@]}"; do
 	printf '\n=== Native tests: %s ===\n' "$cc"
 	run_suite "$cc" "$out/plain"
 	"$cc" "${FLAGS[@]}" "${ALL[@]}" -ldl -o "$out/ctnd"
-	[[ "$("$out/ctnd" -V)" == 'ctnd 3.0' ]]
+	[[ "$("$out/ctnd" -V)" == 'ctnd 3.1' ]]
 	"$out/ctnd" -h >/dev/null
 	for arg in --unknown --node /arbitrary; do
 		if "$out/ctnd" "$arg" >"$out/cli.log" 2>&1; then printf 'FAIL: unknown CLI accepted\n' >&2; exit 1; fi

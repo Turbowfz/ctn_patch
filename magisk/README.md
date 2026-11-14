@@ -1,10 +1,13 @@
 # ctn_patch 模块包（Magisk / KernelSU / APatch）
 
-本模块身份保持 `ctn_patch`、`v3.0`、`versionCode=30`。这个 README 是安装包说明；仓库根 README 是开发文档，两者不是需要同步的副本。
+本模块身份保持 `ctn_patch`、`v3.1`、`versionCode=31`。本说明是安装包文档，仓库根 README 是开发文档。
+CTN 只从 COSA 数据库自动读取，不创建、读取或支持手动 `ctn.conf`；旧版遗留文件不会生效。
 
 ## 包布局与兼容性
 
-- 根目录：`module.prop`、`customize.sh`、`service.sh`、`action.sh`、`uninstall.sh`、`verify.sh`、`changelog.txt`、本说明。
+- 根目录：`module.prop`、管理器脚本、`verify.sh`、`changelog.txt`、`oplus.png` 和本说明。
+- `banner=oplus.png` 使用模块内相对文件名；支持横幅的管理器显示，不支持者忽略。
+- `changelog.txt` 完整保留全部版本的短更新日志，每版最多四条，安装只显示当前版。
 - `lib/common.sh`：所有入口共用的选择器、进程身份及启停逻辑。
 - `bin/ctnd`：守护进程。
 - `kernels/6.1.141/` 与 `kernels/6.1.157/`：各自的 `ctn_patch.ko`、`manifest.json`、`metadata.prop`。安装后保留包内所有 KO，下次启动重新选择，不能在 OTA 后沿用上次选择。
@@ -22,20 +25,30 @@
 
 运行目录固定为 `/data/adb/ctn_patch`，不放在模块更新目录。daemon 独占 `.daemon.lock`，维护 `daemon.pid` 和内部 `restore.state`；服务独占 `.service.lock`。脚本核验 `/proc/<pid>/exe`、存活状态及启动时间，daemon 新旧文件比较已运行 exe 的 SHA256，不靠进程名、不扫全系统 fd、不杀无关 PID。`restore.state` 不是用户配置；只有 daemon 能解释和恢复它。
 
-日志位于 `/data/adb/ctn_patch/boot.log`、`daemon.log` 和 `action.log`。卸载先停止自身服务，向精确身份的 daemon 发 SIGTERM并等待恢复、进程退出和锁释放，再 `rmmod`。恢复债务仍在、退出超时或卸载失败时保留 runtime 并返回失败，不强杀、不抹掉报错。不修改管理器禁用/删除标志。
+日志位于 `/data/adb/ctn_patch/boot.log`、`daemon.log`、`action.log` 和 `action-detail.log`。
+安装输出由 Root 管理器保存，本模块不另外生成安装日志。卸载先停止自身服务，向精确
+身份的 daemon 发 SIGTERM 并等原值恢复、退出和锁释放，再 `rmmod`。恢复债务仍在、
+超时或卸载失败时保留 runtime 并返回失败，不强杀、不抹掉报错，不改管理器状态。
 
 ## 自检
 
-管理器点击 Action（操作）按钮直接运行自检，终端会显示结果和**日志位置**：
-`/data/adb/ctn_patch/action.log`。模块启用且无游戏运行时检查节点写读、边界输入和恢复；禁用、待删除或游戏运行时只查文件/兼容性，不加载或启用。失败退出码原样保留。
+管理器点击 Action（操作）按钮运行自检，默认只显示简短中文状态：适配是否匹配、
+当前版本是否运行、数据库是否可读、演练与恢复是否完成。模块启用且空闲时检查节点
+写读；禁用、待删除或游戏运行时只读，不加载或启用。失败或中断明确显示，保留退出码。
+
+- 摘要日志：`/data/adb/ctn_patch/action.log`
+- 完整技术诊断：`/data/adb/ctn_patch/action-detail.log`
 
 ```sh
-sh /data/adb/modules/ctn_patch/action.sh             # 直接自检并保存日志
-sh /data/adb/modules/ctn_patch/action.sh --read-only # 只读自检，仍保存日志
-sh /data/adb/modules/ctn_patch/verify.sh             # 只读检查，输出终端，不写日志
+sh /data/adb/modules/ctn_patch/action.sh             # 简短中文结果，两份日志分开保存
+sh /data/adb/modules/ctn_patch/action.sh --read-only # 不做写入演练，仍保存日志
+sh /data/adb/modules/ctn_patch/verify.sh             # 只读中文自检，不写日志
+sh /data/adb/modules/ctn_patch/verify.sh --details   # 只读完整技术诊断，不写日志
 ```
 
-输出分别标明 `FILE` 文件版本/profile/build_id/哈希与 `RUNNING` 已加载版本/profile/build_id、daemon 已运行 exe 哈希。运行 KO 的整文件 SHA256 不由内核公开，不把 build_id 冒称为 KO SHA256。直接调用默认 `verify.sh` 不创建锁/日志、不启停 daemon、不加载/卸载、不写节点；静态通过不等于功能实测通过。
+详细模式分别报告磁盘 `FILE` 与正在运行的 `RUNNING` 身份；默认不打印完整哈希。
+直接调用只读 `verify.sh` 不创建锁／日志、不启停 daemon、不加载／卸载、不写节点。
+文件匹配不等于已经加载，静态检查通过不等于游戏效果已验证。
 
 手动要求节点实测时也可使用下面命令（禁用/待删除状态仍拒绝）：
 

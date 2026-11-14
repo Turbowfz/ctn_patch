@@ -4,9 +4,19 @@
 
 ctn_error() { printf 'ctn_patch: %s\n' "$*" >&2; }
 ctn_note() { printf 'ctn_patch: %s\n' "$*"; }
+ctn_fail() {
+    CTN_ERROR_REASON=$1
+    CTN_ERROR_HINT=$2
+    ctn_error "$3"
+    return 1
+}
 
 ctn_init() {
-    MODDIR=$(CDPATH= cd -- "$1" 2>/dev/null && pwd -P) || return 1
+    CTN_ERROR_REASON=
+    CTN_ERROR_HINT=
+    MODDIR=$(CDPATH= cd -- "$1" 2>/dev/null && pwd -P) || {
+        ctn_fail '无法读取模块目录' '请用模块管理器重新解压安装，勿只复制个别文件。' 'cannot resolve module directory'; return 1;
+    }
     # Fixed production roots. Host tests replace this constant in a temporary copy.
     CTN_ROOT=
     CTN_RUNTIME="$CTN_ROOT/data/adb/ctn_patch"
@@ -14,19 +24,31 @@ ctn_init() {
     CTN_SYS="$CTN_ROOT/sys"
     CTN_NODE="$CTN_PROC/game_opt/task_boost/critical_task_name"
     CTN_ENABLE="$CTN_PROC/game_opt/task_boost/ct_enable"
-    CTN_SHELL=$(command -v sh) || return 1
+    CTN_SHELL=$(command -v sh) || {
+        ctn_fail '找不到系统命令解释器' '请更新 Root 模块管理器，确认 /system/bin/sh 可用。' 'shell lookup failed'; return 1;
+    }
     # BusyBox standalone ash reports its applet as bare "sh", not an executable path.
     case "$CTN_SHELL" in
         /*) ;;
         *) CTN_SHELL="$CTN_ROOT/system/bin/sh" ;;
     esac
-    [ -x "$CTN_SHELL" ] || { ctn_error 'no executable absolute shell path'; return 1; }
-    CTN_SHELL_EXE=$(readlink -f "$CTN_SHELL") || return 1
-    case "$CTN_SHELL_EXE" in /*) ;; *) ctn_error 'cannot resolve shell executable'; return 1 ;; esac
-    [ -x "$CTN_SHELL_EXE" ] || return 1
-    CTN_PACKAGE_VERSION=$(ctn_property "$MODDIR/module.prop" version) || return 1
+    [ -x "$CTN_SHELL" ] || {
+        ctn_fail '系统命令解释器不可执行' '请更新模块管理器并检查 /system/bin/sh，不要从相对路径启动。' 'no executable absolute shell path'; return 1;
+    }
+    CTN_SHELL_EXE=$(readlink -f "$CTN_SHELL") || {
+        ctn_fail '无法解析系统命令解释器' '请更新管理器 BusyBox，确认 readlink 命令可用。' 'cannot canonicalize shell executable'; return 1;
+    }
+    case "$CTN_SHELL_EXE" in /*) ;; *)
+        ctn_fail '命令解释器路径不完整' '请通过正规模块管理器安装。' 'cannot resolve shell executable'; return 1 ;;
+    esac
+    [ -x "$CTN_SHELL_EXE" ] || {
+        ctn_fail '系统命令解释器不可执行' '请检查系统环境与 Root 模块管理器。' 'canonical shell is not executable'; return 1;
+    }
+    CTN_PACKAGE_VERSION=$(ctn_property "$MODDIR/module.prop" version) || {
+        ctn_fail '模块版本信息缺失或损坏' '请重新下载完整 ZIP，通过模块管理器安装。' 'module.prop version is missing or invalid'; return 1;
+    }
     [ "$(ctn_property "$MODDIR/module.prop" id)" = ctn_patch ] || {
-        ctn_error 'module.prop identity is not ctn_patch'; return 1;
+        ctn_fail '模块身份信息不正确' '请重新下载 CTN Patch ZIP，勿与其他模块文件混用。' 'module.prop identity is not ctn_patch'; return 1;
     }
     CTN_EXPECTED_VERSION=${CTN_PACKAGE_VERSION#v}
     CTN_LOADED_BY_US=0
@@ -163,40 +185,55 @@ ctn_read_metadata() {
 # image binds full vermagic, CRCs, KCFI and layouts to the verified profile.
 ctn_select() {
     local paths path file hash found=0
-    CTN_RELEASE=$(uname -r) || return 1
+    CTN_ERROR_REASON=
+    CTN_ERROR_HINT=
+    CTN_RELEASE=$(uname -r) || {
+        ctn_fail '无法读取当前内核版本' '请确认 uname 命令可用，并保存安装详细日志。' 'kernel release lookup failed'; return 1;
+    }
     CTN_SELECTED_PROFILE=${CTN_RELEASE%%-*}
     case "$CTN_SELECTED_PROFILE" in 6.1.141|6.1.157) ;; *)
-        ctn_error "unsupported kernel: $CTN_RELEASE (no insmod probing)"; return 1 ;; esac
-    [ "$(uname -m)" = aarch64 ] || { ctn_error 'requires aarch64'; return 1; }
+        ctn_fail '当前内核暂不支持' "本包仅支持已核验的 6.1.141 / 6.1.157；当前为 $CTN_RELEASE。" "unsupported kernel: $CTN_RELEASE (no insmod probing)"; return 1 ;;
+    esac
+    [ "$(uname -m)" = aarch64 ] || {
+        ctn_fail 'CPU 架构不匹配' '此模块仅支持 ARM64 手机，不能在其他架构强行加载。' 'requires aarch64'; return 1;
+    }
     CTN_ACTUAL_PAGE_SIZE=$(getconf PAGE_SIZE 2>/dev/null) || CTN_ACTUAL_PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null)
-    [ "$CTN_ACTUAL_PAGE_SIZE" = 4096 ] || { ctn_error 'requires verified 4096-byte pages'; return 1; }
+    [ "$CTN_ACTUAL_PAGE_SIZE" = 4096 ] || {
+        ctn_fail '内存页大小不匹配或无法读取' '当前构建仅支持 4096 字节页；请检查 getconf 命令或提供设备基线。' 'requires verified 4096-byte pages'; return 1;
+    }
     CTN_KERNEL_DIR="$MODDIR/kernels/$CTN_SELECTED_PROFILE"
     CTN_KO="$CTN_KERNEL_DIR/ctn_patch.ko"
-    ctn_read_metadata "$CTN_KERNEL_DIR/metadata.prop" || return 1
+    ctn_read_metadata "$CTN_KERNEL_DIR/metadata.prop" || {
+        ctn_fail '当前内核的模块清单缺失或损坏' '请重新下载完整 ZIP，不要混用旧版 KO 和新版脚本。' 'selected profile metadata validation failed'; return 1;
+    }
     ctn_list_contains "$CTN_RELEASES" "$CTN_RELEASE" || {
-        ctn_error "kernel release is not allowlisted: $CTN_RELEASE"; return 1;
+        ctn_fail '当前固件的完整内核版本尚未核验' '相同 141/157 版本号不代表 ABI 相同；请提供完整 uname -r 和安装详细日志。' "kernel release is not allowlisted: $CTN_RELEASE"; return 1;
     }
     [ ! -L "$CTN_KERNEL_DIR/manifest.json" ] &&
         [ "$(ctn_sha256 "$CTN_KERNEL_DIR/manifest.json")" = "$CTN_MANIFEST_HASH" ] || {
-        ctn_error 'manifest hash mismatch'; return 1;
+        ctn_fail '兼容性清单校验失败' '请重新下载并安装完整 ZIP，检查 sha256sum 是否可用。' 'manifest hash mismatch'; return 1;
     }
     [ -f "$CTN_KO" ] && [ ! -L "$CTN_KO" ] &&
         [ "$(ctn_sha256 "$CTN_KO")" = "$CTN_MODULE_HASH" ] || {
-        ctn_error 'target KO hash mismatch'; return 1;
+        ctn_fail '所选 KO 文件损坏或缺失' '请重新下载完整 ZIP，勿手动替换内核模块。' 'target KO hash mismatch'; return 1;
     }
     [ -f "$MODDIR/bin/ctnd" ] && [ ! -L "$MODDIR/bin/ctnd" ] &&
         [ "$(ctn_sha256 "$MODDIR/bin/ctnd")" = "$CTN_DAEMON_HASH" ] || {
-        ctn_error 'daemon file hash mismatch'; return 1;
+        ctn_fail '数据库服务程序损坏或缺失' '请重新下载完整 ZIP，勿只复制 KO。' 'daemon file hash mismatch'; return 1;
     }
     CTN_VENDOR_FILE=
     paths=$CTN_VENDOR_PATHS
     while [ -n "$paths" ]; do
         path=${paths%%\|*}; file="$CTN_ROOT$path"
         if [ -e "$file" ] || [ -L "$file" ]; then
-            [ -f "$file" ] && [ -r "$file" ] || { ctn_error "unreadable vendor KO: $path"; return 1; }
-            hash=$(ctn_sha256 "$file") || { ctn_error "cannot hash vendor KO: $path"; return 1; }
+            [ -f "$file" ] && [ -r "$file" ] || {
+                ctn_fail '无法读取厂商 game_opt 模块' '请检查厂商模块路径和读取权限，保存安装详细日志。' "unreadable vendor KO: $path"; return 1;
+            }
+            hash=$(ctn_sha256 "$file") || {
+                ctn_fail '无法校验厂商模块文件' '请检查 sha256sum 命令和厂商文件读取权限。' "cannot hash vendor KO: $path"; return 1;
+            }
             ctn_list_contains "$CTN_VENDOR_HASHES" "$hash" || {
-                ctn_error "unknown vendor identity: $path SHA256=$hash"; return 1;
+                ctn_fail '厂商 game_opt 模块与已核验基线不匹配' '请提供机型、固件版本和安装详细日志；不能绕过校验强行加载 KO。' "unknown vendor identity: $path SHA256=$hash"; return 1;
             }
             [ -n "$CTN_VENDOR_FILE" ] || CTN_VENDOR_FILE=$path
             found=1
@@ -204,7 +241,9 @@ ctn_select() {
         [ "$paths" != "$path" ] || break
         paths=${paths#*\|}
     done
-    [ "$found" = 1 ] || { ctn_error 'no real allowlisted vendor KO is readable'; return 1; }
+    [ "$found" = 1 ] || {
+        ctn_fail '未找到可读的厂商 game_opt 模块' '请提供设备的 vendor / vendor_dlkm 模块路径，当前不支持强行加载。' 'no real allowlisted vendor KO is readable'; return 1;
+    }
     ctn_note "profile=$CTN_PROFILE kernel=$CTN_RELEASE vendor=$CTN_VENDOR_FILE package=$CTN_PACKAGE_MODE runtime_test=$CTN_RUNTIME_VERIFICATION"
 }
 
@@ -262,7 +301,7 @@ ctn_runtime_prepare() {
     [ -d "$CTN_RUNTIME" ] || mkdir -m 700 "$CTN_RUNTIME" || return 1
     chmod 700 "$CTN_RUNTIME" || return 1
     local name
-    for name in .service.lock .maintenance.lock .daemon.lock daemon.pid service.pid .service.stop restore.state exercise.state boot.log daemon.log action.log; do
+    for name in .service.lock .maintenance.lock .daemon.lock daemon.pid service.pid .service.stop restore.state exercise.state boot.log daemon.log action.log action-detail.log; do
         ctn_safe_file "$CTN_RUNTIME/$name" || return 1
     done
 }
@@ -527,6 +566,34 @@ ctn_start_daemon() {
     done
     ctn_stop_pid "$child" "$MODDIR/bin/ctnd" || return 1
     ctn_error 'daemon did not publish a verified PID'; return 1
+}
+
+ctn_data_ready() {
+    local path
+    for path in "$CTN_ROOT/data/user/0/com.oplus.cosa/databases/db_game_database" \
+                "$CTN_ROOT/data/data/com.oplus.cosa/databases/db_game_database"; do
+        [ ! -f "$path" ] || [ ! -r "$path" ] || return 0
+    done
+    return 1
+}
+
+ctn_report_data() {
+    local path present=0
+    ctn_note "READ boot_id=$(ctn_scalar "$CTN_PROC/sys/kernel/random/boot_id")"
+    ctn_note "READ game_state=$(ctn_scalar "$CTN_PROC/game_opt/game_pid")"
+    for path in "$CTN_ROOT/data/user/0/com.oplus.cosa/databases/db_game_database" \
+                "$CTN_ROOT/data/data/com.oplus.cosa/databases/db_game_database"; do
+        if [ -f "$path" ] && [ -r "$path" ]; then
+            present=1
+            ctn_note "READ COSA path=$path stat=$(stat -c '%d:%i:%s:%Y' "$path" 2>/dev/null)"
+        fi
+    done
+    [ "$present" = 1 ] || ctn_note 'READ COSA database missing/unreadable; no configuration is inferred'
+    for path in restore.state exercise.state .service.stop; do
+        if [ -e "$CTN_RUNTIME/$path" ]; then ctn_note "READ runtime $path=present"
+        else ctn_note "READ runtime $path=absent"; fi
+    done
+    ctn_note 'READ configuration source is COSA only; no local text override file is consulted'
 }
 
 ctn_report_running() {

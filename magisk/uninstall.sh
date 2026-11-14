@@ -21,7 +21,7 @@ fi
 # restore.state is never removed by shell. daemon must have removed it itself.
 [ ! -e "$CTN_RUNTIME/restore.state" ] || { ctn_error 'outstanding restore debt'; exit 1; }
 # After unloading, the saved self-check node values cannot remain in this kernel.
-for CTN_FILE in daemon.pid service.pid .service.stop exercise.state boot.log daemon.log action.log .daemon.lock .service.lock; do
+for CTN_FILE in daemon.pid service.pid .service.stop exercise.state boot.log daemon.log action.log action-detail.log .daemon.lock .service.lock; do
     ctn_safe_file "$CTN_RUNTIME/$CTN_FILE" || exit 1
     rm -f "$CTN_RUNTIME/$CTN_FILE" || exit 1
 done

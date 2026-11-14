@@ -20,6 +20,7 @@ import stat
 import struct
 import tempfile
 import zipfile
+import zlib
 
 HERE = Path(__file__).resolve().parent
 # Load the bounded reader from this repository, also under isolated Python (-I).
@@ -45,6 +46,9 @@ SOURCES = {
     "lib/common.sh": ("magisk/common.sh", 0o755),
     "changelog.txt": ("magisk/changelog.txt", 0o644),
     "README.md": ("magisk/README.md", 0o644),
+}
+BINARY_SOURCES = {
+    "oplus.png": ("magisk/oplus.png", 0o644),
 }
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_.+-]+\Z")
@@ -119,6 +123,39 @@ def elf_check(data: bytes, label: str, executable: bool = False) -> None:
     kind, machine = struct.unpack_from("<HH", data, 16)
     require(machine == 183, f"not AArch64: {label}")
     require(kind in ((2, 3) if executable else (1,)), f"wrong ELF type: {label}")
+
+
+def png_check(data: bytes) -> None:
+    require(8 < len(data) <= 4 * 1024 * 1024 and data[:8] == b"\x89PNG\r\n\x1a\n",
+            "invalid/oversized module banner PNG")
+    offset = 8
+    seen_header = seen_data = False
+    while offset < len(data):
+        require(offset + 12 <= len(data), "truncated module banner PNG")
+        size, = struct.unpack_from(">I", data, offset)
+        end = offset + 12 + size
+        require(end <= len(data), "module banner PNG chunk outside file")
+        kind = data[offset + 4:offset + 8]
+        body = data[offset + 8:end - 4]
+        crc, = struct.unpack_from(">I", data, end - 4)
+        require(zlib.crc32(data[offset + 4:end - 4]) & 0xffffffff == crc,
+                "module banner PNG checksum mismatch")
+        if not seen_header:
+            require(kind == b"IHDR" and size == 13, "module banner PNG lacks IHDR")
+            width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", body)
+            require(0 < width <= 4096 and 0 < height <= 4096 and depth == 8 and
+                    color in (2, 6) and compression == filtering == interlace == 0,
+                    "unsupported module banner PNG layout")
+            seen_header = True
+        elif kind == b"IHDR":
+            raise PackageError("duplicate module banner PNG header")
+        if kind == b"IDAT":
+            seen_data = True
+        if kind == b"IEND":
+            require(size == 0 and seen_data and end == len(data), "invalid module banner PNG end")
+            return
+        offset = end
+    raise PackageError("module banner PNG lacks IEND")
 
 
 def module_properties(data: bytes) -> dict[str, str]:
@@ -216,6 +253,41 @@ def validate_verification(record: dict, version: str, profile_bytes: bytes,
             f"missing required verification checks: {version}: {sorted(REQUIRED_CHECKS - names)}")
 
 
+def validate_changelog(data: bytes, props: dict[str, str]) -> None:
+    require(len(data) <= 32768, "in-module changelog history is too large")
+    lines = data.decode("utf-8").splitlines()
+    expected = f"CTN Patch {props['version']}（versionCode {props['versionCode']}）更新日志"
+    require(bool(lines) and lines[0] == expected,
+            "in-module changelog does not match the packaged version")
+    versions: set[str] = set()
+    section_bytes = bullets = 0
+    previous: tuple[int, int] | None = None
+    for line in lines:
+        match = re.fullmatch(r"CTN Patch v?(\d+)\.(\d+)（versionCode (\d+)）更新日志", line)
+        if match:
+            version = (int(match[1]), int(match[2]))
+            name = f"v{version[0]}.{version[1]}"
+            require(name not in versions and (previous is None or version < previous),
+                    "duplicate or unordered in-module changelog version")
+            require(int(match[3]) == version[0] * 10 + version[1], "invalid changelog versionCode")
+            require(previous is None or 1 <= bullets <= 4, "changelog sections need 1-4 concise bullets")
+            versions.add(name)
+            previous = version
+            section_bytes = len(line.encode("utf-8"))
+            bullets = 0
+        elif line:
+            require(previous is not None and line.startswith("- ") and len(line) <= 122,
+                    "changelog must contain only concise bullet lines")
+            require(re.search(r"[0-9a-fA-F]{64}", line) is None,
+                    "full hashes belong in verification reports, not changelog")
+            bullets += 1
+            section_bytes += len(line.encode("utf-8")) + 1
+        require(section_bytes <= 2048 and bullets <= 4, "changelog section must stay concise")
+    require(previous is not None and 1 <= bullets <= 4, "changelog sections need 1-4 concise bullets")
+    historical = {f"v1.{minor}" for minor in range(10)} | {"v2.0", "v2.1", "v2.2", "v3.0"}
+    require(historical <= versions, "in-module changelog is missing historical versions")
+
+
 def json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
@@ -232,14 +304,13 @@ def collect_entries(root: Path, profile: str | None = None,
     entries = {name: (text_bytes(read_required(root, path), path), perms)
                for name, (path, perms) in SOURCES.items()}
     props = module_properties(entries["module.prop"][0])
-    # The in-module changelog is a display file, but it must never go stale:
-    # bind its header to the packaged version and keep it concise.
-    changelog = entries["changelog.txt"][0]
-    require(len(changelog) <= 2048, "in-module changelog must stay concise (<=2048 bytes)")
-    changelog_text = changelog.decode("utf-8")
-    require(props["version"] in changelog_text and
-            f"versionCode {props['versionCode']}" in changelog_text,
-            "in-module changelog does not match the packaged version")
+    require(props.get("banner") == "oplus.png", "module banner must be the packaged relative oplus.png")
+    for name, (relative, permissions) in BINARY_SOURCES.items():
+        data = read_required(root, relative)
+        png_check(data)
+        entries[name] = (data, permissions)
+    # Every historical section stays concise; the first one belongs to this package.
+    validate_changelog(entries["changelog.txt"][0], props)
     daemon = read_required(artifact_root, "user/ctnd")
     elf_check(daemon, "user/ctnd", executable=True)
     entries["bin/ctnd"] = (daemon, 0o755)

@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""从 CHANGELOG.md 抽出「当前版本那一节」，写成 update-changelog.md。
+"""从简短完整的 CHANGELOG.md 生成更新弹窗与包内历史。
 
-为什么要有这个文件：
-    update.json 里的 changelog 是给**更新弹窗**看的。KernelSU 会把那个地址
-    的内容整段当 markdown 渲染出来（源码 ModuleViewModel.kt:437-486，不截断）。
-    直接指向 CHANGELOG.md 的话，弹窗里会是「从 v1.0 到最新版」的全量历史 ——
-    版本一多发版弹窗就成一大段墙。所以给更新器单独喂一份「只有这一版」的。
-
-    CHANGELOG.md 本身保持完整历史（给人看、给仓库看），不删不改。
-
-文件名为什么叫 update-changelog.md 而不是 changelog.md：
-    仓库在 Windows 上，changelog.md 和 CHANGELOG.md 是**同一个文件**（大小写
-    不敏感），会互相覆盖。必须取个明显不同的名字。
-
-用法：
-    python gen_changelog.py            # 按 module.prop 的版本抽
-    python gen_changelog.py v1.1       # 指定版本
+update-changelog.md 只含所选版本；magisk/changelog.txt 保留全部版本，最新在前。
+每版只允许 1–4 条短要点，详细旧记录保留在 Git 历史，不另存长日志副本。
+用法：python gen_changelog.py [v3.1]，或 python gen_changelog.py --version v3.1。
+省略版本时读取 magisk/module.prop；两个输出在全部验证通过后才写入。
 """
+from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 CHANGELOG = HERE / "CHANGELOG.md"
 PROP = HERE / "magisk" / "module.prop"
 OUT = HERE / "update-changelog.md"
+PACKAGE_OUT = HERE / "magisk" / "changelog.txt"
 
 HEADER = ("<!-- 由 gen_changelog.py 自动生成，请勿手改。"
           "要改内容请改 CHANGELOG.md 后重跑本脚本。 -->\n")
+REQUIRED_HISTORY = {
+    **{f"v1.{minor}": 10 + minor for minor in range(10)},
+    "v2.0": 20, "v2.1": 21, "v2.2": 22, "v3.0": 30, "v3.1": 31,
+}
+MAX_BULLETS = 4
+MAX_BULLET_CHARS = 120
+MAX_BULLET_BYTES = 400
+SECTION_HEADER = re.compile(r"## (v([1-9][0-9]*)\.([0-9]))（versionCode ([1-9][0-9]*)）")
+CHECKSUM = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.I)
+
+
+class ChangelogSection(NamedTuple):
+    version: str
+    version_code: int
+    bullets: tuple[str, ...]  # 不含 '- ' 前缀。
 
 
 def current_version() -> str:
@@ -39,31 +47,100 @@ def current_version() -> str:
     sys.exit("!! module.prop 里找不到 version=")
 
 
-def extract_section(text: str, version: str) -> str:
-    """取 CHANGELOG 里标题含 version 的那一节（到下一个 '## ' 为止）。
+def parse_changelog(text: str) -> dict[str, ChangelogSection]:
+    """校验完整简短历史，返回按版本降序的 version -> code/bullets 映射。
 
-    标题形如 '## v1.1（versionCode 11）'。用「含 version 且 version 后紧跟
-    非数字字符」来匹配，免得 v1.1 误命中 v1.10 / v1.11。
+    禁止重复版本、错版号、长段落、校验值及超长要点；历史版本不可丢失。
+    未来版本沿用 v主版本.个位次版本、versionCode = 主版本 * 10 + 次版本。
     """
+    sections: dict[str, ChangelogSection] = {}
+    version = ""
+    code = 0
+    bullets: list[str] = []
+    previous: tuple[int, int] | None = None
+    title_seen = False
+
+    def finish() -> None:
+        if version:
+            if not bullets:
+                raise ValueError(f"{version} 必须包含 1–{MAX_BULLETS} 条要点")
+            sections[version] = ChangelogSection(version, code, tuple(bullets))
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line == "# 更新日志" and not version and not title_seen:
+            title_seen = True
+            continue
+        match = SECTION_HEADER.fullmatch(line)
+        if match:
+            finish()
+            version, major, minor, code_text = match.groups()
+            if version in sections:
+                raise ValueError(f"重复版本标题: {version}")
+            key = (int(major), int(minor))
+            code = int(code_text)
+            if code != key[0] * 10 + key[1]:
+                raise ValueError(f"{version} 的 versionCode 不正确: {code}")
+            if previous is not None and key >= previous:
+                raise ValueError("版本必须按数字降序排列，最新在前")
+            previous = key
+            bullets = []
+            continue
+        if not version or not line.startswith("- "):
+            raise ValueError(f"只允许统一版本标题与短要点: {line}")
+        bullet = line[2:]
+        if not bullet or bullet != bullet.strip():
+            raise ValueError(f"{version} 包含空要点或多余空白")
+        if len(bullet) > MAX_BULLET_CHARS or len(line.encode("utf-8")) > MAX_BULLET_BYTES:
+            raise ValueError(f"{version} 要点过长（最多 {MAX_BULLET_CHARS} 字 / {MAX_BULLET_BYTES} 字节）")
+        if CHECKSUM.search(bullet):
+            raise ValueError(f"{version} 不应包含 64 位校验值")
+        bullets.append(bullet)
+        if len(bullets) > MAX_BULLETS:
+            raise ValueError(f"{version} 最多 {MAX_BULLETS} 条要点")
+    finish()
+    missing = REQUIRED_HISTORY.keys() - sections.keys()
+    if missing:
+        raise ValueError("缺少历史版本: " + ", ".join(sorted(missing)))
+    return sections
+
+
+def render_update_changelog(sections: dict[str, ChangelogSection], version: str) -> str:
+    """更新弹窗只含所选版本，未知版本直接拒绝。"""
+    if not version.startswith("v"):
+        version = "v" + version
+    if version not in sections:
+        raise ValueError(f"CHANGELOG.md 里找不到版本: {version}")
+    section = sections[version]
+    return (HEADER + f"## {section.version}（versionCode {section.version_code}）\n\n"
+            + "\n".join("- " + bullet for bullet in section.bullets) + "\n")
+
+
+def render_package_changelog(sections: dict[str, ChangelogSection]) -> str:
+    """包内全历史；段首是固定纯文本标记，段间仅空行。"""
+    return "\n\n".join(
+        f"CTN Patch {section.version}（versionCode {section.version_code}）更新日志\n\n"
+        + "\n".join("- " + bullet for bullet in section.bullets)
+        for section in sections.values()
+    ) + "\n"
+
+
+def extract_section(text: str, version: str) -> str:
+    """保留发版脚本的单节提取 API；兼容旧正文，但拒绝重复目标标题。"""
     pat = re.compile(r"^##[^\n]*%s(?![0-9.])" % re.escape(version), re.M)
-    m = pat.search(text)
-    if not m:
+    matches = list(pat.finditer(text))
+    if len(matches) > 1:
+        raise ValueError(f"重复版本标题: {version}")
+    if not matches:
         return ""
-    start = m.start()
-    nxt = re.compile(r"^## ", re.M).search(text, m.end())
-    return text[start:(nxt.start() if nxt else len(text))].rstrip() + "\n"
+    match = matches[0]
+    nxt = re.compile(r"^## ", re.M).search(text, match.end())
+    return text[match.start():(nxt.start() if nxt else len(text))].rstrip() + "\n"
 
 
 def strip_checksums(section: str) -> str:
-    """去掉「校验值」那一段（含 ``` 代码块和它上面的小标题）。
-
-    为什么只在这里去、CHANGELOG.md 里留着：
-      - 更新弹窗是给「这次更新改了什么」看的。管理器**不校验** sha256，
-        用户也不会拿着 64 位哈希去比对，摆在弹窗里就是噪音。
-      - 但 CHANGELOG.md 里留着有价值：那是仓库里唯一记着「每一版发出去的
-        到底是哪个二进制」的地方（`expected_vendor.txt` 记的是厂商模块，
-        不是我们的产物）。要核对下载到的东西对不对，就靠它。
-    """
+    """保留旧发版调用的兼容 API，去掉 sha256 代码块及紧邻校验标题。"""
     lines = section.splitlines()
     out = []
     i = 0
@@ -76,7 +153,6 @@ def strip_checksums(section: str) -> str:
                 body.append(lines[j])
                 j += 1
             if "sha256" in "\n".join(body):
-                # 把紧邻上面的「**校验值**」小标题和空行一起去掉
                 while out and out[-1].strip() == "":
                     out.pop()
                 if out and "校验" in out[-1] and len(out[-1]) < 20:
@@ -93,25 +169,27 @@ def strip_checksums(section: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
-def main() -> None:
-    version = sys.argv[1] if len(sys.argv) > 1 else current_version()
-    if not version.startswith("v"):
-        version = "v" + version
-
-    text = CHANGELOG.read_text(encoding="utf-8")
-    section = extract_section(text, version)
-    if not section:
-        sys.exit("!! CHANGELOG.md 里找不到 %s 那一节 —— 先在 CHANGELOG.md 顶部"
-                 "把它写上，再跑本脚本" % version)
-
-    stripped = strip_checksums(section)
-    dropped = len(section.splitlines()) - len(stripped.splitlines())
-
-    OUT.write_text(HEADER + stripped, encoding="utf-8", newline="\n")
-    print("  已生成 %s（%s，%d 行%s）"
-          % (OUT.name, version, len(stripped.splitlines()),
-             "，去掉了 %d 行校验值" % dropped if dropped else ""))
-    print("  更新器看到的就是这一节；CHANGELOG.md 保持完整历史（含校验值）不变")
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("version", nargs="?", help="所选版本，默认读取 module.prop")
+    parser.add_argument("--version", dest="target_version", help="显式指定所选版本")
+    args = parser.parse_args(argv)
+    if args.version and args.target_version:
+        parser.error("版本只能指定一次：位置参数或 --version")
+    try:
+        version = args.target_version or args.version or current_version()
+        if not version.startswith("v"):
+            version = "v" + version
+        sections = parse_changelog(CHANGELOG.read_text(encoding="utf-8"))
+        update = render_update_changelog(sections, version)
+        package = render_package_changelog(sections)
+        # 先验证并渲染两个输出；未知版本或无效历史不能触碰任何输出。
+        OUT.write_text(update, encoding="utf-8", newline="\n")
+        PACKAGE_OUT.write_text(package, encoding="utf-8", newline="\n")
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"!! {exc}\n")
+    print(f"  已生成 {OUT.name}（仅 {version}）")
+    print(f"  已生成 magisk/{PACKAGE_OUT.name}（{len(sections)} 个版本，最新在前，每版最多 {MAX_BULLETS} 条）")
 
 
 if __name__ == "__main__":

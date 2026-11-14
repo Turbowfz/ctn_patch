@@ -2,7 +2,7 @@
 #ifndef CTND_PATHS_H
 #define CTND_PATHS_H
 
-#define CTND_VERSION "3.0"
+#define CTND_VERSION "3.1"
 
 /* Shared with the module scripts. Overrides are for host-test builds only. */
 #ifndef CTND_RUNTIME_DIR

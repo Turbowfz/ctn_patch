@@ -893,7 +893,7 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for verified Oplus 6.1 game_opt");
-MODULE_VERSION("3.0");
+MODULE_VERSION("3.1");
 MODULE_INFO(ctn_profile, CTN_PROFILE_ID);
 MODULE_INFO(ctn_build_id, CTN_BUILD_ID);
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

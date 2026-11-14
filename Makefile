@@ -14,6 +14,7 @@ test:
 	bash daemon/test.sh
 	python3 -I -B tests/test_packaging.py
 	python3 -I -B tests/test_profile_tools.py
+	python3 -I -B tests/test_changelog.py
 	python3 -I -B tests/test_service_lifecycle.py
 	CTN_TEST_SHELL=mksh python3 -I -B tests/test_service_lifecycle.py
 

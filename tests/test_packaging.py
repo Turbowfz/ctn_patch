@@ -84,11 +84,13 @@ def shell_path(path: Path) -> str:
 class Fixture:
     def __init__(self, root: Path):
         self.root = root
-        for relative, _ in PACK.SOURCES.values():
+        for relative, _ in (*PACK.SOURCES.values(), *PACK.BINARY_SOURCES.values()):
             put(root / relative, (REPO / relative).read_bytes())
         put(root / "README.md", "repository development README, not the package README\n")
         put(root / "LICENSE", "source license stays in source\n")
-        put(root / "out/user/ctnd", elf(True, b"ctnd-3.0"))
+        self.properties = PACK.module_properties((root / "magisk/module.prop").read_bytes())
+        self.version = self.properties["version"].removeprefix("v")
+        put(root / "out/user/ctnd", elf(True, ("ctnd-" + self.version).encode()))
         self.vendors: dict[str, bytes] = {}
         for version in PACK.PROFILES:
             vendor = b"verified vendor fixture " + version.encode()
@@ -120,7 +122,7 @@ class Fixture:
     def modinfo(self, profile_id: str = "6.1.157", **changes: str) -> bytes:
         profile = json.loads((self.root / f"profiles/{profile_id}/profile.json").read_bytes())
         values = {
-            "version": "3.0", "ctn_profile": profile_id,
+            "version": self.version, "ctn_profile": profile_id,
             "ctn_build_id": sha(b"build " + profile_id.encode()),
             "vermagic": profile["vendor"]["vermagic"],
         }
@@ -167,7 +169,7 @@ class PackagingTests(unittest.TestCase):
     def test_full_layout_permissions_hashes_and_package_readme(self):
         put(self.root / "magisk/action.sh", (self.root / "magisk/action.sh").read_bytes().replace(b"\n", b"\r\n"))
         output = self.build()
-        self.assertEqual(output.name, "ctn_patch-v3.0-full.zip")
+        self.assertEqual(output.name, f"ctn_patch-{self.fixture.properties['version']}-full.zip")
         entries = self.fixture.collect()
         with zipfile.ZipFile(output) as z:
             self.assertEqual(set(z.namelist()), set(entries))
@@ -192,7 +194,7 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(json.loads(z.read(prefix + "manifest.json"))["verification"]["runtime"], "passed")
 
     def test_missing_each_required_artifact_refuses_without_touching_output(self):
-        required = [relative for relative, _ in PACK.SOURCES.values()] + ["out/user/ctnd"]
+        required = [relative for relative, _ in (*PACK.SOURCES.values(), *PACK.BINARY_SOURCES.values())] + ["out/user/ctnd"]
         required += [f"{base}/{version}/{name}" for version in PACK.PROFILES
                      for base, name in (("profiles", "profile.json"), ("out", "ctn_patch.ko"), ("out", "verification.json"))]
         output = self.root / "keep.zip"
@@ -242,11 +244,13 @@ class PackagingTests(unittest.TestCase):
     def test_module_prop_only_version_bump_refuses_untouched_ko(self):
         path = self.root / "magisk/module.prop"
         changelog = self.root / "magisk/changelog.txt"
-        put(path, path.read_bytes().replace(b"version=v3.0\n", b"version=v3.1\n")
-            .replace(b"versionCode=30\n", b"versionCode=31\n"))
+        props = self.fixture.properties
+        put(path, path.read_bytes().replace(("version=" + props["version"] + "\n").encode(), b"version=v9.9\n")
+            .replace(("versionCode=" + props["versionCode"] + "\n").encode(), b"versionCode=99\n"))
         # Isolate the embedded-KO gate: the display changelog follows the bump.
         put(changelog, changelog.read_bytes()
-            .replace("v3.0（versionCode 30）".encode("utf-8"), "v3.1（versionCode 31）".encode("utf-8")))
+            .replace(f"{props['version']}（versionCode {props['versionCode']}）".encode("utf-8"),
+                     "v9.9（versionCode 99）".encode("utf-8")))
         untouched = {version: (self.root / f"out/{version}/ctn_patch.ko").read_bytes()
                      for version in PACK.PROFILES}
         output = self.root / "keep.zip"
@@ -261,10 +265,16 @@ class PackagingTests(unittest.TestCase):
 
     def test_module_prop_version_without_v_prefix_matches_ko(self):
         path = self.root / "magisk/module.prop"
-        put(path, path.read_bytes().replace(b"version=v3.0\n", b"version=3.0\n"))
+        changelog = self.root / "magisk/changelog.txt"
+        props = self.fixture.properties
+        put(path, path.read_bytes().replace(("version=" + props["version"] + "\n").encode(),
+                                          ("version=" + self.fixture.version + "\n").encode()))
+        put(changelog, changelog.read_bytes().replace(("CTN Patch " + props["version"]).encode(),
+                                                    ("CTN Patch " + self.fixture.version).encode()))
         entries = self.fixture.collect()
         for version in PACK.PROFILES:
-            self.assertIn(b"module_version=3.0\n", entries[f"kernels/{version}/metadata.prop"][0])
+            self.assertIn(("module_version=" + self.fixture.version + "\n").encode(),
+                          entries[f"kernels/{version}/metadata.prop"][0])
 
     def test_valid_hex_record_build_id_must_match_embedded_ko(self):
         original = (self.root / "out/6.1.157/ctn_patch.ko").read_bytes()
@@ -383,21 +393,56 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("changelog.txt", entries)
         data, mode = entries["changelog.txt"]
         self.assertEqual(mode, 0o644)
-        self.assertLessEqual(len(data), 2048)
+        self.assertLessEqual(len(data), 32768)
         text = data.decode("utf-8")
-        self.assertIn("v3.0", text)
-        self.assertIn("versionCode 30", text)
+        sections = re.split(r"(?m)(?=^CTN Patch )", text)
+        sections = [section for section in sections if section.strip()]
+        self.assertEqual(len(sections), 15)
+        for section in sections:
+            self.assertLessEqual(len(section.encode("utf-8")), 2048)
+            bullets = [line for line in section.splitlines() if line.startswith("- ")]
+            self.assertTrue(1 <= len(bullets) <= 4)
+        self.assertIn(self.fixture.properties["version"], text)
+        self.assertIn("versionCode " + self.fixture.properties["versionCode"], text)
         path = self.root / "magisk/changelog.txt"
         raw = path.read_bytes()
-        for label, content in (("stale version", text.replace("v3.0", "v9.9").encode("utf-8")),
-                               ("stale code", text.replace("versionCode 30", "versionCode 31").encode("utf-8")),
-                               ("oversized", ("v3.0（versionCode 30）\n" + "x" * 2100).encode("utf-8"))):
+        for label, content in (("stale version", text.replace(self.fixture.properties["version"], "v9.9").encode("utf-8")),
+                               ("stale code", text.replace("versionCode " + self.fixture.properties["versionCode"], "versionCode 99").encode("utf-8")),
+                               ("oversized", (text + "x" * 2100).encode("utf-8"))):
             with self.subTest(label=label):
                 put(path, content)
                 with self.assertRaisesRegex(PACK.PackageError, "changelog"):
                     self.fixture.collect()
         put(path, raw)
         self.fixture.collect()
+
+    def test_module_banner_is_packaged_and_validated(self):
+        entries = self.fixture.collect()
+        data, mode = entries["oplus.png"]
+        self.assertEqual(mode, 0o644)
+        self.assertEqual(data, (REPO / "magisk/oplus.png").read_bytes())
+        self.assertEqual(self.fixture.properties["banner"], "oplus.png")
+        path = self.root / "magisk/oplus.png"
+        for bad in (b"not a png", data[:-1], data + b"editor suffix",
+                    data[:32] + bytes([data[32] ^ 1]) + data[33:]):
+            with self.subTest(bytes=len(bad)):
+                put(path, bad)
+                with self.assertRaisesRegex(PACK.PackageError, "banner PNG"):
+                    self.fixture.collect()
+        put(path, data)
+        prop = self.root / "magisk/module.prop"
+        raw = prop.read_bytes()
+        for value in ("/data/adb/modules/ctn_patch/oplus.png", "../oplus.png", "other.png"):
+            with self.subTest(banner=value):
+                put(prop, raw.replace(b"banner=oplus.png", ("banner=" + value).encode()))
+                with self.assertRaisesRegex(PACK.PackageError, "relative oplus.png"):
+                    self.fixture.collect()
+        put(prop, raw)
+
+    def test_package_has_no_manual_config_or_install_log(self):
+        entries = self.fixture.collect()
+        self.assertFalse({"ctn.conf", "ctnd.conf", "ctn.conf.example", "install.log"} & set(entries))
+        self.assertIn("不支持 ctn.conf 手动添加", entries["changelog.txt"][0].decode("utf-8"))
 
     def test_status_without_all_six_checks_is_rejected(self):
         self.fixture.record(checks=[])
@@ -648,7 +693,7 @@ class RuntimeShellTests(unittest.TestCase):
 
     def loaded(self, version: str = "6.1.157", legacy: bool = False, ready: str = "Y") -> None:
         root = self.device / "sys/module/ctn_patch"
-        put(root / "version", "3.0\n")
+        put(root / "version", self.fixture.version + "\n")
         if not legacy:
             put(root / "parameters/profile", version + "\n")
             put(root / "parameters/build_id", sha(b"build " + version.encode()) + "\n")
@@ -794,8 +839,11 @@ class RuntimeShellTests(unittest.TestCase):
     def test_standalone_shell_lookup_uses_absolute_system_interpreter(self):
         common = self.package / "lib/common.sh"
         raw = common.read_bytes()
-        put(common, raw.replace(b"    CTN_SHELL=$(command -v sh) || return 1\n",
-                                b"    CTN_SHELL=sh\n", 1))
+        needle = ("    CTN_SHELL=$(command -v sh) || {\n"
+                  "        ctn_fail '找不到系统命令解释器' '请更新 Root 模块管理器，确认 /system/bin/sh 可用。' 'shell lookup failed'; return 1;\n"
+                  "    }\n").encode("utf-8")
+        self.assertIn(needle, raw)
+        put(common, raw.replace(needle, b"    CTN_SHELL=sh\n", 1))
         system_shell = self.device / "system/bin/sh"
         system_shell.parent.mkdir(parents=True)
         system_shell.symlink_to(Path(shutil.which("sh")).resolve())
@@ -807,8 +855,11 @@ class RuntimeShellTests(unittest.TestCase):
     def test_bare_shell_lookup_never_uses_working_directory_executable(self):
         common = self.package / "lib/common.sh"
         raw = common.read_bytes()
-        put(common, raw.replace(b"    CTN_SHELL=$(command -v sh) || return 1\n",
-                                b"    CTN_SHELL=sh\n", 1))
+        needle = ("    CTN_SHELL=$(command -v sh) || {\n"
+                  "        ctn_fail '找不到系统命令解释器' '请更新 Root 模块管理器，确认 /system/bin/sh 可用。' 'shell lookup failed'; return 1;\n"
+                  "    }\n").encode("utf-8")
+        self.assertIn(needle, raw)
+        put(common, raw.replace(needle, b"    CTN_SHELL=sh\n", 1))
         decoy = self.base / "sh"
         put(decoy, "#!/bin/sh\nexit 0\n")
         decoy.chmod(0o755)
@@ -879,11 +930,19 @@ class RuntimeShellTests(unittest.TestCase):
         result = self.run_script("customize.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("更新日志", result.stdout)
-        self.assertIn("支持 6.1.141 / 6.1.157", result.stdout)
+        self.assertIn("开机", result.stdout)
+        self.assertIn("6.1.141", result.stdout)
+        self.assertIn("6.1.157", result.stdout)
         self.assertIn("本包支持内核: 6.1.141 6.1.157", result.stdout)
+        current_header = (f"CTN Patch {self.fixture.properties['version']}"
+                          f"（versionCode {self.fixture.properties['versionCode']}）更新日志")
+        self.assertIn(current_header, result.stdout)
+        self.assertNotIn("CTN Patch v3.0（versionCode 30）更新日志", result.stdout)
+        self.assertNotIn("CTN Patch v2.2（versionCode 22）更新日志", result.stdout)
+        self.assertNotIn("CTN Patch v1.0（versionCode 10）更新日志", result.stdout)
         changelog = self.package / "changelog.txt"
         raw = changelog.read_bytes()
-        put(changelog, raw.replace(b"v3.0", b"v9.9", 1))  # Display file, not a trust anchor.
+        put(changelog, raw.replace(self.fixture.properties["version"].encode(), b"v9.9", 1))  # Display file, not a trust anchor.
         result = self.run_script("customize.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("已跳过显示", result.stdout)
@@ -894,7 +953,8 @@ class RuntimeShellTests(unittest.TestCase):
         self.loaded(legacy=True)
         result = self.run_script("customize.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("NOT evidence", result.stdout)
+        self.assertIn("正常重启才启用新文件", result.stdout)
+        self.assertNotRegex(result.stdout, r"[0-9a-f]{64}")
         self.assertNotIn("insmod", self.events())
         self.assertNotIn("rmmod", self.events())
         put(self.vendor, b"wrong")
@@ -929,7 +989,7 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertEqual((self.package / "disable").read_text(), "keep disabled\n")
         self.assertEqual(self.events(), "")
         self.assertTrue((self.runtime / "action.log").is_file())
-        self.assertIn("read-only", (self.runtime / "action.log").read_text())
+        self.assertIn("只读自检", (self.runtime / "action.log").read_text())
 
     def test_default_verify_and_readonly_action_propagate_errors(self):
         result = self.run_script("verify.sh")
@@ -937,18 +997,23 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertFalse(self.runtime.exists())
         result = self.run_script("action.sh", "--read-only")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("FILE module=v3.0", result.stdout)
-        self.assertIn("RUNNING module=not_loaded", result.stdout)
-        self.assertIn("No runtime exercise", result.stdout)
+        self.assertIn("未做写入演练", result.stdout)
+        self.assertNotIn("ctn_patch:", result.stdout)
+        self.assertNotRegex(result.stdout, r"[0-9a-f]{64}")
         self.assertEqual(self.events(), "")
         log = self.runtime / "action.log"
-        self.assertIn("SELF_CHECK_EXIT=0", log.read_text())
+        detail = self.runtime / "action-detail.log"
+        self.assertIn("退出码 0", log.read_text())
+        self.assertIn(f"FILE module={self.fixture.properties['version']}", detail.read_text())
+        self.assertIn("RUNNING module=not_loaded", detail.read_text())
+        self.assertIn("No runtime exercise", detail.read_text())
         self.assertIn(str(log), result.stdout)
         put(self.vendor, b"bad vendor")
         result = self.run_script("action.sh", "--read-only")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unknown vendor identity", log.read_text())
-        self.assertIn("SELF_CHECK_EXIT=1", log.read_text())
+        self.assertIn("厂商 game_opt 模块", log.read_text())
+        self.assertIn("unknown vendor identity", detail.read_text())
+        self.assertIn("SELF_CHECK_EXIT=1", detail.read_text())
 
     def test_action_default_exercises_and_logs(self):
         for version in PACK.PROFILES:
@@ -962,8 +1027,11 @@ class RuntimeShellTests(unittest.TestCase):
                 self.assertIn("write_names SavedA SavedB", self.events())
                 self.assertEqual(self.node.read_text(), "SavedA:-1,SavedB:-1\n")
                 log = (self.runtime / "action.log").read_text()
-                self.assertIn("SELF_CHECK_EXIT=0", log)
-                self.assertIn("profile=" + version, log)
+                detail = (self.runtime / "action-detail.log").read_text()
+                self.assertIn("原值恢复完成", log)
+                self.assertIn("SELF_CHECK_EXIT=0", detail)
+                self.assertIn("profile=" + version, detail)
+                self.assertNotRegex(log, r"[0-9a-f]{64}")
 
     def test_action_running_game_is_readonly(self):
         self.loaded()
@@ -971,14 +1039,16 @@ class RuntimeShellTests(unittest.TestCase):
         result = self.run_script("action.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("write_names", self.events())
-        self.assertIn("mode=read-only", (self.runtime / "action.log").read_text())
+        self.assertIn("只读自检", (self.runtime / "action.log").read_text())
+        self.assertIn("mode=read-only", (self.runtime / "action-detail.log").read_text())
 
     def test_action_preserves_exercise_failure_code(self):
         self.loaded()
         result = self.run_script("action.sh", MOCK_FAIL_TEST="1", MOCK_FAIL_TEST_RC="19")
         self.assertEqual(result.returncode, 19, result.stderr)
         self.assertEqual(self.node.read_text(), "SavedA:-1,SavedB:-1\n")
-        self.assertIn("SELF_CHECK_EXIT=19", (self.runtime / "action.log").read_text())
+        self.assertIn("退出码 19", (self.runtime / "action.log").read_text())
+        self.assertIn("SELF_CHECK_EXIT=19", (self.runtime / "action-detail.log").read_text())
 
     def test_action_refuses_symlink_log(self):
         target = self.base / "keep.log"
@@ -993,9 +1063,14 @@ class RuntimeShellTests(unittest.TestCase):
         self.loaded(legacy=True)
         result = self.run_script("verify.sh")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("profile=unknown", result.stdout)
-        self.assertIn("reboot required", result.stderr)
+        self.assertIn("身份不同或未知", result.stdout)
+        self.assertIn("正常重启", result.stdout)
+        self.assertNotRegex(result.stdout, r"[0-9a-f]{64}")
         self.assertNotIn("insmod", self.events())
+        detailed = self.run_script("verify.sh", "--details")
+        self.assertNotEqual(detailed.returncode, 0)
+        self.assertIn("profile=unknown", detailed.stdout)
+        self.assertIn("reboot required", detailed.stderr)
         result = self.run_script("service.sh", "--run")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("insmod", self.events())
@@ -1093,6 +1168,7 @@ ctn_daemon_idle''', MOCK_REAL_FLOCK="1")
         self.daemon()
         put(self.runtime / "restore.state", "opaque daemon-only debt")
         put(self.runtime / "action.log", "SELF_CHECK_EXIT=0\n")
+        put(self.runtime / "action-detail.log", "private detailed selfcheck evidence\n")
         put(self.package / "disable", "")
         outside = self.device / "data/adb/other-module/keep"
         put(outside, "untouched")
@@ -1175,14 +1251,14 @@ ctn_daemon_idle''', MOCK_REAL_FLOCK="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("rmmod", self.events())
         self.assertTrue((self.runtime / ".service.stop").exists())
-        self.assertIn("cannot restore original names", result.stderr)
+        self.assertIn("原值恢复：未完成", result.stdout)
 
     def test_exercise_refuses_unmanaged_daemon_and_unrestorable_names(self):
         self.loaded()
         self.daemon()
         result = self.run_script("verify.sh", "--exercise")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("standalone daemon", result.stderr)
+        self.assertIn("存在独立后台进程", result.stdout)
         self.assertNotIn("kill", self.events())
         (self.device / "proc/765432/alive").unlink()
         put(self.node, "ambiguous:value:3,a:3,extra:4\n")
