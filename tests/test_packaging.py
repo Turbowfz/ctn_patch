@@ -520,7 +520,10 @@ uname() {
     case "$1" in -r) printf '%s\n' "${MOCK_RELEASE:-6.1.157-android14-11-o-fixture}" ;;
     -m) printf '%s\n' "${MOCK_ARCH:-aarch64}" ;; *) return 1 ;; esac
 }
-getconf() { printf '%s\n' "${MOCK_PAGE:-4096}"; }
+getconf() {
+    [ "${MOCK_GETCONF_FAIL:-0}" = 0 ] || return 127
+    printf '%s\n' "${MOCK_PAGE:-4096}"
+}
 id() { printf '0\n'; }
 readlink() {
     local path=$1
@@ -948,6 +951,37 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertIn("已跳过显示", result.stdout)
         self.assertNotIn("v9.9", result.stdout)
         put(changelog, raw)
+
+    def test_install_failure_reason_is_visible_in_manager_stdout(self):
+        cases = (
+            ({"MOCK_RELEASE": "6.1.142-android14-11-o-other"}, "当前内核暂不支持", None),
+            ({"MOCK_RELEASE": "6.1.157-android14-11-o-other"}, "完整内核版本尚未核验", None),
+            ({"MOCK_ARCH": "x86_64"}, "CPU 架构不匹配", None),
+            ({"MOCK_PAGE": "16384"}, "内存页大小不匹配或无法读取", None),
+            ({"MOCK_GETCONF_FAIL": "1"}, "内存页大小不匹配或无法读取", None),
+            ({}, "模块清单缺失或损坏", self.package / "kernels/6.1.157/metadata.prop"),
+            ({}, "兼容性清单校验失败", self.package / "kernels/6.1.157/manifest.json"),
+            ({}, "所选 KO 文件损坏或缺失", self.package / "kernels/6.1.157/ctn_patch.ko"),
+            ({}, "数据库服务程序损坏或缺失", self.package / "bin/ctnd"),
+            ({}, "厂商 game_opt 模块与已核验基线不匹配", self.vendor),
+        )
+        for env, reason, changed in cases:
+            with self.subTest(reason=reason, env=env):
+                original = changed.read_bytes() if changed else None
+                try:
+                    if changed:
+                        put(changed, original + b"tampered")
+                    result = self.run_script("customize.sh", **env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("[失败]", result.stdout)
+                    self.assertIn(reason, result.stdout)
+                    self.assertIn("处理：", result.stdout)
+                    self.assertNotIn("insmod", self.events())
+                    self.assertNotIn("rmmod", self.events())
+                    self.assertFalse(self.runtime.exists())
+                finally:
+                    if changed:
+                        put(changed, original)
 
     def test_install_never_uses_loaded_old_module_as_compatibility_evidence(self):
         self.loaded(legacy=True)
