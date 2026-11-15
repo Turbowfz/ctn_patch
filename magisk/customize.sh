@@ -14,29 +14,34 @@ ctn_install_abort() {
 }
 ctn_init "$MODPATH" || ctn_install_abort '模块初始化失败'
 
-ui_print "- CTN Patch $CTN_PACKAGE_VERSION 适配检查（不加载、不写内核）"
+ui_print "- CTN Patch $CTN_PACKAGE_VERSION 安装（不加载、不写内核）"
+ui_print '- [1/4] 自检：检查内核与模块文件'
 ctn_select || ctn_install_abort '内核或模块文件适配检查失败'
 if [ -e "$CTN_NODE" ] && ! ctn_loaded; then
     CTN_ERROR_REASON='发现来源不明的关键线程节点'
     CTN_ERROR_HINT='请提供管理器安装日志，当前不能在未知节点上叠加模块。'
     ctn_install_abort '节点来源无法确认'
 fi
-ui_print "[正常] 当前内核：$CTN_SELECTED_PROFILE，已选择对应 KO"
-ui_print '[正常] 模块文件与厂商 game_opt 校验通过'
+ui_print "  [正常] 当前内核：$CTN_SELECTED_PROFILE，已选择对应 KO"
+ui_print '  [正常] 模块文件校验通过，厂商 game_opt 模块已找到'
+if [ "$CTN_RELEASE_VERIFIED" != 1 ]; then
+    ui_print "  [注意] 完整内核版本未在实测名单：$CTN_RELEASE；按 $CTN_SELECTED_PROFILE ABI 由内核校验加载。"
+fi
 if ctn_loaded; then
     CTN_RUNNING_VERSION=$(ctn_scalar "$CTN_SYS/module/ctn_patch/version") || CTN_RUNNING_VERSION=unknown
-    ui_print "[注意] 当前运行版本：$CTN_RUNNING_VERSION；安装后正常重启才启用新文件。"
+    ui_print "  [注意] 当前运行版本：$CTN_RUNNING_VERSION；安装后正常重启才启用新文件。"
 fi
 [ "$CTN_PACKAGE_MODE" != development ] ||
-    ui_print '[注意] 开发验证包；各内核真机验证范围以说明为准。'
+    ui_print '  [注意] 开发验证包；各内核真机验证范围以说明为准。'
 
+ui_print '- [2/4] 安装：保留开关状态，设置文件权限'
 # Preserve existing manager decisions; installation never stops a daemon.
 CTN_OLD="$CTN_ROOT/data/adb/modules/ctn_patch"
 for CTN_FLAG in disable remove; do
     if [ -e "$CTN_OLD/$CTN_FLAG" ] && [ "$CTN_OLD" != "$MODDIR" ]; then
         ctn_safe_file "$MODDIR/$CTN_FLAG" || ctn_install_abort '无法安全保留管理器状态'
         [ -e "$MODDIR/$CTN_FLAG" ] || : > "$MODDIR/$CTN_FLAG" || ctn_install_abort '无法保留管理器状态'
-        ui_print "[注意] 原 $CTN_FLAG 状态已保留，不会自动启用模块。"
+        ui_print "  [注意] 原 $CTN_FLAG 状态已保留，不会自动启用模块。"
     fi
 done
 
@@ -56,12 +61,12 @@ for CTN_VERSION in 6.1.141 6.1.157; do
     done
 done
 
+ui_print '- [3/4] 当前版本更新日志'
 CTN_CHANGELOG="$MODDIR/changelog.txt"
 CTN_CODE=$(ctn_property "$MODDIR/module.prop" versionCode) || CTN_CODE=
 CTN_CURRENT_HEADER="CTN Patch $CTN_PACKAGE_VERSION（versionCode $CTN_CODE）更新日志"
 if ctn_safe_file "$CTN_CHANGELOG" && [ -r "$CTN_CHANGELOG" ] &&
    grep -qxF -- "$CTN_CURRENT_HEADER" "$CTN_CHANGELOG"; then
-    ui_print '- 当前版本更新日志：'
     CTN_PRINT_CURRENT=0
     CTN_PRINT_COUNT=0
     while IFS= read -r CTN_LINE || [ -n "$CTN_LINE" ]; do
@@ -76,8 +81,9 @@ if ctn_safe_file "$CTN_CHANGELOG" && [ -r "$CTN_CHANGELOG" ] &&
         CTN_PRINT_COUNT=$((CTN_PRINT_COUNT + 1))
     done < "$CTN_CHANGELOG"
 else
-    ui_print '[注意] 更新日志缺失或版本不符，已跳过显示。'
+    ui_print '  [注意] 更新日志缺失或版本不符，已跳过显示。'
 fi
+ui_print '- [4/4] 完成：重启手机后开机自动启用'
 ui_print "- 本包支持内核:$CTN_KERNELS；开机自动重新选择并校验，不用手动选 KO。"
 ui_print '- CTN 只读 COSA 数据库，不读取或创建 ctn.conf。'
-ui_print '- 安装日志由管理器保存；Action 可检查适配和运行状态。'
+ui_print '- 安装日志由管理器保存；装好后在模块里点 Action 可再自检。'

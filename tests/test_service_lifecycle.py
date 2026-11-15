@@ -565,14 +565,13 @@ class ServiceLifecycleTests(unittest.TestCase):
                     self.assert_summary(output, rc=1)
         self.assertFalse(self.runtime.exists())
         FIXTURES.put(version, self.module_version + "\n")
+        # Vendor bytes are recorded, not gated: unknown content must not fail.
         vendor = self.device / "vendor/lib/modules/oplus_bsp_game_opt.ko"
         FIXTURES.put(vendor, b"unknown vendor image")
         rc, output = self.run_script("action.sh", "--read-only")
-        self.assertEqual(rc, 1, output)
-        summary, _ = self.assert_action_logs(output, 1, "unknown vendor identity")
-        self.assertIn("[失败] ", summary)
-        self.assertNotIn("[正常] 文件与兼容性：", summary)
-        self.assertNotIn("[正常] 名称演练：", summary)
+        self.assertEqual(rc, 0, output)
+        summary, _ = self.assert_action_logs(output, 0, "mode=read-only", "Static checks only")
+        self.assertIn("[正常] 文件与兼容性：", summary)
         self.assertFalse((self.runtime / "test-writes").exists())
 
     def test_restore_failure_keeps_record_stop_and_does_not_resume(self):

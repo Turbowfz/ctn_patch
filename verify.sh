@@ -71,7 +71,11 @@ fi
 ctn_note "verification mode=$([ "$CTN_EXERCISE" = 1 ] && printf exercise || printf read-only)"
 CTN_ERROR_REASON= CTN_ERROR_HINT=
 ctn_select || ctn_abort '文件或兼容性检查失败；请查看详细诊断，不尝试其它内核文件' "$?"
-ctn_status 正常 "文件与兼容性：内核 $CTN_PROFILE，对应 KO 与厂商组件匹配"
+if [ "$CTN_RELEASE_VERIFIED" = 1 ]; then
+    ctn_status 正常 "文件与兼容性：内核 $CTN_PROFILE，对应 KO 与厂商模块就绪"
+else
+    ctn_status 注意 "文件与兼容性：内核 $CTN_PROFILE，完整版本未在实测名单；KO 由内核 ABI 校验，厂商模块已就绪"
+fi
 ctn_report_running
 if [ "$CTN_DETAILS" = 1 ] && command -v ctn_report_data >/dev/null 2>&1; then ctn_report_data; fi
 

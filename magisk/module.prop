@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 id=ctn_patch
 name=CTN Patch
-version=v3.1
-versionCode=31
+version=v3.2
+versionCode=32
 author=Turbo
-description=按 COSA 数据库自动填入游戏关键线程；开机选择已核验的 6.1.141 / 6.1.157 KO，不支持手动配置文件
+description=按 COSA 数据库自动填入游戏关键线程；开机自动选择 6.1.141 / 6.1.157 对应 KO，不支持手动配置文件
 banner=oplus.png
 updateJson=https://gitee.com/turbowfz/ctn_patch/raw/main/update.json

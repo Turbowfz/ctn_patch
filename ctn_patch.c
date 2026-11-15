@@ -150,6 +150,15 @@ MODULE_PARM_DESC(build_id, "Immutable source/profile/compiler build identity");
 MODULE_PARM_DESC(patch_ready, "Validated critical_task_name node is ready");
 MODULE_PARM_DESC(pid_display_available, "Verified locked PID source is available");
 
+/* Accept any build of the same numeric kernel series (6.1.141/6.1.157):
+ * the running release must start with the profile id followed by '-'. */
+static bool ctn_release_matches_profile(const char *release)
+{
+	const size_t n = sizeof(CTN_PROFILE_ID) - 1;
+
+	return release && !strncmp(release, CTN_PROFILE_ID, n) && release[n] == '-';
+}
+
 static int ctn_validate_profile(void)
 {
 	/* These are BTF-derived fields, not a guessed struct-module byte prefix. */
@@ -199,8 +208,13 @@ static int ctn_validate_profile(void)
 	if (!CTN_PROFILE_ID[0] || !CTN_BUILD_ID[0] || !CTN_EXPECT_DEFAULT0[0] ||
 	    !CTN_EXPECT_DEFAULT1[0] || !CTN_NAME_READERS_RCU_VERIFIED)
 		return -EPROTONOSUPPORT;
-	if (strcmp(utsname()->release, CTN_RUNTIME_RELEASE) ||
-	    strcmp(init_utsname()->release, CTN_RUNTIME_RELEASE) ||
+	/*
+	 * Numeric profile gate only: same-series 6.1.141/6.1.157 builds load and
+	 * the kernel's own MODVERSIONS CRC checks stay the ABI gate at insmod.
+	 * The vermagic self-check is build-time consistency, not a host comparison.
+	 */
+	if (!ctn_release_matches_profile(utsname()->release) ||
+	    !ctn_release_matches_profile(init_utsname()->release) ||
 	    strcmp(VERMAGIC_STRING, CTN_MODULE_VERMAGIC))
 		return -ENOEXEC;
 	return 0;
@@ -893,7 +907,7 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for verified Oplus 6.1 game_opt");
-MODULE_VERSION("3.1");
+MODULE_VERSION("3.2");
 MODULE_INFO(ctn_profile, CTN_PROFILE_ID);
 MODULE_INFO(ctn_build_id, CTN_BUILD_ID);
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

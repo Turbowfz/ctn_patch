@@ -181,8 +181,9 @@ ctn_read_metadata() {
     esac
 }
 
-# This is an identity gate, not an ELF heuristic. The allowlisted whole vendor
-# image binds full vermagic, CRCs, KCFI and layouts to the verified profile.
+# Compatibility gate: numeric kernel series plus package file identity. The
+# vendor image bytes are recorded in metadata but not gated here; the kernel
+# module verifies vendor symbols, sizes, sections and module state at load.
 ctn_select() {
     local paths path file hash found=0
     CTN_ERROR_REASON=
@@ -192,7 +193,7 @@ ctn_select() {
     }
     CTN_SELECTED_PROFILE=${CTN_RELEASE%%-*}
     case "$CTN_SELECTED_PROFILE" in 6.1.141|6.1.157) ;; *)
-        ctn_fail '当前内核暂不支持' "本包仅支持已核验的 6.1.141 / 6.1.157；当前为 $CTN_RELEASE。" "unsupported kernel: $CTN_RELEASE (no insmod probing)"; return 1 ;;
+        ctn_fail '当前内核暂不支持' "本包仅支持 6.1.141 / 6.1.157 内核；当前为 $CTN_RELEASE。" "unsupported kernel: $CTN_RELEASE (no insmod probing)"; return 1 ;;
     esac
     [ "$(uname -m)" = aarch64 ] || {
         ctn_fail 'CPU 架构不匹配' '此模块仅支持 ARM64 手机，不能在其他架构强行加载。' 'requires aarch64'; return 1;
@@ -206,9 +207,10 @@ ctn_select() {
     ctn_read_metadata "$CTN_KERNEL_DIR/metadata.prop" || {
         ctn_fail '当前内核的模块清单缺失或损坏' '请重新下载完整 ZIP，不要混用旧版 KO 和新版脚本。' 'selected profile metadata validation failed'; return 1;
     }
-    ctn_list_contains "$CTN_RELEASES" "$CTN_RELEASE" || {
-        ctn_fail '当前固件的完整内核版本尚未核验' '相同 141/157 版本号不代表 ABI 相同；请提供完整 uname -r 和安装详细日志。' "kernel release is not allowlisted: $CTN_RELEASE"; return 1;
-    }
+    # 数字版本号选择 profile；ABI 最终由内核 insmod 时的 MODVERSIONS CRC 校验把关，
+    # 完整 release 名单与厂商字节身份只作记录，厂商模块须存在且可读。
+    CTN_RELEASE_VERIFIED=0
+    if ctn_list_contains "$CTN_RELEASES" "$CTN_RELEASE"; then CTN_RELEASE_VERIFIED=1; fi
     [ ! -L "$CTN_KERNEL_DIR/manifest.json" ] &&
         [ "$(ctn_sha256 "$CTN_KERNEL_DIR/manifest.json")" = "$CTN_MANIFEST_HASH" ] || {
         ctn_fail '兼容性清单校验失败' '请重新下载并安装完整 ZIP，检查 sha256sum 是否可用。' 'manifest hash mismatch'; return 1;
@@ -229,12 +231,6 @@ ctn_select() {
             [ -f "$file" ] && [ -r "$file" ] || {
                 ctn_fail '无法读取厂商 game_opt 模块' '请检查厂商模块路径和读取权限，保存安装详细日志。' "unreadable vendor KO: $path"; return 1;
             }
-            hash=$(ctn_sha256 "$file") || {
-                ctn_fail '无法校验厂商模块文件' '请检查 sha256sum 命令和厂商文件读取权限。' "cannot hash vendor KO: $path"; return 1;
-            }
-            ctn_list_contains "$CTN_VENDOR_HASHES" "$hash" || {
-                ctn_fail '厂商 game_opt 模块与已核验基线不匹配' '请提供机型、固件版本和安装详细日志；不能绕过校验强行加载 KO。' "unknown vendor identity: $path SHA256=$hash"; return 1;
-            }
             [ -n "$CTN_VENDOR_FILE" ] || CTN_VENDOR_FILE=$path
             found=1
         fi
@@ -244,7 +240,7 @@ ctn_select() {
     [ "$found" = 1 ] || {
         ctn_fail '未找到可读的厂商 game_opt 模块' '请提供设备的 vendor / vendor_dlkm 模块路径，当前不支持强行加载。' 'no real allowlisted vendor KO is readable'; return 1;
     }
-    ctn_note "profile=$CTN_PROFILE kernel=$CTN_RELEASE vendor=$CTN_VENDOR_FILE package=$CTN_PACKAGE_MODE runtime_test=$CTN_RUNTIME_VERIFICATION"
+    ctn_note "profile=$CTN_PROFILE kernel=$CTN_RELEASE vendor=$CTN_VENDOR_FILE package=$CTN_PACKAGE_MODE runtime_test=$CTN_RUNTIME_VERIFICATION release_verified=$CTN_RELEASE_VERIFIED"
 }
 
 ctn_disabled() { [ -e "$MODDIR/disable" ] || [ -e "$MODDIR/remove" ] || [ -e "$MODDIR/.uninstalling" ]; }

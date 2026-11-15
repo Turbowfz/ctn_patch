@@ -397,7 +397,7 @@ class PackagingTests(unittest.TestCase):
         text = data.decode("utf-8")
         sections = re.split(r"(?m)(?=^CTN Patch )", text)
         sections = [section for section in sections if section.strip()]
-        self.assertEqual(len(sections), 15)
+        self.assertEqual(len(sections), 16)
         for section in sections:
             self.assertLessEqual(len(section.encode("utf-8")), 2048)
             bullets = [line for line in section.splitlines() if line.startswith("- ")]
@@ -882,7 +882,7 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertFalse(self.runtime.exists())
 
     def test_unknown_release_arch_or_pages_refuses_without_insmod(self):
-        for env in ({"MOCK_RELEASE": "6.1.142-android14"}, {"MOCK_RELEASE": "6.1.157-android14-11-o-unknown"},
+        for env in ({"MOCK_RELEASE": "6.1.142-android14"},
                     {"MOCK_ARCH": "x86_64"}, {"MOCK_PAGE": "16384"}, {"MOCK_PAGE": ""}):
             with self.subTest(env=env):
                 result = self.common("ctn_select", **env)
@@ -891,8 +891,20 @@ class RuntimeShellTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("insmod", self.events())
 
-    def test_vendor_and_target_ko_tamper_rejected_even_same_size(self):
-        for path in (self.vendor, self.package / "kernels/6.1.157/ctn_patch.ko", self.package / "bin/ctnd"):
+    def test_same_series_release_passes_selection_with_verified_flag(self):
+        # Numeric series selects the profile; an unverified full release is a
+        # notice, while the kernel's insmod CRC check stays the ABI gate.
+        for release, flag in (("6.1.157-android14-11-o-unknown", "0"),
+                              ("6.1.157-android14-11-o-fixture", "1")):
+            with self.subTest(release=release):
+                result = self.common("ctn_select && echo \"VERIFIED=$CTN_RELEASE_VERIFIED\"",
+                                     MOCK_RELEASE=release)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("VERIFIED=" + flag, result.stdout)
+        self.assertNotIn("insmod", self.events())
+
+    def test_target_ko_and_daemon_tamper_rejected_even_same_size(self):
+        for path in (self.package / "kernels/6.1.157/ctn_patch.ko", self.package / "bin/ctnd"):
             with self.subTest(path=path):
                 raw = path.read_bytes()
                 put(path, raw[:-1] + bytes([raw[-1] ^ 1]))
@@ -901,15 +913,15 @@ class RuntimeShellTests(unittest.TestCase):
                 put(path, raw)
         self.assertEqual(self.events(), "")
 
-    def test_missing_vendor_or_conflicting_second_path_refused(self):
+    def test_missing_vendor_refused_and_conflicting_second_path_is_ignored(self):
         self.vendor.unlink()
         self.assertNotEqual(self.common("ctn_select").returncode, 0)
         put(self.vendor, self.fixture.vendors["6.1.157"])
         second = self.device / "vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko"
         put(second, self.fixture.vendors["6.1.141"])
         result = self.common("ctn_select")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unknown vendor identity", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vendor=/vendor/lib/modules/oplus_bsp_game_opt.ko", result.stdout)
 
     def test_metadata_unknown_duplicate_or_shell_expression_is_never_executed(self):
         path = self.package / "kernels/6.1.157/metadata.prop"
@@ -932,6 +944,10 @@ class RuntimeShellTests(unittest.TestCase):
     def test_install_displays_changelog_and_packaged_kernels(self):
         result = self.run_script("customize.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[1/4] 自检", result.stdout)
+        self.assertIn("[2/4] 安装", result.stdout)
+        self.assertIn("[3/4] 当前版本更新日志", result.stdout)
+        self.assertIn("[4/4] 完成", result.stdout)
         self.assertIn("更新日志", result.stdout)
         self.assertIn("开机", result.stdout)
         self.assertIn("6.1.141", result.stdout)
@@ -955,7 +971,6 @@ class RuntimeShellTests(unittest.TestCase):
     def test_install_failure_reason_is_visible_in_manager_stdout(self):
         cases = (
             ({"MOCK_RELEASE": "6.1.142-android14-11-o-other"}, "当前内核暂不支持", None),
-            ({"MOCK_RELEASE": "6.1.157-android14-11-o-other"}, "完整内核版本尚未核验", None),
             ({"MOCK_ARCH": "x86_64"}, "CPU 架构不匹配", None),
             ({"MOCK_PAGE": "16384"}, "内存页大小不匹配或无法读取", None),
             ({"MOCK_GETCONF_FAIL": "1"}, "内存页大小不匹配或无法读取", None),
@@ -963,7 +978,6 @@ class RuntimeShellTests(unittest.TestCase):
             ({}, "兼容性清单校验失败", self.package / "kernels/6.1.157/manifest.json"),
             ({}, "所选 KO 文件损坏或缺失", self.package / "kernels/6.1.157/ctn_patch.ko"),
             ({}, "数据库服务程序损坏或缺失", self.package / "bin/ctnd"),
-            ({}, "厂商 game_opt 模块与已核验基线不匹配", self.vendor),
         )
         for env, reason, changed in cases:
             with self.subTest(reason=reason, env=env):
@@ -983,6 +997,22 @@ class RuntimeShellTests(unittest.TestCase):
                     if changed:
                         put(changed, original)
 
+    def test_install_warns_when_full_release_is_not_verified(self):
+        result = self.run_script("customize.sh", MOCK_RELEASE="6.1.157-android14-11-o-other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[注意] 完整内核版本未在实测名单：6.1.157-android14-11-o-other", result.stdout)
+        self.assertIn("按 6.1.157 ABI 由内核校验加载", result.stdout)
+        self.assertIn("[正常] 模块文件校验通过，厂商 game_opt 模块已找到", result.stdout)
+        self.assertNotIn("insmod", self.events())
+        self.assertFalse(self.runtime.exists())
+
+    def test_verify_flags_unverified_full_release_as_notice(self):
+        result = self.run_script("verify.sh", MOCK_RELEASE="6.1.157-android14-11-o-other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[注意] 文件与兼容性：内核 6.1.157，完整版本未在实测名单", result.stdout)
+        self.assertNotIn("完整内核版本尚未核验", result.stdout)
+        self.assertNotIn("insmod", self.events())
+
     def test_install_never_uses_loaded_old_module_as_compatibility_evidence(self):
         self.loaded(legacy=True)
         result = self.run_script("customize.sh")
@@ -992,7 +1022,9 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertNotIn("insmod", self.events())
         self.assertNotIn("rmmod", self.events())
         put(self.vendor, b"wrong")
-        self.assertNotEqual(self.run_script("customize.sh").returncode, 0)
+        result = self.run_script("customize.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[正常] 模块文件校验通过，厂商 game_opt 模块已找到", result.stdout)
 
     def test_upgrade_preserves_disable_and_remove(self):
         old = self.device / "data/adb/modules/ctn_patch"
@@ -1044,10 +1076,8 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertIn(str(log), result.stdout)
         put(self.vendor, b"bad vendor")
         result = self.run_script("action.sh", "--read-only")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("厂商 game_opt 模块", log.read_text())
-        self.assertIn("unknown vendor identity", detail.read_text())
-        self.assertIn("SELF_CHECK_EXIT=1", detail.read_text())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("vendor=/vendor/lib/modules/oplus_bsp_game_opt.ko", detail.read_text())
 
     def test_action_default_exercises_and_logs(self):
         for version in PACK.PROFILES:

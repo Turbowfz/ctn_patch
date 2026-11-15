@@ -13,9 +13,9 @@ CTN 只从 COSA 数据库自动读取，不创建、读取或支持手动 `ctn.c
 - `kernels/6.1.141/` 与 `kernels/6.1.157/`：各自的 `ctn_patch.ko`、`manifest.json`、`metadata.prop`。安装后保留包内所有 KO，下次启动重新选择，不能在 OTA 后沿用上次选择。
 - 不包含用户配置、源码、LICENSE、测试线程程序。源码仓库保留 LICENSE；`out/user/fakethreads` 是独立测试产物，不是模块运行依赖。
 
-安装和启动均先检查 `uname -r` 精确白名单、`aarch64` 与 4096 字节页，然后校验真实 `/vendor/lib/modules/oplus_bsp_game_opt.ko` 或 `/vendor_dlkm/lib/modules/oplus_bsp_game_opt.ko` 的完整 SHA256。所有可读候选都必须匹配，出现不同的 vendor 文件即拒绝。此保守 identity gate 绑定已核验的完整 vermagic、符号 CRC、KCFI、布局等 ABI 信息，不靠前缀猜测，也不以 `insmod` 试错。还会校验目标 KO、daemon、manifest 的 SHA256。
+安装和启动均按 `uname -r` 的 6.1.141 / 6.1.157 数字版本选择 KO，检查 `aarch64`、4096 字节页与厂商 game_opt 模块存在可读。完整内核版本与厂商模块字节身份记录在清单中但不作安装门槛；不在实测名单的固件仅显示提示。KO 加载兼容由内核 MODVERSIONS CRC 及模块自身的厂商符号、大小、分区和模块状态校验把关，不以 `insmod` 试错或轮换 KO。还会校验目标 KO、daemon、manifest 的 SHA256。
 
-运行 shell 只读取白名单 `metadata.prop` 键，不 `source`/`eval` 元数据，不依赖 JSON 工具。列表以 `|` 分隔，`manifest.json` 保留 profile 与逐项核验记录。未知内核、未知 vendor、损坏文件或来源不明的原生节点全部拒绝；目前没有获准的原生 daemon-only profile。
+运行 shell 只读取白名单 `metadata.prop` 键，不 `source`/`eval` 元数据，不依赖 JSON 工具。列表以 `|` 分隔，`manifest.json` 保留 profile 与逐项核验记录。不支持的内核版本、损坏文件或来源不明的原生节点全部拒绝；目前没有获准的原生 daemon-only profile。
 
 ## 安装、禁用与运行
 

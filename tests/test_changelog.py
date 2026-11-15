@@ -18,7 +18,7 @@ assert SPEC and SPEC.loader
 GEN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GEN)
 EXPECTED = [
-    ("v3.1", 31), ("v3.0", 30), ("v2.2", 22), ("v2.1", 21), ("v2.0", 20),
+    ("v3.2", 32), ("v3.1", 31), ("v3.0", 30), ("v2.2", 22), ("v2.1", 21), ("v2.0", 20),
     *((f"v1.{minor}", 10 + minor) for minor in range(9, -1, -1)),
 ]
 PACKAGE_HEADER = re.compile(r"CTN Patch (v[0-9]+\.[0-9]+)（versionCode ([0-9]+)）更新日志")
@@ -49,7 +49,7 @@ class ChangelogTests(unittest.TestCase):
             bullets.append(line)
         self.assertTrue(1 <= len(bullets) <= 4)
         self.assertEqual(headings, EXPECTED)
-        self.assertEqual(len({version for version, _ in headings}), 15)
+        self.assertEqual(len({version for version, _ in headings}), 16)
 
     def test_root_complete_unique_descending_concise_history(self):
         self.assertTrue(SOURCE.startswith("# 更新日志\n\n"))
@@ -57,7 +57,7 @@ class ChangelogTests(unittest.TestCase):
         parsed = GEN.parse_changelog(SOURCE)
         self.assertEqual([(version, section.version_code) for version, section in parsed.items()], EXPECTED)
 
-    def test_package_generation_has_exact_15_sections_and_no_extra_details(self):
+    def test_package_generation_has_exact_16_sections_and_no_extra_details(self):
         parsed = GEN.parse_changelog(SOURCE)
         package = GEN.render_package_changelog(parsed)
         self.assert_sections(package, PACKAGE_HEADER)
@@ -74,7 +74,7 @@ class ChangelogTests(unittest.TestCase):
         package = (REPO / "magisk/changelog.txt").read_bytes()
         update = (REPO / "update-changelog.md").read_bytes()
         self.assertEqual(package, GEN.render_package_changelog(parsed).encode("utf-8"))
-        self.assertEqual(update, GEN.render_update_changelog(parsed, "v3.1").encode("utf-8"))
+        self.assertEqual(update, GEN.render_update_changelog(parsed, "v3.2").encode("utf-8"))
         self.assert_sections(package.decode("utf-8"), PACKAGE_HEADER)
 
     def test_update_contains_only_requested_current_section(self):
@@ -89,10 +89,9 @@ class ChangelogTests(unittest.TestCase):
 
     def test_current_no_manual_configuration_and_historical_override_is_past_only(self):
         parsed = GEN.parse_changelog(SOURCE)
-        current = "\n".join(parsed["v3.1"].bullets)
-        self.assertIn("不创建或读取手动配置文件", current)
+        current = "\n".join(parsed["v3.2"].bullets)
         self.assertIn("不支持 ctn.conf 手动添加", current)
-        self.assertIn("141 仍无本轮实机验证", current)
+        self.assertIn("141 仍无实机验证", current)
         self.assertIn("当时支持本地覆盖（已移除）", "\n".join(parsed["v1.1"].bullets))
         self.assertIn("移除本地覆盖文件 ctn.conf", "\n".join(parsed["v2.0"].bullets))
 
@@ -135,13 +134,13 @@ class ChangelogTests(unittest.TestCase):
                 GEN.parse_changelog(SOURCE.replace(marker, marker + addition, 1))
 
     def test_future_versions_must_follow_same_concise_contract(self):
-        future = ("# 更新日志\n\n## v3.2（versionCode 32）\n\n- 简短新版本要点。\n\n"
+        future = ("# 更新日志\n\n## v3.3（versionCode 33）\n\n- 简短新版本要点。\n\n"
                   + SOURCE.removeprefix("# 更新日志\n\n"))
         parsed = GEN.parse_changelog(future)
-        self.assertEqual(len(parsed), 16)
-        self.assertEqual(next(iter(parsed)), "v3.2")
-        self.assertEqual(parsed["v3.2"].version_code, 32)
-        self.assertTrue(GEN.render_package_changelog(parsed).startswith("CTN Patch v3.2（versionCode 32）更新日志\n\n"))
+        self.assertEqual(len(parsed), 17)
+        self.assertEqual(next(iter(parsed)), "v3.3")
+        self.assertEqual(parsed["v3.3"].version_code, 33)
+        self.assertTrue(GEN.render_package_changelog(parsed).startswith("CTN Patch v3.3（versionCode 33）更新日志\n\n"))
 
     def test_extract_section_keeps_legacy_boundary_and_missing_behavior(self):
         text = "## v1.10（versionCode 110）\n\n- 不应匹配。\n\n## v1.1（versionCode 11）\n\n- 所选版本。\n"
@@ -198,8 +197,8 @@ class GeneratorCLITests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.generate(argv)
                 self.assertEqual(re.findall(r"^## .+$", self.update.read_text(encoding="utf-8"), re.M), ["## v2.2（versionCode 22）"])
-                self.assertTrue(self.package.read_text(encoding="utf-8").startswith("CTN Patch v3.1（versionCode 31）更新日志\n\n"))
-                self.assertEqual(len(re.findall(r"^CTN Patch ", self.package.read_text(encoding="utf-8"), re.M)), 15)
+                self.assertTrue(self.package.read_text(encoding="utf-8").startswith("CTN Patch v3.2（versionCode 32）更新日志\n\n"))
+                self.assertEqual(len(re.findall(r"^CTN Patch ", self.package.read_text(encoding="utf-8"), re.M)), 16)
 
     def test_unknown_or_unsupported_target_rejected_before_output_touch(self):
         for target in ("v9.9", "v1.10", "not-a-version"):
