@@ -225,7 +225,13 @@ ctn_exercise_cleanup() {
     fi
     if [ "$CTN_LOADED_BY_US" = 1 ]; then
         if [ "$restore_rc" = 0 ] && [ ! -e "$CTN_RUNTIME/restore.state" ]; then
-            rmmod ctn_patch || { restore_rc=$?; ctn_error "cannot unload the test-owned KO rc=$restore_rc"; }
+            if [ -e "$CTN_SYS/module/ctn_patch/parameters/critical_task_control" ]; then
+                echo stop > "$CTN_SYS/module/ctn_patch/parameters/critical_task_control" 2>/dev/null ||
+                    { restore_rc=1; ctn_error 'cannot restore the vendor sched hook before unload'; }
+            fi
+            if [ "$restore_rc" = 0 ]; then
+                rmmod ctn_patch || { restore_rc=$?; ctn_error "cannot unload the test-owned KO rc=$restore_rc"; }
+            fi
         else ctn_error 'restoration failed; refusing to unload test KO'; restore_rc=1
         fi
     fi

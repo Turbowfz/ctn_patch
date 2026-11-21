@@ -18,6 +18,7 @@ def gates(profile):
             'CTN_EXPECT_MODULE_SIZE':s['module']['size'],
             'CTN_EXPECT_TASK_COMM_OFFSET':s['task_struct']['members']['comm'],
             'CTN_EXPECT_TASK_PID_OFFSET':s['task_struct']['members']['pid'],
+            'CTN_EXPECT_TASK_TGID_OFFSET':s['task_struct']['members']['tgid'],
             'CTN_EXPECT_RRT_SIZE':24,'CTN_EXPECT_RT_LOCK_SIZE':a['vendor_symbols']['rt_info_rwlock']['size'],
             'CTN_EXPECT_CRITICAL_TASK_BYTES':a['vendor_symbols']['critical_task']['size'],
             'CTN_EXPECT_DEFAULT0':'UnityMain','CTN_EXPECT_DEFAULT1':'UnityGfxDevice'}
@@ -25,6 +26,31 @@ def gates(profile):
         values[prefix+'SIZE']=s[structname]['size']
         for field,offset in s[structname]['members'].items():
             values[prefix+field.upper()+'_OFFSET']=offset
+    chain = a.get('ctn_chain')
+    if chain:
+        if chain.get('private_layout_verified') is not True:
+            raise ValueError('缺少已验证的 CTN 链路布局证据')
+        structures = chain.get('structures', {})
+        required = ('tracepoint', 'tracepoint_func', 'thread_info')
+        if any(name not in structures for name in required):
+            raise ValueError('CTN 链路结构证据不完整')
+        values['CTN_CHAIN_VERIFIED'] = 1
+        values['CTN_EXPECT_CHB_LOCK_SIZE'] = chain['raw_spinlock_size']
+        values['CTN_EXPECT_TRACE_FUNC_SIZE'] = chain['tracepoint_func_size']
+        values['CTN_EXPECT_TRACE_PRIORITY_OFFSET'] = chain['tracepoint_func_priority_offset']
+        values['CTN_EXPECT_TASK_CPU_OFFSET'] = chain['task_cpu_offset']
+        values['CTN_EXPECT_TASK_USAGE_OFFSET'] = chain['task_usage_offset']
+        values['CTN_EXPECT_REFCOUNT_SIZE'] = chain['refcount_size']
+        values['CTN_CHAIN_PRIORITY'] = chain['tracepoint_priority']
+        tp = structures['tracepoint']
+        values['CTN_EXPECT_TRACEPOINT_SIZE'] = tp['size']
+        values['CTN_EXPECT_TRACEPOINT_FUNCS_OFFSET'] = tp['members']['funcs']
+        func = structures['tracepoint_func']
+        values['CTN_EXPECT_TRACE_FUNC_PTR_OFFSET'] = func['members']['func']
+        values['CTN_EXPECT_TRACE_FUNC_DATA_OFFSET'] = func['members']['data']
+        sched = chain['functions']['sched']
+        values['CTN_CHAIN_SCHED_SIZE'] = sched['size']
+        values['CTN_CHAIN_SCHED_KCFI'] = int(sched['kcfi'], 16)
     return values
 
 

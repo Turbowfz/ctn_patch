@@ -12,6 +12,13 @@ ctn_safe_file "$MODDIR/.uninstalling" || exit 1
 ctn_stop_service || { ctn_error 'uninstall stopped: restore/stop failed; keeping module and runtime'; exit 1; }
 ctn_exercise_guard || { ctn_error 'uninstall stopped: unresolved self-check restoration'; exit 1; }
 if ctn_loaded; then
+    # 链路模块持有自引用挡 rmmod；先恢复厂商调度回调再卸载。
+    if [ -e "$CTN_SYS/module/ctn_patch/parameters/critical_task_control" ]; then
+        if ! echo stop > "$CTN_SYS/module/ctn_patch/parameters/critical_task_control" 2>/dev/null; then
+            ctn_error 'cannot restore the vendor sched hook; runtime retained'
+            exit 1
+        fi
+    fi
     rmmod ctn_patch
     CTN_RC=$?
     [ "$CTN_RC" = 0 ] || { ctn_error "rmmod failed rc=$CTN_RC; runtime retained"; exit "$CTN_RC"; }

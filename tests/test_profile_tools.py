@@ -23,7 +23,8 @@ class ProfileTools(unittest.TestCase):
         self.directory = Path(self.temp.name)
         self.module = self.directory / 'module'
         (self.module / 'kernel').mkdir(parents=True)
-        for name in ('Kbuild', 'ctn_patch.c', 'kernel/ctn_patch_internal.h'):
+        for name in ('Kbuild', 'ctn_patch.c', 'kernel/ctn_patch_internal.h',
+                     'kernel/ctn_chain_core.h'):
             shutil.copyfile(ROOT / name, self.module / name)
         self.profile = ROOT / 'profiles/6.1.157/profile.json'
         self.spec = json.loads(self.profile.read_text())

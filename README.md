@@ -4,7 +4,7 @@
 `/proc/game_opt/task_boost/critical_task_name`，由 `ctnd` 从 COSA 数据库读取
 `game_config.ctn` 后应用。没有本地 CTN 覆盖文件，也不读取 `from_server`。
 
-模块 ID 保持 `ctn_patch`，当前发布版本 `v3.1 / versionCode 31`（包内保留开发验证标记）。开机自动选择
+模块 ID 保持 `ctn_patch`，当前版本 `v3.3 / versionCode 33`（开发验证，未发布）。开机自动选择
 已核验的 6.1.141 / 6.1.157 KO，不读取或创建 `ctn.conf`。旧版 v3.0 与 v2.2
 保留，不用新包的文件校验替代新 KO 的实机结果。
 

@@ -12,6 +12,7 @@ all:
 
 test:
 	bash daemon/test.sh
+	python3 -I -B tests/test_ctn_chain.py
 	python3 -I -B tests/test_packaging.py
 	python3 -I -B tests/test_profile_tools.py
 	python3 -I -B tests/test_changelog.py

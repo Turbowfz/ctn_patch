@@ -122,6 +122,117 @@
       "name_reader": "critical_task relocations resolve only to update_critical_task_time, called by registered sched_switch callback",
       "rcu_basis": "tracepoint.h __DO_TRACE preempt-disabled section; Linux >=5.0 synchronize_rcu waits for this section",
       "pid_policy": "rwlock-protected entries plus RCU task lookup and task pointer/PID identity; no direct vendor stale-task dereference"
+    },
+    "ctn_chain": {
+      "source": {
+        "repo": "https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750",
+        "commit": "d50b305f7da9e14715a25120a4ac7b1a4b8b97c3",
+        "branch": "oneplus/sm8750_b_16.0.0_oneplus_13"
+      },
+      "vendor_evidence_sha256": "addda8f97c222c6d24e3fcceebfbbacdba2732cb83503b9dbeeb8f48c338552f",
+      "private_layout_verified": true,
+      "raw_spinlock_size": 4,
+      "tracepoint_func_size": 24,
+      "tracepoint_func_priority_offset": 16,
+      "task_cpu_offset": 40,
+      "tracepoint_priority": 10,
+      "structures": {
+        "tracepoint": {
+          "size": 72,
+          "members": {
+            "name": 0,
+            "key": 8,
+            "funcs": 64
+          }
+        },
+        "tracepoint_func": {
+          "size": 24,
+          "members": {
+            "func": 0,
+            "data": 8,
+            "prio": 16
+          }
+        },
+        "thread_info": {
+          "size": 48,
+          "members": {
+            "cpu": 40
+          }
+        }
+      },
+      "functions": {
+        "sched": {
+          "name": "sched_switch_hook",
+          "size": 116,
+          "kcfi": "0xee1f7a69",
+          "bytes_sha256": "fa3fa6ad0b7b14f85cf1f210d79faae60f429ff25fa96391242f7f5210ea9c58",
+          "words": [
+            "0xd503233f",
+            "0xa9be7bfd",
+            "0xa9014ff4",
+            "0x910003fd",
+            "0x00000000",
+            "0x00000000",
+            "0x34000268",
+            "0xaa0203f4",
+            "0xaa0203e0",
+            "0x2a1f03e1",
+            "0x52800022",
+            "0xaa0303f3",
+            "0x94000011",
+            "0xaa1303e0",
+            "0x2a1f03e1",
+            "0x2a1f03e2",
+            "0x9400000d",
+            "0xaa1403e0",
+            "0x52800021",
+            "0x52800022",
+            "0x94000009",
+            "0xaa1303e0",
+            "0x52800021",
+            "0x2a1f03e2",
+            "0x94000005",
+            "0xa9414ff4",
+            "0xa8c27bfd",
+            "0xd50323bf",
+            "0xd65f03c0"
+          ],
+          "masks": [
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0x00000000",
+            "0x00000000",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff"
+          ]
+        }
+      },
+      "runtime": "not_tested",
+      "task_usage_offset": 64,
+      "refcount_size": 4
     }
   },
   "source": {

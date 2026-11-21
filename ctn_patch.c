@@ -40,11 +40,14 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pid_namespace.h>
+#include <linux/refcount.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
+#include <linux/tracepoint.h>
 #include <linux/uaccess.h>
 #include <linux/utsname.h>
 #include <linux/vmalloc.h>
@@ -56,6 +59,10 @@
 
 #include "ctn_profile.h"
 #include "ctn_patch_internal.h"
+#include "ctn_chain_core.h"
+
+/* 设备 vmlinux 导出；MODVERSIONS CRC 在装载时核对（见 profile imports）。 */
+extern struct tracepoint __tracepoint_sched_switch;
 
 #if !defined(CONFIG_ARM64) || !defined(CONFIG_CFI_CLANG) || \
     !defined(CONFIG_KALLSYMS_ALL) || !defined(CONFIG_MODULE_UNLOAD)
@@ -77,6 +84,9 @@
 #define PROBE_RETRY_MS		10000
 #define PROBE_MAX_TRIES		60
 #define CT_SYMBOL_NAME_LEN	128
+#define CHAIN_MAX_FUNCS		32
+#define CHAIN_MAX_CANDIDATES	32
+#define CHAIN_POLL_MS		1000
 
 struct rrt_entry {
 	pid_t pid;
@@ -99,6 +109,40 @@ static bool patched;
 static bool patch_ready;
 static bool pid_display_available;
 static bool stopping;
+
+/* ---- CTN 链路（一加13官方方案移植）：登记 → PID/TGID 绑定 → 调度消费 ---- */
+static raw_spinlock_t *chb_lock_addr;
+static u64 *running_ns_addr;
+static u64 *blocked_ns_addr;
+static u64 *end_ns_addr;
+static u64 *slide_ns_addr;
+static u64 *window_end_addr;
+static atomic_t *status_addr;
+static int *cpu_core_addr;
+static bool *ct_enable_addr;
+/* get_task_struct 是内核内联函数（kallsyms 无符号），按设备 BTF 核对的
+ * usage 偏移内联完成引用计数；释放必须经 ctn_task_unref（先减后放）。 */
+static void ctn_task_ref(struct task_struct *task)
+{
+	refcount_inc(&task->usage);
+}
+static void ctn_task_unref(struct task_struct *task)
+{
+	if (refcount_dec_and_test(&task->usage))
+		__put_task_struct(task);
+}
+static bool chain_swapped;
+static bool chain_active;
+static bool chain_stopping;
+static bool chain_probe_on;
+static DEFINE_RAW_SPINLOCK(chain_lock);
+static u64 chain_generation = 1;
+static u64 chain_epoch;
+static struct ctn_chain_config chain_config;
+static struct ctn_chain_binding chain_binding;
+static struct kretprobe registry_probe;
+static unsigned long registry_probe_seen;
+static struct delayed_work chain_work;
 static DEFINE_MUTEX(patch_lock);
 static struct delayed_work probe_work;
 static unsigned int probe_tries;
@@ -204,6 +248,24 @@ static int ctn_validate_profile(void)
 		     CTN_NAME_READERS_RCU_VERIFIED != 1);
 	BUILD_BUG_ON(sizeof(CTN_EXPECT_DEFAULT0) > CT_NAME_LEN ||
 		     sizeof(CTN_EXPECT_DEFAULT1) > CT_NAME_LEN);
+#ifdef CTN_CHAIN_VERIFIED
+	/* 一加13链路所需的内核核心结构，两套基线 BTF 完全一致。 */
+	BUILD_BUG_ON(sizeof(struct tracepoint) != CTN_EXPECT_TRACEPOINT_SIZE);
+	BUILD_BUG_ON(offsetof(struct tracepoint, funcs) !=
+		     CTN_EXPECT_TRACEPOINT_FUNCS_OFFSET);
+	BUILD_BUG_ON(sizeof(struct tracepoint_func) != CTN_EXPECT_TRACE_FUNC_SIZE);
+	BUILD_BUG_ON(offsetof(struct tracepoint_func, func) !=
+		     CTN_EXPECT_TRACE_FUNC_PTR_OFFSET);
+	BUILD_BUG_ON(offsetof(struct tracepoint_func, data) !=
+		     CTN_EXPECT_TRACE_FUNC_DATA_OFFSET);
+	BUILD_BUG_ON(offsetof(struct tracepoint_func, prio) !=
+		     CTN_EXPECT_TRACE_PRIORITY_OFFSET);
+	BUILD_BUG_ON(offsetof(struct thread_info, cpu) != CTN_EXPECT_TASK_CPU_OFFSET);
+	BUILD_BUG_ON(sizeof(raw_spinlock_t) != CTN_EXPECT_CHB_LOCK_SIZE);
+	BUILD_BUG_ON(offsetof(struct task_struct, tgid) != CTN_EXPECT_TASK_TGID_OFFSET);
+	BUILD_BUG_ON(offsetof(struct task_struct, usage) != CTN_EXPECT_TASK_USAGE_OFFSET);
+	BUILD_BUG_ON(sizeof(refcount_t) != CTN_EXPECT_REFCOUNT_SIZE);
+#endif
 
 	if (!CTN_PROFILE_ID[0] || !CTN_BUILD_ID[0] || !CTN_EXPECT_DEFAULT0[0] ||
 	    !CTN_EXPECT_DEFAULT1[0] || !CTN_NAME_READERS_RCU_VERIFIED)
@@ -262,7 +324,7 @@ static noinline __used long ctn_nofault_stub(void *dst, const void *src, size_t 
 	return -EFAULT;
 }
 static noinline __used struct task_struct *ctn_pid_ns_stub(pid_t pid,
-						      struct pid_namespace *ns)
+							      struct pid_namespace *ns)
 {
 	return NULL;
 }
@@ -554,54 +616,613 @@ static void ctn_resolve_pid_source(void)
 	smp_store_release(&pid_display_available, true);
 }
 
-/* Called with patch_lock. The rwlock protects entries; RCU protects task lookup. */
-static pid_t ctn_find_pid(const char *name, pid_t excluded)
-{
-	struct rrt_entry entry;
-	struct task_struct *task;
-	unsigned long flags;
-	char comm[TASK_COMM_LEN];
-	size_t length = strlen(name);
-	pid_t found = -1, task_pid;
-	int n, valid, i;
+/* ---- 链路实现：登记快照 → 绑定发布 → 真实调度消费 ---- */
 
-	if (!smp_load_acquire(&pid_display_available) || !length ||
-	    length >= TASK_COMM_LEN)
-		return -1;
+static unsigned long chain_victim_hook;
+static void ctn_chain_sched_hook(void *unused, bool preempt,
+				 struct task_struct *prev, struct task_struct *next,
+				 unsigned int prev_state);
+
+static void ctn_chain_rebind_work(struct work_struct *work);
+static void ctn_registry_probe_monitor(void);
+static int ctn_registry_entry(struct kretprobe_instance *instance, struct pt_regs *regs);
+static int ctn_registry_return(struct kretprobe_instance *instance, struct pt_regs *regs);
+static int ctn_chain_swap_out(void);
+
+/* 官方登记表行：pid/task/wake_count，24 字节（BUILD_BUG_ON 已核对偏移）。 */
+struct ctn_registry_row {
+	int pid;
+	struct task_struct *task;
+	u32 wake_count;
+};
+
+static void ctn_chain_config_defaults(void)
+{
+	static const char *const defaults[CT_NUM] = { CTN_EXPECT_DEFAULT0,
+						      CTN_EXPECT_DEFAULT1 };
+	unsigned int i;
+
+	memset(&chain_config, 0, sizeof(chain_config));
+	for (i = 0; i < CT_NUM; i++) {
+		size_t length = strlen(defaults[i]);
+
+		memcpy(chain_config.names[i], defaults[i], length + 1);
+		chain_config.length[i] = (unsigned int)length;
+	}
+}
+
+/* 厂商 CTB 计时对象与开关：对象身份在 try_patch 阶段按 profile 证据解析。 */
+static int ctn_chain_resolve_objects(void)
+{
+	static const struct {
+		const char *name;
+		size_t size;
+		void **out;
+	} objects[] = {
+		{ "chb_lock", sizeof(raw_spinlock_t), (void **)&chb_lock_addr },
+		{ "critical_task_running_time_ns", 2 * sizeof(u64), (void **)&running_ns_addr },
+		{ "critical_task_block_time_ns", 2 * sizeof(u64), (void **)&blocked_ns_addr },
+		{ "critical_task_end_time", 2 * sizeof(u64), (void **)&end_ns_addr },
+		{ "cur_slide_window_running_time_ns", 2 * sizeof(u64), (void **)&slide_ns_addr },
+		{ "last_window_end_time_ns", sizeof(u64), (void **)&window_end_addr },
+		{ "critical_task_running_status", 2 * sizeof(atomic_t), (void **)&status_addr },
+		{ "cpu_core", 2 * sizeof(int), (void **)&cpu_core_addr },
+		{ "ct_enable", sizeof(bool), (void **)&ct_enable_addr },
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+		void *found = NULL;
+
+		ret = ctn_object_symbol(objects[i].name, objects[i].size, false, &found);
+		if (ret)
+			return ret;
+		*objects[i].out = found;
+	}
+	if ((unsigned long)chb_lock_addr % __alignof__(raw_spinlock_t) ||
+	    (unsigned long)cpu_core_addr % __alignof__(int) ||
+	    (unsigned long)status_addr % __alignof__(atomic_t) ||
+	    (unsigned long)running_ns_addr % __alignof__(u64))
+		return -ENOEXEC;
+	return 0;
+}
+
+/* 定位 CTB 的 sched_switch_hook：同名函数有三个，按精确 st_size 消歧。 */
+static int ctn_chain_resolve_hook(unsigned long *hook)
+{
+	Elf_Sym symbol;
+	char name[CT_SYMBOL_NAME_LEN];
+	unsigned int i, type;
+	unsigned long found = 0;
+	int ret;
+
+	for (i = 1; i < victim_kallsyms.num_symtab; i++) {
+		ret = ctn_nofault(&symbol, victim_kallsyms.symtab + i, sizeof(symbol));
+		if (ret)
+			return ret;
+		if (!symbol.st_name || symbol.st_shndx == SHN_UNDEF ||
+		    ELF_ST_TYPE(symbol.st_info) != STT_FUNC ||
+		    symbol.st_shndx >= SHN_LORESERVE)
+			continue;
+		if (symbol.st_name >= victim_strtab_bytes)
+			return -ENOEXEC;
+		ret = ctn_nofault_string(victim_kallsyms.strtab + symbol.st_name,
+					 name, sizeof(name),
+					 victim_strtab_bytes - symbol.st_name);
+		if (ret == -ENAMETOOLONG)
+			continue;
+		if (ret)
+			return ret;
+		if (strcmp(name, "sched_switch_hook") ||
+		    symbol.st_size != CTN_CHAIN_SCHED_SIZE)
+			continue;
+		if (found)
+			return -ENOEXEC;
+		found = kallsyms_symbol_value(&symbol);
+	}
+	if (!found || (found & 3) || !ctn_core_range((const void *)found, CTN_CHAIN_SCHED_SIZE))
+		return -ENOENT;
+	type = 0;
+	if (ctn_bootstrap_type((const void *)found, &type) || type != CTN_CHAIN_SCHED_KCFI)
+		return -ENOEXEC;
+	*hook = found;
+	return 0;
+}
+
+/* 注册表行 -> 已验证的候选任务；每选中一个持有一个引用。 */
+static int ctn_chain_collect(struct ctn_chain_task *candidates, unsigned int max,
+			     unsigned int *count)
+{
+	unsigned int i, kept = 0;
+	int total;
+	unsigned long flags;
+
+	*count = 0;
+	if (!smp_load_acquire(&pid_display_available) || !g_related_threads ||
+	    !g_total_num || !find_task_by_pid_ns_fn || !initial_pid_namespace)
+		return -ENOENT;
 	read_lock_irqsave(g_rt_lock, flags);
+	if (ctn_nofault(&total, g_total_num, sizeof(total)) || total < 0 ||
+	    total > MAX_TID_COUNT) {
+		read_unlock_irqrestore(g_rt_lock, flags);
+		return -ENOEXEC;
+	}
+	/* 单遍持锁完成行读取、身份核对与取引用；不建中间数组，控制内核栈帧。 */
+	for (i = 0; i < (unsigned int)total && kept < max; i++) {
+		struct ctn_registry_row row;
+		struct task_struct *task;
+		struct ctn_chain_task candidate;
+
+		if (ctn_nofault(&row, g_related_threads + i, sizeof(row)))
+			break;
+		if (row.pid <= 0 || !ctn_kernel_address(row.task))
+			continue;
+		rcu_read_lock();
+		task = find_task_by_pid_ns_fn(row.pid, initial_pid_namespace);
+		/* 指针身份核对，绝不直接解引用厂商登记表里的旧 task。 */
+		if (task && task == row.task) {
+			candidate.token = (unsigned long)task;
+			candidate.pid = READ_ONCE(task->pid);
+			candidate.tgid = READ_ONCE(task->tgid);
+			memcpy(candidate.comm, task->comm, sizeof(candidate.comm));
+			if (candidate.pid == row.pid && ctn_chain_task_valid(&candidate)) {
+				ctn_task_ref(task);
+				candidates[kept++] = candidate;
+			}
+		}
+		rcu_read_unlock();
+	}
+	read_unlock_irqrestore(g_rt_lock, flags);
+	*count = kept;
+	return 0;
+}
+
+/*
+ * 发布新绑定。tasks 里的引用随结构移交：同 token 的引用立即归还一份，
+ * 被替换的旧任务引用在宽限期后才释放。
+ */
+static void ctn_chain_publish(struct ctn_chain_task tasks[CT_NUM], int tgid)
+{
+	struct ctn_chain_task previous[CT_NUM];
+	bool keep[CT_NUM] = { false, false };
+	unsigned long flags;
+	int i;
+
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	for (i = 0; i < CT_NUM; i++) {
+		previous[i] = chain_binding.tasks[i];
+		keep[i] = previous[i].token && previous[i].token == tasks[i].token;
+		chain_binding.tasks[i] = tasks[i];
+	}
+	chain_binding.tgid = tgid;
+	chain_binding.generation = chain_generation;
+	chain_binding.epoch = chain_epoch;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	for (i = 0; i < CT_NUM; i++) {
+		if (keep[i])
+			ctn_task_unref((struct task_struct *)tasks[i].token);
+	}
+	synchronize_rcu();
+	for (i = 0; i < CT_NUM; i++) {
+		if (!keep[i] && previous[i].token)
+			ctn_task_unref((struct task_struct *)previous[i].token);
+	}
+}
+
+/* 清空绑定：引用在宽限期后释放，热路径随之失配。 */
+static void ctn_chain_clear(void)
+{
+	struct ctn_chain_task empty[CT_NUM];
+
+	memset(empty, 0, sizeof(empty));
+	ctn_chain_publish(empty, -1);
+}
+
+static void ctn_chain_drop_extra(struct ctn_chain_task *candidates, unsigned int count,
+				 const struct ctn_chain_task chosen[CT_NUM])
+{
+	unsigned int i;
+	int j;
+
+	for (i = 0; i < count; i++) {
+		bool chosen_task = false;
+
+		for (j = 0; j < CT_NUM; j++)
+			chosen_task |= chosen[j].token == candidates[i].token &&
+				       candidates[i].token;
+		/* 未发布的候选立即归还引用；它们从未对读者可见。 */
+		if (!chosen_task)
+			ctn_task_unref((struct task_struct *)candidates[i].token);
+	}
+}
+
+static void ctn_chain_rebind_work(struct work_struct *work)
+{
+	struct ctn_chain_selection selection;
+	struct ctn_chain_binding next;
+	struct ctn_chain_task candidates[CHAIN_MAX_CANDIDATES];
+	struct ctn_chain_task chosen[CT_NUM];
+	struct ctn_chain_config config;
+	unsigned int count = 0, i;
+	int group = -1, ret;
+	unsigned long flags;
+
+	(void)work;
+	if (READ_ONCE(chain_stopping) || !smp_load_acquire(&patch_ready) ||
+	    !smp_load_acquire(&chain_swapped))
+		return;
+	ctn_registry_probe_monitor();
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	config = chain_config;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+
+	if (WARN_ON_ONCE(!ctn_chain_config_valid(&config)))
+		return;
+	ret = ctn_chain_collect(candidates, CHAIN_MAX_CANDIDATES, &count);
+	if (ret) {
+		/* 登记表不可读时向“无绑定”收敛，绝不沿用旧窗口。 */
+		pr_warn_ratelimited("ctn_patch: registry snapshot failed ret=%d\n", ret);
+		ctn_chain_clear();
+		goto reschedule;
+	}
+	for (i = 0; i < count; i++) {
+		if (group < 0 && candidates[i].tgid > 0)
+			group = candidates[i].tgid;
+	}
+	ctn_chain_select_init(&selection, &config, group);
+	for (i = 0; i < count; i++)
+		ctn_chain_select_add(&selection, &candidates[i]);
+	ctn_chain_select_finish(&selection, &next);
+	for (i = 0; i < CT_NUM; i++)
+		chosen[i] = next.tasks[i];
+	ctn_chain_drop_extra(candidates, count, chosen);
+	/* 官方在无候选时保留旧 PID；这里收敛为清空，避免沿用上一局身份。 */
+	if (group <= 0)
+		memset(chosen, 0, sizeof(chosen));
+	ctn_chain_publish(chosen, group > 0 ? group : -1);
+
+reschedule:
+	if (!READ_ONCE(chain_stopping) && smp_load_acquire(&patch_ready) &&
+	    smp_load_acquire(&chain_swapped))
+		queue_delayed_work(system_wq, &chain_work,
+				   msecs_to_jiffies(CHAIN_POLL_MS));
+}
+
+/* 厂商登记写入即失效旧绑定；返回后重建，漏触发由周期轮询兜底。 */
+static int ctn_registry_entry(struct kretprobe_instance *instance, struct pt_regs *regs)
+{
+	unsigned long flags;
+
+	(void)instance;
+	(void)regs;
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	chain_epoch++;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	queue_delayed_work(system_wq, &chain_work, 0);
+	return 0;
+}
+
+static int ctn_registry_return(struct kretprobe_instance *instance, struct pt_regs *regs)
+{
+	(void)instance;
+	(void)regs;
+	if (!READ_ONCE(chain_stopping))
+		queue_delayed_work(system_wq, &chain_work, 0);
+	return 0;
+}
+
+static void ctn_registry_probe_monitor(void)
+{
+	unsigned long missed = READ_ONCE(registry_probe.nmissed);
+
+	if (missed != READ_ONCE(registry_probe_seen)) {
+		WRITE_ONCE(registry_probe_seen, missed);
+		/* 漏触发只是失去即时失效，周期轮询仍会重建绑定。 */
+		pr_warn_ratelimited("ctn_patch: registry probe missed %lu; poll refresh covers\n",
+				    missed);
+	}
+}
+
+/* 读取 tracepoint 回调数组快照；只比较地址，不解引用回调。 */
+static int ctn_chain_read_funcs(const struct tracepoint_func *out, unsigned int max)
+{
+	const struct tracepoint_func *funcs;
+	unsigned int i;
+
 	rcu_read_lock();
-	if (ctn_nofault(&n, g_total_num, sizeof(n)) || n <= 0 || n > MAX_TID_COUNT ||
-	    ctn_nofault(&valid, &g_have_valid_rp->counter, sizeof(valid)) || !valid)
-		goto out;
-	for (i = 0; i < n; i++) {
-		if (ctn_nofault(&entry, g_related_threads + i, sizeof(entry)))
+	funcs = rcu_dereference(__tracepoint_sched_switch.funcs);
+	if (!funcs) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	for (i = 0; i < max; i++) {
+		if (ctn_nofault((void *)&out[i], &funcs[i], sizeof(out[i]))) {
+			rcu_read_unlock();
+			return -EFAULT;
+		}
+		if (!out[i].func)
 			break;
-		if (entry.pid <= 0 || entry.pid == excluded || !entry.task)
+	}
+	rcu_read_unlock();
+	return i < max ? (int)i : -ENOEXEC;
+}
+
+static int ctn_chain_funcs_check(const struct tracepoint_func *funcs, int count,
+				 const void *hook, bool *present)
+{
+	int i, seen = 0;
+
+	*present = false;
+	for (i = 0; i < count && funcs[i].func; i++) {
+		if (funcs[i].func != hook)
 			continue;
-		task = find_task_by_pid_ns_fn(entry.pid, initial_pid_namespace);
-		/* Never dereference the potentially unreferenced vendor entry.task. */
-		if (!task || task != entry.task ||
-		    ctn_nofault(&task_pid, &task->pid, sizeof(task_pid)) ||
-		    task_pid != entry.pid ||
-		    ctn_nofault_string(task->comm, comm, sizeof(comm), sizeof(task->comm)))
+		seen++;
+		/* 本模块与厂商 CTB 都以 NULL data 注册。 */
+		if (funcs[i].data)
+			return -ENOEXEC;
+	}
+	if (seen > 1)
+		return -ENOEXEC;
+	*present = seen == 1;
+	return 0;
+}
+
+static int ctn_chain_verify(const void *must_have, const void *must_not_have)
+{
+	struct tracepoint_func funcs[CHAIN_MAX_FUNCS];
+	bool present;
+	int count, ret;
+
+	count = ctn_chain_read_funcs(funcs, CHAIN_MAX_FUNCS);
+	if (count < 0)
+		return count;
+	ret = ctn_chain_funcs_check(funcs, count, must_have, &present);
+	if (ret || !present)
+		return ret ?: -ENOEXEC;
+	if (must_not_have) {
+		ret = ctn_chain_funcs_check(funcs, count, must_not_have, &present);
+		if (ret || present)
+			return ret ?: -ENOEXEC;
+	}
+	return 0;
+}
+
+/*
+ * 回调事务：先注册自己的（未激活）→ 唯一化核对两个回调 → 持自引用 →
+ * 移除厂商 CTB 回调 → RCU 同步 → 复核 → 激活。任何失败都回退原状。
+ */
+static int ctn_chain_swap_in(void)
+{
+	unsigned long victim_hook;
+	int ret;
+
+	if (chain_swapped)
+		return 0;
+	ret = ctn_chain_resolve_objects();
+	if (ret)
+		return ret;
+	ret = ctn_chain_resolve_hook(&victim_hook);
+	if (ret)
+		return ret;
+	ret = tracepoint_probe_register_prio(&__tracepoint_sched_switch,
+					     (void *)ctn_chain_sched_hook, NULL,
+					     CTN_CHAIN_PRIORITY);
+	if (ret)
+		return ret;
+	chain_victim_hook = victim_hook;
+	ret = ctn_chain_verify((void *)ctn_chain_sched_hook, NULL);
+	if (ret)
+		goto fail_unregister;
+	/* 自引用挡住 rmmod，直到 control stop 成功恢复厂商回调。 */
+	if (!try_module_get(THIS_MODULE)) {
+		ret = -EBUSY;
+		goto fail_unregister;
+	}
+	ret = tracepoint_probe_unregister(&__tracepoint_sched_switch,
+					  (void *)victim_hook, NULL);
+	if (ret) {
+		module_put(THIS_MODULE);
+		goto fail_unregister;
+	}
+	synchronize_rcu();
+	ret = ctn_chain_verify((void *)ctn_chain_sched_hook, (void *)victim_hook);
+	if (ret) {
+		/* 复核失败：尽力恢复厂商回调，再交还自引用。 */
+		if (tracepoint_probe_register_prio(&__tracepoint_sched_switch,
+						   (void *)victim_hook, NULL,
+						   CTN_CHAIN_PRIORITY))
+			pr_err("ctn_patch: vendor sched hook restore failed %d\n", ret);
+		else
+			ret = ctn_chain_verify((void *)victim_hook, (void *)ctn_chain_sched_hook);
+		module_put(THIS_MODULE);
+		goto fail_unregister;
+	}
+	smp_store_release(&chain_active, true);
+	chain_swapped = true;
+	return 0;
+fail_unregister:
+	tracepoint_probe_unregister(&__tracepoint_sched_switch,
+				    (void *)ctn_chain_sched_hook, NULL);
+	synchronize_rcu();
+	return ret;
+}
+
+/*
+ * 受控停止：只有厂商回调恢复并复核成功才解除自引用。失败时保持自引用，
+ * rmmod 会以 EBUSY 拒绝，可重试，不会留下悬空调回调。
+ */
+static int ctn_chain_swap_out(void)
+{
+	struct ctn_chain_task tasks[CT_NUM];
+	unsigned long flags;
+	int ret, i;
+
+	if (!chain_swapped)
+		return 0;
+	smp_store_release(&chain_active, false);
+	ret = tracepoint_probe_unregister(&__tracepoint_sched_switch,
+					  (void *)ctn_chain_sched_hook, NULL);
+	synchronize_rcu();
+	ret = tracepoint_probe_register_prio(&__tracepoint_sched_switch,
+					     (void *)chain_victim_hook, NULL,
+					     CTN_CHAIN_PRIORITY);
+	if (ret) {
+		/* 恢复失败：重新激活自己的回调并保留自引用。 */
+		if (!tracepoint_probe_register(&__tracepoint_sched_switch,
+					       (void *)ctn_chain_sched_hook, NULL))
+			smp_store_release(&chain_active, true);
+		pr_err("ctn_patch: vendor hook restore failed %d; unload retained\n", ret);
+		return ret ?: -EIO;
+	}
+	synchronize_rcu();
+	ret = ctn_chain_verify((void *)chain_victim_hook, (void *)ctn_chain_sched_hook);
+	if (ret) {
+		pr_err("ctn_patch: vendor hook verify failed %d; unload retained\n", ret);
+		return ret;
+	}
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	for (i = 0; i < CT_NUM; i++)
+		tasks[i] = chain_binding.tasks[i];
+	memset(&chain_binding.tasks, 0, sizeof(chain_binding.tasks));
+	chain_binding.tgid = -1;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	synchronize_rcu();
+	for (i = 0; i < CT_NUM; i++) {
+		if (tasks[i].token)
+			ctn_task_unref((struct task_struct *)tasks[i].token);
+	}
+	chain_swapped = false;
+	module_put(THIS_MODULE);
+	return ret;
+}
+
+/* 新官方热路径：绑定身份核对一次通过后，按原引擎锁纪律累计时间。 */
+static void ctn_chain_sched_hook(void *unused, bool preempt,
+				 struct task_struct *prev, struct task_struct *next,
+				 unsigned int prev_state)
+{
+	struct ctn_chain_binding snap;
+	struct ctn_chain_config config;
+	const struct task_struct *tasks[CT_NUM] = { NULL, NULL };
+	bool matched[CT_NUM] = { false, false };
+	bool is_prev[CT_NUM] = { false, false };
+	unsigned long flags_chain, flags_chb;
+	u64 generation, epoch, now;
+	int i;
+
+	(void)unused;
+	(void)preempt;
+	(void)prev_state;
+	if (!smp_load_acquire(&chain_active))
+		return;
+	/* 与厂商原回调相同的开关读取，保持既有语义与竞态边界。 */
+	if (!READ_ONCE(*ct_enable_addr))
+		return;
+	raw_spin_lock_irqsave(&chain_lock, flags_chain);
+	generation = chain_generation;
+	epoch = chain_epoch;
+	snap = chain_binding;
+	config = chain_config;
+	raw_spin_unlock_irqrestore(&chain_lock, flags_chain);
+	if (!ctn_chain_binding_current(&snap, generation, epoch))
+		return;
+
+	now = ktime_get();
+	for (i = 0; i < CT_NUM; i++) {
+		const struct ctn_chain_task *saved = &snap.tasks[i];
+		struct ctn_chain_task view;
+
+		if (!saved->token)
 			continue;
-		if (!strncmp(name, comm, length)) {
-			found = entry.pid;
-			break;
+		view.token = (unsigned long)prev;
+		view.pid = READ_ONCE(prev->pid);
+		view.tgid = READ_ONCE(prev->tgid);
+		memcpy(view.comm, prev->comm, sizeof(view.comm));
+		if (ctn_chain_match(&config, &snap, &view, generation, epoch, true)) {
+			matched[i] = true;
+			is_prev[i] = true;
+			tasks[i] = prev;
+			continue;
+		}
+		view.token = (unsigned long)next;
+		view.pid = READ_ONCE(next->pid);
+		view.tgid = READ_ONCE(next->tgid);
+		memcpy(view.comm, next->comm, sizeof(view.comm));
+		if (ctn_chain_match(&config, &snap, &view, generation, epoch, true)) {
+			matched[i] = true;
+			is_prev[i] = false;
+			tasks[i] = next;
 		}
 	}
-out:
-	rcu_read_unlock();
-	read_unlock_irqrestore(g_rt_lock, flags);
-	return found;
+	if (!(matched[0] || matched[1]))
+		return;
+	/* 与厂商 update_critical_task_time 相同的 chb_lock 纪律；reset 仍仅持
+	 * chb_mutex，这一原生竞态按官方实现原样保留。 */
+	raw_spin_lock_irqsave(chb_lock_addr, flags_chb);
+	for (i = 0; i < CT_NUM; i++) {
+		struct ctn_chain_time sample;
+		int cpu = 0;
+
+		if (!matched[i])
+			continue;
+		cpu = (int)READ_ONCE(task_thread_info(tasks[i])->cpu);
+		sample.running_ns = READ_ONCE(running_ns_addr[i]);
+		sample.blocked_ns = READ_ONCE(blocked_ns_addr[i]);
+		sample.end_ns = READ_ONCE(end_ns_addr[i]);
+		sample.window_running_ns = READ_ONCE(slide_ns_addr[i]);
+		sample.running = 0;
+		sample.cpu = 0;
+		if (ctn_chain_account(&sample, now, READ_ONCE(*window_end_addr),
+				      is_prev[i], cpu)) {
+			WRITE_ONCE(running_ns_addr[i], sample.running_ns);
+			WRITE_ONCE(blocked_ns_addr[i], sample.blocked_ns);
+			WRITE_ONCE(end_ns_addr[i], sample.end_ns);
+			WRITE_ONCE(slide_ns_addr[i], sample.window_running_ns);
+			atomic_set(&status_addr[i], sample.running);
+			if (!is_prev[i])
+				WRITE_ONCE(cpu_core_addr[i], sample.cpu);
+		}
+	}
+	raw_spin_unlock_irqrestore(chb_lock_addr, flags_chb);
 }
 
-static void ctn_resolve_pids(const char names[CT_NUM][CT_NAME_LEN], pid_t pids[CT_NUM])
+/* control 参数：echo stop > .../parameters/critical_task_control */
+static int ctn_control_set(const char *value, const struct kernel_param *kp)
 {
-	pids[1] = ctn_find_pid(names[1], -1);
-	pids[0] = !strcmp(names[0], names[1]) ? pids[1] :
-		  ctn_find_pid(names[0], pids[1]);
+	int ret;
+
+	(void)kp;
+	size_t len = value ? strlen(value) : 0;
+	while (len && (value[len - 1] == '\n' || value[len - 1] == '\r' ||
+		       value[len - 1] == ' ' || value[len - 1] == '\t'))
+		len--;
+	if (len != 4 || strncmp(value, "stop", 4))
+		return -EOPNOTSUPP;
+	if (!chain_swapped)
+		return 0;
+	WRITE_ONCE(chain_stopping, true);
+	cancel_delayed_work_sync(&chain_work);
+	unregister_kretprobe(&registry_probe);
+	chain_probe_on = false;
+	ret = ctn_chain_swap_out();
+	WRITE_ONCE(chain_stopping, false);
+	return ret;
 }
+
+static int ctn_control_get(char *buf, const struct kernel_param *kp)
+{
+	(void)kp;
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+			 chain_swapped ? "active" : "stopped");
+}
+
+static const struct kernel_param_ops ctn_control_param_ops = {
+	.set = ctn_control_set,
+	.get = ctn_control_get,
+};
+module_param_cb(critical_task_control, &ctn_control_param_ops, NULL, 0600);
+MODULE_PARM_DESC(critical_task_control, "Write 'stop' to restore the vendor sched hook before rmmod");
 
 /* Verify current ownership before reading/publishing. Unexpected writers fail closed. */
 static int ctn_check_slots(const char *slots[CT_NUM])
@@ -627,8 +1248,11 @@ static ssize_t ctn_read(struct file *file, char __user *ubuf,
 {
 	char page[CT_INPUT_LEN], names[CT_NUM][CT_NAME_LEN];
 	const char *slots[CT_NUM];
-	pid_t pids[CT_NUM];
+	struct ctn_chain_binding snap;
+	u64 generation, epoch;
+	unsigned long flags;
 	size_t available;
+	pid_t pids[CT_NUM] = { -1, -1 };
 	int ret, i, len;
 
 	mutex_lock(&patch_lock);
@@ -647,7 +1271,18 @@ static ssize_t ctn_read(struct file *file, char __user *ubuf,
 		if (ret)
 			goto out;
 	}
-	ctn_resolve_pids(names, pids);
+	/* PID 展示来自链路绑定（官方 critical_task_pids 语义），不再扫描登记表。 */
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	generation = chain_generation;
+	epoch = chain_epoch;
+	snap = chain_binding;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	if (ctn_chain_binding_current(&snap, generation, epoch)) {
+		for (i = 0; i < CT_NUM; i++) {
+			if (snap.tasks[i].token)
+				pids[i] = snap.tasks[i].pid;
+		}
+	}
 	len = scnprintf(page, sizeof(page), "%s:%d,%s:%d\n",
 			names[0], (int)pids[0], names[1], (int)pids[1]);
 	mutex_unlock(&patch_lock);
@@ -662,8 +1297,9 @@ static ssize_t ctn_write(struct file *file, const char __user *ubuf,
 {
 	char input[CT_INPUT_LEN], names[CT_NUM][CT_NAME_LEN];
 	const char *slots[CT_NUM];
-	pid_t pids[CT_NUM];
+	struct ctn_chain_config next_config;
 	u8 next[CT_NUM];
+	unsigned long flags;
 	int ret, i;
 
 	if (*ppos != 0)
@@ -673,6 +1309,10 @@ static ssize_t ctn_write(struct file *file, const char __user *ubuf,
 	if (copy_from_user(input, ubuf, count))
 		return -EFAULT;
 	ret = ctn_parse_names(input, count, names);
+	if (ret)
+		return ret;
+	/* 链路配置先在临时对象解析，失败不影响已发布状态。 */
+	ret = ctn_chain_parse(input, count, &next_config);
 	if (ret)
 		return ret;
 
@@ -700,9 +1340,13 @@ static ssize_t ctn_write(struct file *file, const char __user *ubuf,
 		active_slot[i] = next[i];
 	}
 	patched = true;
-	ctn_resolve_pids(names, pids);
-	pr_info_ratelimited("ctn_patch: names [%s:%d] [%s:%d]\n",
-			names[0], (int)pids[0], names[1], (int)pids[1]);
+	/* 新配置发布给链路；旧绑定随代数失效，重建由工作队列完成。 */
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	chain_config = next_config;
+	chain_generation++;
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	queue_delayed_work(system_wq, &chain_work, 0);
+	pr_info_ratelimited("ctn_patch: names [%s] [%s]\n", names[0], names[1]);
 	*ppos = count;
 	ret = count;
 out:
@@ -727,6 +1371,19 @@ static void ctn_release_state(void)
 	if (victim)
 		module_put(victim);
 	victim = NULL;
+	/* 厂商对象地址随引用释放失效；链路须在下次 patch 后重新解析。 */
+	chain_swapped = false;
+	chain_active = false;
+	chb_lock_addr = NULL;
+	running_ns_addr = NULL;
+	blocked_ns_addr = NULL;
+	end_ns_addr = NULL;
+	slide_ns_addr = NULL;
+	window_end_addr = NULL;
+	status_addr = NULL;
+	cpu_core_addr = NULL;
+	ct_enable_addr = NULL;
+	chain_victim_hook = 0;
 	memset(&victim_layout, 0, sizeof(victim_layout));
 	memset(&victim_kallsyms, 0, sizeof(victim_kallsyms));
 	victim_strtab_bytes = 0;
@@ -816,6 +1473,31 @@ static int ctn_try_patch(void)
 	}
 	/* All state is initialized before the node is advertised to userspace. */
 	smp_store_release(&patch_ready, !READ_ONCE(stopping));
+	/*
+	 * 链路最后接入：失败只回退到旧名称补丁行为，不影响节点本身。
+	 * swap 内部任何失败都会恢复厂商回调并复核。
+	 */
+	ctn_chain_config_defaults();
+	if (ctn_chain_resolve_objects()) {
+		pr_warn("ctn_patch: CTN chain objects unavailable; legacy matching kept\n");
+	} else if (ctn_chain_swap_in()) {
+		pr_err("ctn_patch: CTN chain swap failed; legacy matching kept\n");
+	} else {
+		memset(&registry_probe, 0, sizeof(registry_probe));
+		registry_probe.kp.symbol_name = "rt_info_proc_write";
+		registry_probe.entry_handler = ctn_registry_entry;
+		registry_probe.handler = ctn_registry_return;
+		registry_probe.maxactive = 8;
+		if (!register_kretprobe(&registry_probe)) {
+			chain_probe_on = true;
+			queue_delayed_work(system_wq, &chain_work, 0);
+		} else {
+			/* 探针注册失败只失去即时失效；周期轮询仍然重建绑定。 */
+			pr_warn("ctn_patch: registry probe unavailable; poll refresh only\n");
+			queue_delayed_work(system_wq, &chain_work, 0);
+		}
+		pr_info("ctn_patch: CTN chain active (official pid/tgid binding)\n");
+	}
 	pr_info("ctn_patch: profile=%s build_id=%s ready; PID display %s\n",
 		CTN_PROFILE_ID, CTN_BUILD_ID,
 		smp_load_acquire(&pid_display_available) ? "available" : "disabled");
@@ -860,6 +1542,7 @@ static int __init ctn_patch_init(void)
 		return ret;
 	}
 	INIT_DELAYED_WORK(&probe_work, ctn_probe_work);
+	INIT_DELAYED_WORK(&chain_work, ctn_chain_rebind_work);
 	probe_tries = 1;
 	ret = ctn_try_patch();
 	if (ret == -EAGAIN) {
@@ -872,11 +1555,25 @@ static int __init ctn_patch_init(void)
 
 static void __exit ctn_patch_exit(void)
 {
+	struct ctn_chain_task tasks[CT_NUM];
+	unsigned long flags;
 	int i;
 
 	WRITE_ONCE(stopping, true);
 	smp_store_release(&patch_ready, false);
+	WRITE_ONCE(chain_stopping, true);
 	cancel_delayed_work_sync(&probe_work);
+	cancel_delayed_work_sync(&chain_work);
+	/*
+	 * 正常卸载路径必须先通过 control stop 恢复厂商回调（自引用挡住 rmmod）。
+	 * 这里只是防御性兜底：若仍在链路状态，尽力恢复并如实报告。
+	 */
+	if (chain_swapped && ctn_chain_swap_out())
+		pr_err("ctn_patch: chain swap_out failed during unload\n");
+	if (chain_probe_on) {
+		unregister_kretprobe(&registry_probe);
+		chain_probe_on = false;
+	}
 	/* Never hold patch_lock across proc_remove: it drains blocked callbacks. */
 	if (name_entry) {
 		proc_remove(name_entry);
@@ -897,6 +1594,17 @@ static void __exit ctn_patch_exit(void)
 		synchronize_rcu();
 		patched = false;
 	}
+	/* 兜底释放残留绑定引用；正常路径 swap_out 已释放。 */
+	raw_spin_lock_irqsave(&chain_lock, flags);
+	for (i = 0; i < CT_NUM; i++)
+		tasks[i] = chain_binding.tasks[i];
+	memset(&chain_binding.tasks, 0, sizeof(chain_binding.tasks));
+	raw_spin_unlock_irqrestore(&chain_lock, flags);
+	synchronize_rcu();
+	for (i = 0; i < CT_NUM; i++) {
+		if (tasks[i].token)
+			ctn_task_unref((struct task_struct *)tasks[i].token);
+	}
 	ctn_release_state();
 	mutex_unlock(&patch_lock);
 	pr_info("ctn_patch: unloaded\n");
@@ -907,7 +1615,7 @@ module_exit(ctn_patch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Turbo");
 MODULE_DESCRIPTION("Add /proc/game_opt/task_boost/critical_task_name for verified Oplus 6.1 game_opt");
-MODULE_VERSION("3.2");
+MODULE_VERSION("3.3");
 MODULE_INFO(ctn_profile, CTN_PROFILE_ID);
 MODULE_INFO(ctn_build_id, CTN_BUILD_ID);
 MODULE_SOFTDEP("pre: " VICTIM_MODULE);

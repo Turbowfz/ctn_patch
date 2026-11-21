@@ -397,7 +397,7 @@ class PackagingTests(unittest.TestCase):
         text = data.decode("utf-8")
         sections = re.split(r"(?m)(?=^CTN Patch )", text)
         sections = [section for section in sections if section.strip()]
-        self.assertEqual(len(sections), 16)
+        self.assertEqual(len(sections), 17)
         for section in sections:
             self.assertLessEqual(len(section.encode("utf-8")), 2048)
             bullets = [line for line in section.splitlines() if line.startswith("- ")]
